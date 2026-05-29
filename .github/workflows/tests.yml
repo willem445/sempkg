@@ -36,10 +36,10 @@ jobs:
         run: npm install -g @colbymchenry/codegraph
 
       - name: Install dependencies
-        run: uv pip install -e ".[dev]"
+        run: uv pip install --system -e ".[dev]"
 
       - name: Run pytest
-        run: uv run pytest
+        run: uv run --system pytest
 
       - name: Upload coverage reports
         uses: codecov/codecov-action@v3
