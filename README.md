@@ -4,6 +4,24 @@ A multi-repo [codegraph](https://github.com/colbymchenry/codegraph) MCP server f
 
 Registers locally cloned internal Python packages, indexes them with codegraph, and exposes a single MCP endpoint that Copilot uses to query symbols, call graphs, and source files — without needing to drag reference files into the context window each session.
 
+## Why this exists
+
+When you are working in one repository, you often still need context from other codebases:
+
+- Internal Python packages used by your app
+- A locally installed SDK
+- Internal frameworks shared across repos
+- Public dependencies cloned locally when you want exact source/API behavior
+
+The usual workaround is to manually paste external code into chat or attach files repeatedly.
+That increases token usage, creates noisy context windows, and does not scale well across sessions.
+
+[codegraph](https://github.com/colbymchenry/codegraph) is excellent at indexing and querying code efficiently, but it is typically centered on the currently open codebase.
+
+`codegraph-hub` provides a wrapper MCP server in front of codegraph so you can register and index multiple local folders, then expose them through one Copilot-accessible endpoint.
+
+This gives Copilot direct, queryable access to symbols, call graphs, and source across your local dependency graph without manual copy/paste context management.
+
 ---
 
 ## Prerequisites
