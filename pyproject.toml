@@ -1,0 +1,21 @@
+[build-system]
+requires = ["uv_build>=0.11.17,<0.12"]
+build-backend = "uv_build"
+
+[project]
+name = "codegraph-hub"
+version = "0.1.0"
+description = "Multi-repo codegraph MCP server for GitHub Copilot — indexes internal packages and exposes them via MCP tools"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+dependencies = [
+    "fastmcp>=2.0",
+]
+
+[project.scripts]
+codegraph-hub = "codegraph_hub.cli:main_cli"
+
+[tool.uv]
+# Prefer uv for dependency management and environment sync in this project.
+managed = true
