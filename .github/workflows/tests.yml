@@ -39,7 +39,7 @@ jobs:
         run: uv pip install --system -e ".[dev]"
 
       - name: Run pytest
-        run: uv run --system pytest
+        run: python -m pytest
 
       - name: Upload coverage reports
         uses: codecov/codecov-action@v3
