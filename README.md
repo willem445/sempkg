@@ -2,7 +2,7 @@
 
 A multi-repo [codegraph](https://github.com/colbymchenry/codegraph) MCP server for **GitHub Copilot**.
 
-Registers locally cloned internal Python packages, indexes them with codegraph, and exposes a single MCP endpoint that Copilot uses to query symbols, call graphs, and source files — without needing to drag reference files into the context window each session.
+Registers locally cloned internal codebases, indexes them with codegraph, and exposes a single MCP endpoint that Copilot uses to query symbols, call graphs, and source files — without needing to drag reference files into the context window each session.
 
 ## Why this exists
 
