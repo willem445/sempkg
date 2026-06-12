@@ -56,7 +56,7 @@ Requirements:
 **Prompt:**
 
 ```
-Implement a CLI tool `cgbundle unpack`.
+Implement an unpacking feature into codegraph-hub CLI tool. This will eventually be connected up to a "codegraph-hub add dep@x.y.z" command which pulls down the bundle from the register, unpacks it (this feature) into a repository equivalent of a python .venv or npm node_modules. This task is just implementing the unpack feature + unit tests.
 
 Requirements:
 - Input: .cgbundle file
@@ -77,6 +77,8 @@ Requirements:
 
 ```
 Implement a local registry cache for Codegraph-Hub.
+
+TBDL should support repository specific node_modules style or globally in the ~/.codegraph-hub user folder.
 
 Requirements:
 - Store registry.json in ~/.codegraph-hub/registry.json
@@ -253,6 +255,8 @@ Requirements:
 
 ```
 Implement a static registry server.
+
+For initial testing, I want to just host this either on my local PC or on a local network server. I mainly want to support local network index server as this will likely be deployed in enterprises where a registry of internal codebases needs to be maintained.
 
 Requirements:
 - Serve index.json and bundles over HTTPS.
