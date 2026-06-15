@@ -1,6 +1,6 @@
 # CGBundle Format Specification
 
-**Version:** 1.0.0
+**Version:** 1.1.0
 **Status:** Draft
 
 ---
@@ -49,11 +49,17 @@ A `.cgbundle` file is a **gzip-compressed tar archive** (`.tar.gz` renamed to `.
 ├── config.json         # CodeGraph configuration used during indexing (required)
 ├── graph/              # CodeGraph graph store directory (required)
 │   └── ...             # Internal graph files (implementation-defined)
-└── embeddings/         # Semantic embedding vectors (required)
-    └── ...             # Internal embedding files (implementation-defined)
+├── embeddings/         # CodeGraph semantic embedding vectors (required)
+│   └── ...             # Internal embedding files (implementation-defined)
+└── qmd/                # QMD documentation index (optional)
+    ├── index/          # Project-local QMD SQLite database
+    ├── embeddings/     # Format-neutral vector export
+    ├── metadata.json   # QMD indexing metadata
+    ├── model.gguf      # GGUF embedding model (optional)
+    └── config.json     # QMD collection configuration
 ```
 
-All five top-level entries (`manifest.json`, `metadata.json`, `config.json`, `graph/`, `embeddings/`) are **required**. A bundle missing any of them is invalid.
+The top-level entries `manifest.json`, `metadata.json`, `config.json`, `graph/`, and `embeddings/` are **required**. The `qmd/` entry is **optional**. A bundle missing any required entry is invalid.
 
 ---
 
@@ -73,6 +79,7 @@ The manifest is the authoritative descriptor for a bundle. It is generated at pa
   "tag":               "<string | null>",
   "created_at":        "<ISO 8601 UTC datetime>",
   "codegraph_version": "<string>",
+  "extensions":        ["<string>", ...],
   "checksums": {
     "<relative-file-path>": "<sha256-hex>",
     ...
@@ -92,6 +99,7 @@ The manifest is the authoritative descriptor for a bundle. It is generated at pa
 | `tag`               | string or null  | Yes      | Git tag associated with this version, or `null` if none |
 | `created_at`        | string          | Yes      | ISO 8601 UTC timestamp of when the bundle was created (e.g. `"2025-08-01T14:30:00Z"`) |
 | `codegraph_version` | string          | Yes      | Version of CodeGraph used to produce the index |
+| `extensions`        | array of string | No       | Optional bundle extensions present. Must include `"qmd"` when `qmd/` is present. Omit or use `[]` when no extensions are bundled. |
 | `checksums`         | object          | Yes      | Map of relative file paths (within the bundle) to their SHA-256 hex digests. Must cover every file except `manifest.json` itself. |
 
 ### 4.3 Checksums Coverage
@@ -102,7 +110,7 @@ The `checksums` map must include an entry for **every file** in the bundle **exc
 
 ```json
 {
-  "spec_version": "1.0.0",
+  "spec_version": "1.1.0",
   "name": "aws-sdk",
   "version": "1.11.210",
   "source_repo": "https://github.com/aws/aws-sdk-cpp",
@@ -110,6 +118,7 @@ The `checksums` map must include an entry for **every file** in the bundle **exc
   "tag": "1.11.210",
   "created_at": "2025-08-01T14:30:00Z",
   "codegraph_version": "0.3.1",
+  "extensions": [],
   "checksums": {
     "metadata.json": "a1b2c3d4e5f6...",
     "config.json": "b2c3d4e5f6a1...",
@@ -180,7 +189,176 @@ At least one file must be present inside `embeddings/`; an empty directory is in
 
 ---
 
-## 9. Versioning and Immutability
+## 9. `qmd/` — Documentation Index
+
+The `qmd/` directory is an **optional** extension that bundles a per-repository documentation index produced by [QMD](https://github.com/tobi/qmd) (Query Markup Documents). QMD provides hybrid BM25 full-text search, vector semantic search, and LLM re-ranking — all running locally via GGUF models.
+
+When present, `qmd/` allows consumers (agents, IDEs, MCP clients) to query the repository's documentation offline without cloning the source repository or relying on a shared global QMD instance. The index is scoped exclusively to the repository being bundled.
+
+When `qmd/` is present, `manifest.json` must include `"qmd"` in its `extensions` array.
+
+### 9.1 Sub-directory Layout
+
+```
+qmd/
+├── index/             # Project-local QMD SQLite database (required)
+│   └── index.sqlite   # Documents, FTS5 index, and sqlite-vec embeddings
+├── embeddings/        # Format-neutral vector export (required)
+│   └── ...            # Implementation-defined flat binary or JSONL chunks
+├── metadata.json      # QMD indexing metadata (required)
+├── model.gguf         # GGUF embedding model used during indexing (optional)
+└── config.json        # QMD collection configuration (required)
+```
+
+All entries except `model.gguf` are **required** when `qmd/` is present. When `model.gguf` is omitted, the `embed_model` field in `qmd/metadata.json` records the HuggingFace URI so consumers can download it on demand.
+
+### 9.2 `qmd/index/` — QMD Database
+
+Contains the project-local QMD SQLite database (`index.sqlite`). This database is produced using a scoped, project-local QMD invocation (see §9.7) and holds a single collection representing the repository being bundled. It includes:
+
+- Document content and metadata (`documents` table)
+- FTS5 full-text index (`documents_fts`)
+- Vector embedding chunks (`content_vectors`, `vectors_vec` via sqlite-vec)
+- Collection and context configuration (`collections`, `path_contexts`)
+- LLM response cache (`llm_cache`)
+
+Consumers with QMD installed can mount and query this database directly:
+
+```js
+import { createStore } from '@tobilu/qmd'
+
+const store = await createStore({ dbPath: './qmd/index/index.sqlite' })
+const results = await store.search({ query: "authentication flow" })
+await store.close()
+```
+
+### 9.3 `qmd/embeddings/` — Vector Export
+
+A format-neutral export of the embedding vectors already stored in `qmd/index/index.sqlite`. This allows lightweight consumers that do not have QMD or the sqlite-vec extension installed to use the precomputed embeddings directly.
+
+The internal format is **implementation-defined**. The `embeddings_format` field in `qmd/metadata.json` must identify the format (e.g. `"binary-f32"`, `"jsonl"`). At least one file must be present; an empty `qmd/embeddings/` directory is invalid.
+
+### 9.4 `qmd/metadata.json` — QMD Metadata
+
+#### Schema
+
+```json
+{
+  "qmd_version":       "<string>",
+  "embed_model":       "<string>",
+  "embed_model_hash":  "<string | null>",
+  "chunk_strategy":    "<string>",
+  "embeddings_format": "<string>",
+  "embedding_dim":     "<number>",
+  "collection_name":   "<string>",
+  "document_count":    "<number>",
+  "chunk_count":       "<number>",
+  "indexed_paths":     ["<string>", ...],
+  "created_at":        "<ISO 8601 UTC datetime>"
+}
+```
+
+#### Field Definitions
+
+| Field               | Type            | Required | Description |
+|---------------------|-----------------|----------|-------------|
+| `qmd_version`       | string          | Yes      | Version of QMD used to produce the index (e.g. `"2.5.3"`) |
+| `embed_model`       | string          | Yes      | HuggingFace URI of the embedding model used (e.g. `"hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf"`) |
+| `embed_model_hash`  | string or null  | Yes      | SHA-256 hex digest of `qmd/model.gguf`, or `null` if `model.gguf` was omitted |
+| `chunk_strategy`    | string          | Yes      | Chunking strategy: `"regex"` (default) or `"auto"` (AST-aware, recommended for source code) |
+| `embeddings_format` | string          | Yes      | Format of files in `qmd/embeddings/` (e.g. `"binary-f32"`, `"jsonl"`) |
+| `embedding_dim`     | number          | Yes      | Dimensionality of each embedding vector |
+| `collection_name`   | string          | Yes      | QMD collection name used during indexing (should match bundle `name`) |
+| `document_count`    | number          | Yes      | Total number of documents indexed |
+| `chunk_count`       | number          | Yes      | Total number of embedding chunks generated |
+| `indexed_paths`     | array of string | Yes      | Glob patterns or paths indexed (relative to repo root) |
+| `created_at`        | string          | Yes      | ISO 8601 UTC timestamp (must match `manifest.json` `created_at`) |
+
+#### Example
+
+```json
+{
+  "qmd_version": "2.5.3",
+  "embed_model": "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf",
+  "embed_model_hash": "a1b2c3d4e5f6...",
+  "chunk_strategy": "auto",
+  "embeddings_format": "binary-f32",
+  "embedding_dim": 768,
+  "collection_name": "aws-sdk",
+  "document_count": 1842,
+  "chunk_count": 9231,
+  "indexed_paths": ["docs/**/*.md", "**/*.rst", "README.md"],
+  "created_at": "2025-08-01T14:30:00Z"
+}
+```
+
+### 9.5 `qmd/model.gguf` — Embedding Model
+
+The GGUF embedding model used to generate vectors in `qmd/index/index.sqlite` and `qmd/embeddings/`. Including the model enables fully offline operation: a consumer can load the model and perform semantic queries against the index without downloading anything.
+
+This file is **optional**. When omitted, the `embed_model` field in `qmd/metadata.json` provides the HuggingFace URI for on-demand download. When included:
+
+- Its SHA-256 digest must appear in `manifest.json` `checksums` as `qmd/model.gguf`.
+- Its SHA-256 digest must match `qmd/metadata.json` `embed_model_hash`.
+
+> **Note:** GGUF embedding models are typically 300 MB – 1 GB. Distributors should weigh offline-operation benefits against bundle size when deciding whether to include `model.gguf`.
+
+### 9.6 `qmd/config.json` — Collection Configuration
+
+The QMD collection configuration used to produce the index, expressed as JSON (equivalent to a `qmd.yml` config file). Consumers can use this to reproduce the index or to mount a new QMD store with the same settings.
+
+At minimum this must be a valid JSON object (`{}`). A typical configuration identifies the collection name, path, and glob pattern:
+
+```json
+{
+  "collections": {
+    "aws-sdk": {
+      "path": ".",
+      "pattern": "**/*.{md,rst,txt}"
+    }
+  }
+}
+```
+
+### 9.7 Producing a Scoped QMD Index
+
+QMD's default index is global (`~/.cache/qmd/index.sqlite`). To produce a per-repository index scoped exclusively to one repository, use an explicit `--index` path so the index is never written to the global store.
+
+**CLI approach:**
+
+```sh
+# Index and embed the repository into a project-local store
+qmd --index ./qmd/index/index.sqlite collection add . --name <bundle-name>
+qmd --index ./qmd/index/index.sqlite update
+qmd --index ./qmd/index/index.sqlite embed --chunk-strategy auto
+```
+
+**SDK approach:**
+
+```js
+import { createStore } from '@tobilu/qmd'
+
+const store = await createStore({
+  dbPath: './qmd/index/index.sqlite',
+  config: {
+    collections: {
+      [bundleName]: {
+        path: repoRoot,
+        pattern: '**/*.{md,rst,txt}',
+      },
+    },
+  },
+})
+await store.update()
+await store.embed({ chunkStrategy: 'auto' })
+await store.close()
+```
+
+The resulting `index.sqlite` is self-contained and portable. Absolute filesystem paths recorded during indexing are not required for search — only the document content and vectors matter at query time.
+
+---
+
+## 10. Versioning and Immutability
 
 - Once packed and published, a CGBundle **must not be modified**. It is treated as an immutable artifact.
 - To publish a correction to an already-released version, a new patch version must be issued.
@@ -194,26 +372,29 @@ At least one file must be present inside `embeddings/`; an empty directory is in
 
 ---
 
-## 10. Validation Rules
+## 11. Validation Rules
 
 A bundle is **valid** if and only if all of the following hold:
 
-### 10.1 Archive Structure
+### 11.1 Archive Structure
 
 - [ ] The file is a valid gzip-compressed tar archive.
 - [ ] All entries are rooted under a single top-level directory named `<name>-<version>/`.
 - [ ] No symlinks or absolute paths are present inside the archive.
 - [ ] No path traversal sequences (`../`) appear in any archive entry.
 
-### 10.2 Required Files
+### 11.2 Required Files
 
 - [ ] `manifest.json` is present and is valid JSON.
 - [ ] `metadata.json` is present and is valid JSON.
 - [ ] `config.json` is present and is valid JSON.
 - [ ] `graph/` directory is present and non-empty.
 - [ ] `embeddings/` directory is present and non-empty.
+- [ ] If `qmd/` is present: `qmd/index/index.sqlite`, `qmd/metadata.json`, `qmd/config.json`, and `qmd/embeddings/` are all present.
+- [ ] If `qmd/` is present: `qmd/embeddings/` is non-empty.
+- [ ] If `qmd/` is present: `manifest.json` `extensions` includes `"qmd"`.
 
-### 10.3 Manifest Integrity
+### 11.3 Manifest Integrity
 
 - [ ] All required fields in `manifest.json` are present and non-empty.
 - [ ] `spec_version` is a valid semantic version string.
@@ -222,11 +403,11 @@ A bundle is **valid** if and only if all of the following hold:
 - [ ] `checksums` contains an entry for every file in the bundle except `manifest.json`.
 - [ ] No extra files are present in the bundle that are absent from `checksums`.
 
-### 10.4 Checksum Verification
+### 11.4 Checksum Verification
 
 - [ ] The SHA-256 digest of each listed file matches the value recorded in `checksums`.
 
-### 10.5 Cross-Field Consistency
+### 11.5 Cross-Field Consistency
 
 - [ ] `manifest.json`.`name` matches the filename prefix.
 - [ ] `manifest.json`.`version` matches the filename version component.
@@ -235,10 +416,12 @@ A bundle is **valid** if and only if all of the following hold:
 - [ ] `metadata.json`.`source_repo` matches `manifest.json`.`source_repo`.
 - [ ] `metadata.json`.`commit_hash` matches `manifest.json`.`commit_hash`.
 - [ ] `metadata.json`.`created_at` matches `manifest.json`.`created_at`.
+- [ ] If `qmd/` is present: `qmd/metadata.json`.`created_at` matches `manifest.json`.`created_at`.
+- [ ] If `qmd/model.gguf` is present: `qmd/metadata.json`.`embed_model_hash` matches the SHA-256 digest of `qmd/model.gguf`.
 
 ---
 
-## 11. Error Codes
+## 12. Error Codes
 
 Implementations should surface validation failures using the following codes:
 
@@ -259,7 +442,7 @@ Implementations should surface validation failures using the following codes:
 
 ---
 
-## 12. Reference: Minimal Valid Bundle
+## 13. Reference: Minimal Valid Bundle
 
 The smallest valid bundle contains:
 
@@ -278,8 +461,9 @@ With `manifest.json` listing checksums for `metadata.json`, `config.json`, `grap
 
 ---
 
-## 13. Changelog
+## 14. Changelog
 
 | Version | Date       | Notes |
 |---------|------------|-------|
+| 1.1.0   | 2026-06-12 | Added optional `qmd/` extension (§9) for per-repository QMD documentation index. Added optional `extensions` field to `manifest.json`. Added QMD validation rules to §11.2 and §11.5. |
 | 1.0.0   | 2026-06-10 | Initial specification |

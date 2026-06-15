@@ -17,6 +17,9 @@ pub struct Manifest {
     pub tag: Option<String>,
     pub created_at: String,
     pub codegraph_version: String,
+    /// Optional bundle extensions present (e.g. `["qmd"]`).
+    /// Spec: cgbundle-spec.md §4.2.
+    pub extensions: Vec<String>,
     /// Map of bundle-relative file path → SHA-256 hex digest.
     /// Covers every file in the bundle **except** `manifest.json` itself.
     pub checksums: HashMap<String, String>,
@@ -35,5 +38,27 @@ pub struct Metadata {
     pub tag: Option<String>,
     pub language: String,
     pub indexed_paths: Vec<String>,
+    pub created_at: String,
+}
+
+/// QMD index metadata (`qmd/metadata.json`).
+///
+/// Read from the caller-supplied QMD index directory. The packer stamps
+/// `created_at` to match the bundle's `created_at` before writing it into
+/// the archive, ensuring §11.5 cross-field consistency.
+/// Spec: cgbundle-spec.md §9.4.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct QmdMetadata {
+    pub qmd_version: String,
+    pub embed_model: String,
+    pub embed_model_hash: Option<String>,
+    pub chunk_strategy: String,
+    pub embeddings_format: String,
+    pub embedding_dim: u64,
+    pub collection_name: String,
+    pub document_count: u64,
+    pub chunk_count: u64,
+    pub indexed_paths: Vec<String>,
+    /// Stamped by the packer to match `manifest.json` `created_at`.
     pub created_at: String,
 }

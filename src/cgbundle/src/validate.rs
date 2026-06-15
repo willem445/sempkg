@@ -41,6 +41,47 @@ pub fn validate_input_dir(dir: &Path) -> Result<(), PackError> {
     Ok(())
 }
 
+/// Validate that an optional QMD index directory has the required structure.
+///
+/// When `qmd/` is included in a bundle the following must be present
+/// (spec §9.1):
+/// - `index/index.sqlite` — project-local QMD database
+/// - `embeddings/`        — non-empty vector export directory
+/// - `metadata.json`      — QMD indexing metadata
+/// - `config.json`        — QMD collection configuration
+///
+/// `model.gguf` is optional and is not validated here.
+pub fn validate_qmd_dir(dir: &Path) -> Result<(), PackError> {
+    // Required files (relative to qmd_dir)
+    let required_files = [
+        "index/index.sqlite",
+        "metadata.json",
+        "config.json",
+    ];
+    for file in &required_files {
+        let path = dir.join(file);
+        if !path.is_file() {
+            return Err(PackError::MissingFile(format!("qmd/{file}")));
+        }
+    }
+
+    // `embeddings/` must exist and be non-empty
+    let embeddings = dir.join("embeddings");
+    if !embeddings.is_dir() {
+        return Err(PackError::MissingDirectory("qmd/embeddings".to_string()));
+    }
+    let has_files = WalkDir::new(&embeddings)
+        .min_depth(1)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .any(|e| e.file_type().is_file());
+    if !has_files {
+        return Err(PackError::EmptyDirectory("qmd/embeddings".to_string()));
+    }
+
+    Ok(())
+}
+
 /// Validate a bundle package name.
 ///
 /// Rules (spec §4.2):
@@ -151,5 +192,86 @@ mod tests {
     fn hash_with_non_hex_rejected() {
         let bad: String = "g".repeat(40);
         assert!(validate_commit_hash(&bad).is_err());
+    }
+
+    // --- validate_qmd_dir ---
+
+    use std::fs;
+    use tempfile::TempDir;
+
+    fn make_qmd_dir(dir: &Path) {
+        fs::create_dir_all(dir.join("index")).unwrap();
+        fs::create_dir_all(dir.join("embeddings")).unwrap();
+        fs::write(dir.join("index").join("index.sqlite"), b"sqlite-data").unwrap();
+        fs::write(dir.join("embeddings").join("vectors.bin"), b"vec-data").unwrap();
+        fs::write(dir.join("metadata.json"), b"{}").unwrap();
+        fs::write(dir.join("config.json"), b"{}").unwrap();
+    }
+
+    #[test]
+    fn valid_qmd_dir() {
+        let tmp = TempDir::new().unwrap();
+        make_qmd_dir(tmp.path());
+        assert!(validate_qmd_dir(tmp.path()).is_ok());
+    }
+
+    #[test]
+    fn qmd_missing_sqlite() {
+        let tmp = TempDir::new().unwrap();
+        make_qmd_dir(tmp.path());
+        fs::remove_file(tmp.path().join("index").join("index.sqlite")).unwrap();
+        let err = validate_qmd_dir(tmp.path()).unwrap_err();
+        assert!(
+            matches!(err, PackError::MissingFile(ref f) if f.contains("index.sqlite")),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn qmd_missing_metadata_json() {
+        let tmp = TempDir::new().unwrap();
+        make_qmd_dir(tmp.path());
+        fs::remove_file(tmp.path().join("metadata.json")).unwrap();
+        let err = validate_qmd_dir(tmp.path()).unwrap_err();
+        assert!(
+            matches!(err, PackError::MissingFile(ref f) if f.contains("metadata.json")),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn qmd_missing_config_json() {
+        let tmp = TempDir::new().unwrap();
+        make_qmd_dir(tmp.path());
+        fs::remove_file(tmp.path().join("config.json")).unwrap();
+        let err = validate_qmd_dir(tmp.path()).unwrap_err();
+        assert!(
+            matches!(err, PackError::MissingFile(ref f) if f.contains("config.json")),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn qmd_missing_embeddings_dir() {
+        let tmp = TempDir::new().unwrap();
+        make_qmd_dir(tmp.path());
+        fs::remove_dir_all(tmp.path().join("embeddings")).unwrap();
+        let err = validate_qmd_dir(tmp.path()).unwrap_err();
+        assert!(
+            matches!(err, PackError::MissingDirectory(ref d) if d.contains("embeddings")),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn qmd_empty_embeddings_dir() {
+        let tmp = TempDir::new().unwrap();
+        make_qmd_dir(tmp.path());
+        fs::remove_file(tmp.path().join("embeddings").join("vectors.bin")).unwrap();
+        let err = validate_qmd_dir(tmp.path()).unwrap_err();
+        assert!(
+            matches!(err, PackError::EmptyDirectory(ref d) if d.contains("embeddings")),
+            "unexpected: {err}"
+        );
     }
 }

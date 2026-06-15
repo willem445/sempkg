@@ -32,4 +32,16 @@ pub enum PackError {
     /// Directory traversal failure.
     #[error("directory walk error: {0}")]
     Walk(#[from] walkdir::Error),
+
+    /// External tool not found on PATH.
+    #[error("tool '{0}' not found on PATH — ensure it is installed and accessible")]
+    ToolNotFound(String),
+
+    /// External tool exited with a non-zero status.
+    #[error("'{tool}' exited with status {code:?}:\n{stderr}")]
+    ToolFailed {
+        tool: String,
+        code: Option<i32>,
+        stderr: String,
+    },
 }
