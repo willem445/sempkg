@@ -4,7 +4,7 @@ This guide covers how to run a local or self-hosted bundle registry, create and 
 
 ## Overview
 
-The bundle registry server is provided by the SemBundle-registry CLI in this repository.
+The bundle registry server is provided by the sempkg-registry CLI in this repository.
 
 Core endpoints:
 - GET /index.json: lists available packages/versions with SHA-256 hash and signing status per version
@@ -44,13 +44,13 @@ This installs FastAPI, uvicorn, and multipart support used by the registry serve
 Set an admin password (required):
 
 ```powershell
-$env:SemBundle_REGISTRY_ADMIN_PASSWORD = "change-me-now"
+$env:sempkg_registry_ADMIN_PASSWORD = "change-me-now"
 ```
 
 Start server on all interfaces so other LAN machines can reach it:
 
 ```powershell
-SemBundle-registry serve --host 0.0.0.0 --port 8765 --storage-dir C:\registry\bundles --config-dir C:\registry\config
+sempkg-registry serve --host 0.0.0.0 --port 8765 --storage-dir C:\registry\bundles --config-dir C:\registry\config
 ```
 
 Notes:
@@ -64,13 +64,13 @@ Notes:
 Build image from repository root:
 
 ```powershell
-docker build -f src/SemBundle_registry/Dockerfile -t SemBundle-registry .
+docker build -f src/SemBundle_registry/Dockerfile -t sempkg-registry .
 ```
 
 Run container:
 
 ```powershell
-docker run --rm -p 8765:8765 -e SemBundle_REGISTRY_ADMIN_PASSWORD="change-me-now" -v C:\registry-data:/data SemBundle-registry python -m SemBundle_registry serve --host 0.0.0.0 --port 8765 --storage-dir /data/bundles --config-dir /data/config
+docker run --rm -p 8765:8765 -e SemBundle_REGISTRY_ADMIN_PASSWORD="change-me-now" -v C:\registry-data:/data sempkg-registry python -m SemBundle_registry serve --host 0.0.0.0 --port 8765 --storage-dir /data/bundles --config-dir /data/config
 ```
 
 ## Token Management
@@ -80,19 +80,19 @@ docker run --rm -p 8765:8765 -e SemBundle_REGISTRY_ADMIN_PASSWORD="change-me-now
 Create token:
 
 ```powershell
-SemBundle-registry token add --label "ci-publisher" --config-dir C:\registry\config
+sempkg-registry token add --label "ci-publisher" --config-dir C:\registry\config
 ```
 
 List tokens (metadata only):
 
 ```powershell
-SemBundle-registry token list --config-dir C:\registry\config
+sempkg-registry token list --config-dir C:\registry\config
 ```
 
 Revoke token:
 
 ```powershell
-SemBundle-registry token revoke <TOKEN_VALUE> --config-dir C:\registry\config
+sempkg-registry token revoke <TOKEN_VALUE> --config-dir C:\registry\config
 ```
 
 ### Option B: Admin API token management
@@ -379,7 +379,7 @@ The server-generated index.json has this structure:
 ## Troubleshooting
 
 - Error: SemBundle_REGISTRY_ADMIN_PASSWORD environment variable is not set
-  - Set the variable before running SemBundle-registry serve.
+  - Set the variable before running sempkg-registry serve.
 
 - Publish returns 401
   - Token missing/invalid. Confirm Bearer token and correct config-dir.
