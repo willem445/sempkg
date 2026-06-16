@@ -247,6 +247,7 @@ Bundle registry and distribution docs:
 | `bundle list --global` | List global-only bundles | `codegraph-hub bundle list --global` |
 | `bundle remove <pkg>@<ver>` | Remove bundle from workspace scope | `codegraph-hub bundle remove my-lib@1.2.0` |
 | `bundle remove <pkg>@<ver> --global` | Remove bundle from global scope | `codegraph-hub bundle remove my-lib@1.2.0 --global` |
+| `bundle lance-search [<pkg>@<ver>] <query> [-n <n>]` | BM25 search over bundle documentation | `codegraph-hub bundle lance-search my-lib@1.2.0 "timeout configuration"` |
 
 ### cgbundle Registry Publishing
 
@@ -259,3 +260,118 @@ Bundle registry and distribution docs:
 - `CGBUNDLE_TOKEN`
 
 See [docs/registry-server.md](docs/registry-server.md) for self-hosting, token management, and full publish/pull workflows.
+
+---
+
+## Documentation Search (LanceDB)
+
+Bundles can include a built-in LanceDB documentation index (`lance/` extension). No external tools are required — indexing and searching happen entirely in-process.
+
+### Searching from the Python server
+
+Any bundle that was packed with `--lance-dir` (or built with `cgbundle build --docs-dir`) will show up in `list_packages` with a `+Lance docs` indicator. Call the `search_bundle_docs` MCP tool:
+
+```
+User: How does the retry policy work in my-sdk?
+Copilot: [calls search_bundle_docs("my-sdk", "retry policy")]
+         → returns BM25-ranked excerpts from the bundled markdown docs
+```
+
+Or from the CLI:
+
+```powershell
+codegraph-hub bundle lance-search my-sdk@1.2.0 "retry policy"
+codegraph-hub bundle lance-search "retry policy"    # search all bundles with docs
+```
+
+### Building bundles with documentation
+
+Use `cgbundle build --docs-dir` to index documentation alongside source during the build step:
+
+```powershell
+cgbundle build `
+  --name my-sdk `
+  --version 1.2.0 `
+  --source-dir C:\Projects\my-sdk\src `
+  --docs-dir   C:\Projects\my-sdk\docs `
+  --source-repo https://github.com/org/my-sdk `
+  --commit-hash <sha> `
+  --codegraph-version 1.0.0
+```
+
+This produces `my-sdk-1.2.0.cgbundle` containing both the CodeGraph index and a LanceDB documentation index with BM25 full-text search.
+
+To customise which files are indexed:
+
+```powershell
+--docs-glob "**/*.md,**/*.rst"   # default: **/*.{md,txt,rst}
+```
+
+To include a pre-built LanceDB directory in an existing pack operation:
+
+```powershell
+cgbundle pack ./cg-out --lance-dir ./my-lance-index --name my-sdk ...
+```
+
+See [docs/cgbundle-spec.md](docs/cgbundle-spec.md) §9 for the `lance/` extension format and [docs/adr-001-lancedb-doc-index.md](docs/adr-001-lancedb-doc-index.md) for the design rationale.
+
+---
+
+## sempkg — Rust MCP Server
+
+`sempkg` is a native Rust alternative to the Python `codegraph-hub` server. It is faster, has no Python runtime dependency, and includes the same doc search via LanceDB.
+
+### Install
+
+```powershell
+cargo install --path src/sempkg
+```
+
+Or build only:
+
+```powershell
+cd src/sempkg ; cargo build --release
+```
+
+### Configure for VS Code / Copilot
+
+Add to `.vscode/mcp.json` in your project (workspace-scoped) or to `%APPDATA%\Code\User\mcp.json` (global):
+
+```json
+{
+  "servers": {
+    "sempkg": {
+      "type": "stdio",
+      "command": "sempkg",
+      "args": ["mcp", "-C", "${workspaceFolder}"]
+    }
+  }
+}
+```
+
+### Quick start
+
+```powershell
+# Initialise a workspace manifest
+sempkg init --registry https://my-registry.example.com
+
+# Add and install a bundle dependency
+sempkg add my-sdk@1.2.0 --registry-url https://my-registry.example.com
+
+# Install all dependencies
+sempkg sync
+
+# Search symbols
+sempkg search my-sdk DataFrame
+
+# Search documentation (requires lance extension in bundle)
+sempkg docs my-sdk "retry policy"
+
+# Index docs for a locally registered package
+sempkg pkg add mylib C:\Projects\mylib
+sempkg pkg lance-index mylib --pattern "**/*.md"
+sempkg docs mylib "getting started"
+```
+
+See [docs/sempkg.md](docs/sempkg.md) for the full CLI and MCP reference.
+

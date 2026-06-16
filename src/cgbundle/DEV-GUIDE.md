@@ -61,8 +61,12 @@ automatically by `cargo`. No manual installation is needed.
 | `flate2` | 1 | Gzip compression/decompression (wraps `tar` streams) |
 | `chrono` | 0.4 | UTC timestamp generation for `created_at` fields |
 | `walkdir` | 2 | Recursive directory traversal |
-| `thiserror` | 1 | Ergonomic `Error` trait derivation for `PackError` |
-
+| `thiserror` | 1 | Ergonomic `Error` trait derivation for `PackError` || `lancedb` | 0.14 | LanceDB embedded database — used by `build.rs` to create the `lance/` doc index |
+| `arrow-array` | 52 | Apache Arrow columnar arrays — data rows for the LanceDB table |
+| `arrow-schema` | 52 | Arrow schema definition for the `docs` table (`path`, `content` columns) |
+| `tokio` | 1 | Async runtime — LanceDB's Rust API is fully async; `block_on` is used from sync entry points |
+| `glob` | 0.3 | Glob pattern matching for `--docs-glob` file discovery |
+| `which` | 6 | Locate `codegraph` on PATH |
 **Dev dependencies** (tests only):
 
 | Crate | Version | Purpose |
@@ -78,11 +82,12 @@ src/cgbundle/
 ├── Cargo.toml          # Package manifest and dependency declarations
 ├── DEV-GUIDE.md        # This file
 └── src/
-    ├── main.rs         # CLI entry point (clap subcommands)
+    ├── main.rs         # CLI entry point (clap subcommands: pack, build, publish, sign, verify, keygen)
     ├── pack.rs         # Core pack logic + integration tests
-    ├── manifest.rs     # Manifest and Metadata struct definitions
+    ├── build.rs        # Build pipeline: codegraph + LanceDB indexing + pack
+    ├── manifest.rs     # Manifest, Metadata, LanceMetadata struct definitions
     ├── checksum.rs     # SHA-256 helpers + unit tests
-    ├── validate.rs     # Input validation + unit tests
+    ├── validate.rs     # Input validation + unit tests (validate_lance_dir)
     └── error.rs        # PackError enum (thiserror)
 ```
 
@@ -147,7 +152,72 @@ test result: ok. 18 passed; 0 failed
 
 ## 6. Usage
 
-### Synopsis
+There are two ways to create a bundle:
+
+- **`cgbundle build`** — run CodeGraph indexing and (optionally) LanceDB documentation indexing, then pack everything in one step. Recommended for CI.
+- **`cgbundle pack`** — pack a pre-existing CodeGraph output directory. Use this if you already have a `graph/` directory and want to add a pre-built `lance/` extension.
+
+---
+
+### `cgbundle build` — Full pipeline (recommended)
+
+```
+cgbundle build --name <name> --version <ver> --source-repo <url> --commit-hash <sha>
+               --codegraph-version <ver> --source-dir <dir> [--source-dir <dir> ...]
+               [--docs-dir <dir> [--docs-dir <dir> ...] [--docs-glob <pattern>]]
+               [--tag <tag>] [--language <lang>] [--output <path>]
+```
+
+| Flag | Required | Description |
+|------|----------|-------------|
+| `--name` / `-n` | Yes | Package name |
+| `--version` / `-r` | Yes | Version string |
+| `--source-repo` | Yes | Canonical repository URL |
+| `--commit-hash` | Yes | Full 40-character Git SHA |
+| `--codegraph-version` | Yes | Version of CodeGraph used |
+| `--source-dir` / `-s` | Yes (repeat) | Source directory to index with `codegraph init --index`. Multiple flags allowed. |
+| `--docs-dir` / `-d` | No (repeat) | Documentation directory to index with LanceDB. Multiple flags allowed. Omit to skip the `lance/` extension. |
+| `--docs-glob` | No | Glob pattern for doc discovery. Default: `**/*.{md,txt,rst}`. Comma-separate multiple patterns. |
+| `--tag` | No | Git tag |
+| `--language` | No | Primary language (default: `unknown`) |
+| `--output` / `-o` | No | Output `.cgbundle` path (default: `./<name>-<version>.cgbundle`) |
+
+**Example — source only:**
+
+```powershell
+cgbundle build `
+  --name aws-sdk `
+  --version 1.11.210 `
+  --source-repo https://github.com/aws/aws-sdk-cpp `
+  --commit-hash d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3 `
+  --codegraph-version 0.3.1 `
+  --source-dir C:\Projects\aws-sdk\src `
+  --language cpp
+```
+
+**Example — source + LanceDB documentation index:**
+
+```powershell
+cgbundle build `
+  --name my-sdk `
+  --version 2.0.0 `
+  --source-repo https://github.com/org/my-sdk `
+  --commit-hash a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0 `
+  --codegraph-version 0.3.1 `
+  --source-dir C:\Projects\my-sdk\src `
+  --docs-dir   C:\Projects\my-sdk\docs `
+  --docs-glob  "**/*.md" `
+  --language   rust
+```
+
+The build step:
+1. Runs `codegraph init --index` on each `--source-dir`
+2. Walks each `--docs-dir`, matches files against `--docs-glob`, chunks them into ~800-char paragraphs, writes a LanceDB `docs` table, and creates a tantivy BM25 FTS index — all in-process, no external tools
+3. Packs everything into a `.cgbundle` archive
+
+---
+
+### `cgbundle pack` — Pack a pre-existing CodeGraph output directory
 
 ```
 cgbundle pack <INPUT_DIR> [OPTIONS]
@@ -172,41 +242,7 @@ cgbundle pack <INPUT_DIR> [OPTIONS]
 | `--language` | `unknown` | Primary language indexed (e.g. `python`, `cpp`, `rust`) |
 | `--indexed-paths` | `.` | Comma-separated list of repo-relative paths that were indexed |
 | `--output` / `-o` | `./<name>-<version>.cgbundle` | Output file path |
-
-### Example
-
-```powershell
-cgbundle pack C:\codegraph-output\aws-sdk `
-    --name aws-sdk `
-    --version 1.11.210 `
-    --source-repo https://github.com/aws/aws-sdk-cpp `
-    --commit-hash d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3 `
-    --codegraph-version 0.3.1 `
-    --tag 1.11.210 `
-    --language cpp `
-    --indexed-paths src,include `
-    --output aws-sdk-1.11.210.cgbundle
-```
-
-Successful output:
-
-```
-Bundle created: aws-sdk-1.11.210.cgbundle
-```
-
-On error, a structured message is printed to stderr and the process exits with
-code `1`:
-
-```
-error: required directory not found: 'graph' (expected inside the CodeGraph output dir)
-```
-
-### Getting help
-
-```powershell
-cgbundle --help
-cgbundle pack --help
-```
+| `--lance-dir` | none | Path to a pre-built LanceDB directory to include as the `lance/` extension. Must contain `metadata.json` and a `docs.lance/` subdirectory. |
 
 ---
 

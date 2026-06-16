@@ -45,8 +45,8 @@ pub struct BundleManifest {
 }
 
 impl BundleManifest {
-    pub fn has_qmd(&self) -> bool {
-        self.extensions.iter().any(|e| e == "qmd")
+    pub fn has_lance(&self) -> bool {
+        self.extensions.iter().any(|e| e == "lance")
     }
 }
 
@@ -71,8 +71,8 @@ pub enum BundleScope {
 }
 
 impl BundleInfo {
-    pub fn has_qmd(&self) -> bool {
-        self.manifest.has_qmd() && self.bundle_dir.join("qmd").join("index").join("index.sqlite").exists()
+    pub fn has_lance(&self) -> bool {
+        self.manifest.has_lance() && self.bundle_dir.join("lance").is_dir()
     }
 
     pub fn is_indexed(&self) -> bool {

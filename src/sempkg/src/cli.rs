@@ -9,7 +9,7 @@ use clap::{Parser, Subcommand};
     version,
     about = "Semantic package manager for cgbundle archives",
     long_about = "sempkg manages cgbundle semantic index packages, provides scoped \
-                  CodeGraph and QMD queries, and runs an MCP server for AI agents."
+                  CodeGraph and LanceDB doc queries, and runs an MCP server for AI agents."
 )]
 pub struct Cli {
     /// Workspace directory (default: current directory)
@@ -185,10 +185,10 @@ pub enum Commands {
     },
 
     // -----------------------------------------------------------------------
-    // QMD documentation search
+    // LanceDB documentation search
     // -----------------------------------------------------------------------
 
-    /// Search the documentation index of a bundle.
+    /// Search the LanceDB documentation index of a bundle.
     Docs {
         /// Bundle name.
         package: String,
@@ -199,7 +199,7 @@ pub enum Commands {
         limit: usize,
     },
 
-    /// Show QMD index metadata for a bundle.
+    /// Show LanceDB index metadata for a bundle.
     DocsMeta {
         /// Bundle name.
         package: String,
@@ -244,11 +244,11 @@ pub enum PkgCommands {
     /// List all registered local packages.
     List,
 
-    /// Build or update the QMD documentation index for a local package.
+    /// Build or update the LanceDB documentation index for a local package.
     ///
-    /// The index is stored at <package-path>/.sempkg/qmd/index.sqlite and is
-    /// fully isolated from the user's global QMD install.
-    QmdIndex {
+    /// The index is stored at <package-path>/.sempkg/lance/ and requires
+    /// no external tools.
+    LanceIndex {
         /// Package name (must be registered with `sempkg pkg add`).
         name: String,
         /// Glob pattern of files to index (default: **/*.{md,rst,txt}).

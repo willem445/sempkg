@@ -369,9 +369,9 @@ class BundlePackage:
         """Bundle is queryable if its ``graph/`` directory exists."""
         return (Path(self.path) / "graph").exists()
 
-    def has_qmd(self) -> bool:
-        """Return True when the bundle contains a QMD documentation index."""
-        return (Path(self.path) / "qmd" / "index" / "index.sqlite").exists()
+    def has_lance(self) -> bool:
+        """Return True when the bundle contains a LanceDB documentation index."""
+        return (Path(self.path) / "lance").is_dir()
 
 
 def get_all_bundle_packages(workspace_dir: Path | None = None) -> list[BundlePackage]:

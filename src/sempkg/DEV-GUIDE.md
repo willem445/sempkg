@@ -1,6 +1,6 @@
 # sempkg — Developer Guide
 
-`sempkg` is a native Rust CLI and MCP server for managing cgbundle semantic index packages, querying CodeGraph and QMD, and serving context to AI agents.
+`sempkg` is a native Rust CLI and MCP server for managing cgbundle semantic index packages, querying CodeGraph and LanceDB documentation indexes, and serving context to AI agents.
 
 ---
 
@@ -18,7 +18,7 @@ src/sempkg/
     ├── registry.rs      HTTP registry client (index.json, downloads)
     ├── verify.rs        Ed25519 signature verification
     ├── codegraph.rs     codegraph CLI wrapper (scoped queries)
-    ├── qmd.rs           QMD SQLite search + CLI wrapper
+    ├── lance.rs         LanceDB documentation search (scoped to bundle)
     ├── packages.rs      Local package registry (~/.sempkg/packages.json)
     └── mcp.rs           MCP JSON-RPC 2.0 server (stdio transport)
 ```
@@ -87,6 +87,7 @@ The lock file `sempkg.lock` is auto-generated. Commit it for reproducible instal
 | `sempkg pkg remove <name>` | Unregister a local package |
 | `sempkg pkg reindex <name>` | Reindex a local package |
 | `sempkg pkg status <name>` | Show codegraph index status |
+| `sempkg pkg lance-index <name> [--pattern <glob>]` | Build/update LanceDB documentation index |
 
 ### CodeGraph queries (package-scoped)
 
@@ -101,12 +102,12 @@ All queries operate exclusively on the named package's index — no cross-packag
 | `sempkg impact <pkg> <symbol> [-d <depth>]` | Impact analysis |
 | `sempkg files <pkg> [-f <filter>]` | List indexed files |
 
-### QMD documentation search
+### LanceDB documentation search
 
 | Command | Description |
 |---------|-------------|
-| `sempkg docs <bundle> <query> [-n <limit>]` | Search bundle documentation |
-| `sempkg docs-meta <bundle>` | Show QMD metadata |
+| `sempkg docs <bundle> <query> [-n <limit>]` | BM25 search over bundle documentation |
+| `sempkg docs-meta <bundle>` | Show LanceDB metadata (document count, FTS status) |
 
 ### MCP server
 
@@ -143,8 +144,8 @@ The MCP server exposes these tools to AI agents:
 | `get_callees` | Find callees of a symbol |
 | `get_impact` | Downstream impact analysis |
 | `list_files` | List files in a package |
-| `search_docs` | BM25/vector search over bundle QMD docs |
-| `docs_metadata` | QMD metadata for a bundle |
+| `search_docs` | BM25 full-text search over bundle LanceDB documentation |
+| `docs_metadata` | LanceDB metadata for a bundle |
 
 All tools accept a `package` argument that scopes the query to exactly one package or bundle.
 
@@ -160,10 +161,17 @@ All tools accept a `package` argument that scopes the query to exactly one packa
     config.json
     graph/
     embeddings/
-    qmd/           (optional)
+    lance/           (optional — LanceDB documentation index)
+        metadata.json
+        docs.lance/
 
 # Global bundles
 ~/.sempkg/bundles/<name>/<version>/
+
+# Local package LanceDB indexes (built with `sempkg pkg lance-index`)
+<package-path>/.sempkg/lance/
+    metadata.json
+    docs.lance/
 
 # Local package registry
 ~/.sempkg/packages.json
@@ -182,4 +190,4 @@ Generate a key pair with `cgbundle keygen`.
 ## Dependencies
 
 - [CodeGraph](https://github.com/colbymchenry/codegraph) — must be on PATH (`npm install -g @colbymchenry/codegraph`)
-- [QMD](https://github.com/tobi/qmd) — optional, required for `docs` commands on local projects (`npm install -g @tobilu/qmd`)
+- No external tools required for documentation indexing. LanceDB runs entirely in-process.

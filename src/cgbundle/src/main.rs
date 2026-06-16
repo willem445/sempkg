@@ -76,16 +76,14 @@ enum Commands {
         #[arg(long, short = 'o')]
         output: Option<PathBuf>,
 
-        /// Path to a project-local QMD index directory to include as the `qmd/` extension.
+        /// Path to a pre-built LanceDB directory to include as the `lance/` extension.
         ///
         /// The directory must contain:
-        ///   index/index.sqlite  — QMD SQLite database
-        ///   embeddings/         — non-empty vector export
-        ///   metadata.json       — QMD indexing metadata
-        ///   config.json         — QMD collection configuration
-        /// model.gguf is optional. When supplied, sets extensions=["qmd"] in manifest.json.
+        ///   metadata.json  — LanceDB indexing metadata
+        ///   docs.lance/    — LanceDB Arrow table directory
+        /// When supplied, sets extensions=["lance"] in manifest.json.
         #[arg(long)]
-        qmd_dir: Option<PathBuf>,
+        lance_dir: Option<PathBuf>,
     },
 
     /// Publish a .cgbundle to a registry server
@@ -145,23 +143,15 @@ enum Commands {
         #[arg(long = "source-dir", short = 's', required = true)]
         source_dirs: Vec<PathBuf>,
 
-        // --- QMD inputs (optional) ---
-        /// Documentation directory to index with QMD.
+        // --- Lance inputs (optional) ---
+        /// Documentation directory to index with LanceDB.
         /// Repeat the flag to add multiple directories.
         #[arg(long = "docs-dir", short = 'd')]
         docs_dirs: Vec<PathBuf>,
 
-        /// QMD collection name (default: bundle name)
+        /// Glob mask for document discovery (default: **/*.{md,txt,rst})
         #[arg(long)]
-        qmd_collection_name: Option<String>,
-
-        /// Glob mask for QMD document discovery (default: **/*.{md,txt,rst})
-        #[arg(long)]
-        qmd_glob: Option<String>,
-
-        /// QMD chunking strategy: "auto" (AST-aware) or "regex" (default: auto)
-        #[arg(long, default_value = "auto")]
-        qmd_chunk_strategy: String,
+        docs_glob: Option<String>,
     },
 
     /// Generate an Ed25519 keypair for bundle signing
@@ -241,9 +231,7 @@ fn main() {
             output,
             source_dirs,
             docs_dirs,
-            qmd_collection_name,
-            qmd_glob,
-            qmd_chunk_strategy,
+            docs_glob,
         } => build::build(BuildOptions {
             name,
             version,
@@ -255,9 +243,7 @@ fn main() {
             output_path: output,
             source_dirs,
             docs_dirs,
-            qmd_collection_name,
-            qmd_glob,
-            qmd_chunk_strategy,
+            docs_glob,
         })
         .map(|path| {
             println!("Bundle created: {}", path.display());
@@ -270,13 +256,12 @@ fn main() {
             version,
             source_repo,
             commit_hash,
-
             codegraph_version,
             tag,
             language,
             indexed_paths,
             output,
-            qmd_dir,
+            lance_dir,
         } => pack::pack(PackOptions {
             input_dir,
             output_path: output,
@@ -288,7 +273,7 @@ fn main() {
             language,
             indexed_paths,
             codegraph_version,
-            qmd_dir,
+            lance_dir,
         })
         .map(|path| {
             println!("Bundle created: {}", path.display());

@@ -4,7 +4,7 @@ mod error;
 mod manifest;
 mod mcp;
 mod packages;
-mod qmd;
+mod lance;
 mod registry;
 mod store;
 mod verify;
@@ -89,13 +89,13 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
                 println!("Installed bundles:");
                 for b in &bundles {
                     let idx = if b.is_indexed() { "indexed" } else { "no graph" };
-                    let qmd_flag = if b.has_qmd() { "  +qmd" } else { "" };
+                    let lance_flag = if b.has_lance() { "  +lance" } else { "" };
                     let scope = match b.scope {
                         BundleScope::Workspace => "workspace",
                         BundleScope::Global    => "global",
                     };
                     println!(
-                        "  {:<20} @ {:<12} [{idx}]  [{scope}]{qmd_flag}",
+                        "  {:<20} @ {:<12} [{idx}]  [{scope}]{lance_flag}",
                         b.name, b.version
                     );
                 }
@@ -300,7 +300,7 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
             println!(
                 "Installed {}@{} [{scope_label}]{}",
                 info.name, info.version,
-                if info.has_qmd() { "  +qmd" } else { "" }
+                if info.has_lance() { "  +lance" } else { "" }
             );
             Ok(())
         }
@@ -330,7 +330,7 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
                 println!("  Graph:      {}", bundle.bundle_dir.join("graph").exists());
                 println!("  .codegraph: {}", bundle.bundle_dir.join(".codegraph").exists());
                 println!("  Queryable:  {}", bundle.is_indexed());
-                println!("  QMD:        {}", bundle.has_qmd());
+                println!("  Lance:      {}", bundle.has_lance());
                 println!("  Source:     {}", bundle.manifest.source_repo);
                 println!("  Commit:     {}", bundle.manifest.commit_hash);
                 println!("  Created:    {}", bundle.manifest.created_at);
@@ -410,28 +410,26 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
         }
 
         // -----------------------------------------------------------------------
-        // QMD doc search
+        // LanceDB doc search
         // -----------------------------------------------------------------------
         Commands::Docs { package, query, limit } => {
-            let (bundle_dir, collection) = resolve_qmd_path(&package, workspace)?;
-            let results = qmd::search(&bundle_dir, &query, limit, Some(&collection))?;
-            println!("{}", qmd::format_results(&results, &query));
+            let bundle_dir = resolve_lance_path(&package, workspace)?;
+            let results = lance::search(&bundle_dir, &query, limit)?;
+            println!("{}", lance::format_results(&results, &query));
             Ok(())
         }
 
         Commands::DocsMeta { package } => {
-            let (bundle_dir, _) = resolve_qmd_path(&package, workspace)?;
-            if let Some(meta) = qmd::load_metadata(&bundle_dir) {
-                println!("QMD metadata for '{package}':");
-                println!("  Version:         {}", meta.qmd_version.as_deref().unwrap_or("unknown"));
-                println!("  Model:           {}", meta.embed_model.as_deref().unwrap_or("unknown"));
-                println!("  Chunk strategy:  {}", meta.chunk_strategy.as_deref().unwrap_or("unknown"));
-                println!("  Collection:      {}", meta.collection_name.as_deref().unwrap_or("unknown"));
-                println!("  Documents:       {}", meta.document_count.unwrap_or(0));
-                println!("  Chunks:          {}", meta.chunk_count.unwrap_or(0));
-                println!("  Indexed at:      {}", meta.created_at.as_deref().unwrap_or("unknown"));
+            let bundle_dir = resolve_lance_path(&package, workspace)?;
+            if let Some(meta) = lance::load_metadata(&bundle_dir) {
+                println!("LanceDB metadata for '{package}':");
+                println!("  Table:       {}", meta.table_name.as_deref().unwrap_or("docs"));
+                println!("  Documents:   {}", meta.document_count.unwrap_or(0));
+                println!("  Chunks:      {}", meta.chunk_count.unwrap_or(0));
+                println!("  FTS enabled: {}", meta.fts_enabled.unwrap_or(false));
+                println!("  Indexed at:  {}", meta.created_at.as_deref().unwrap_or("unknown"));
             } else {
-                anyhow::bail!("No QMD metadata found for '{package}'.");
+                anyhow::bail!("No LanceDB metadata found for '{package}'.");
             }
             Ok(())
         }
@@ -531,17 +529,16 @@ fn run_pkg(cmd: PkgCommands) -> Result<()> {
             Ok(())
         }
 
-        PkgCommands::QmdIndex { name, pattern } => {
+        PkgCommands::LanceIndex { name, pattern } => {
             let reg = PackageRegistry::load()?;
             let pkg = reg.get(&name).with_context(|| format!("Package '{name}' not found."))?;
             println!(
-                "Building QMD index for '{name}' (pattern: {pattern})\n\
-                 Index stored at: {}/.sempkg/qmd/index.sqlite\n\
-                 Global QMD collections are not affected.",
+                "Building LanceDB index for '{name}' (pattern: {pattern})\n\
+                 Index stored at: {}/.sempkg/lance/",
                 pkg.path
             );
-            let db_path = qmd::cli_update(&pkg.abs_path(), &pkg.name, &pattern)?;
-            println!("QMD index ready at {}", db_path.display());
+            let lance_dir = lance::cli_update(&pkg.abs_path(), &pkg.name, &pattern)?;
+            println!("LanceDB index ready at {}", lance_dir.display());
             println!(
                 "Search it with: sempkg docs {name} \"<query>\"\n\
                  (or via MCP tool: search_docs)"
@@ -620,34 +617,28 @@ fn resolve_codegraph_path(name: &str, workspace: Option<&Path>) -> Result<PathBu
     anyhow::bail!("Package '{name}' not found.{hint}")
 }
 
-/// Resolve a name to its QMD-queryable directory, and its collection name.
-/// Returns `(bundle_dir, collection_name)`.
+/// Resolve a name to its LanceDB-queryable directory.
 /// Checks local packages first, then installed bundles.
-fn resolve_qmd_path(name: &str, workspace: Option<&Path>) -> Result<(PathBuf, String)> {
-    // Local package with a scoped QMD index built by `sempkg pkg qmd-index`
-    // Layout: <pkg-path>/.sempkg/qmd/index/index.sqlite
-    // qmd_db_path() appends qmd/index/index.sqlite, so bundle_dir must be <pkg-path>/.sempkg/
+fn resolve_lance_path(name: &str, workspace: Option<&Path>) -> Result<PathBuf> {
     let reg = PackageRegistry::load()?;
     if let Some(pkg) = reg.get(name) {
-        let sempkg_dir = pkg.abs_path().join(".sempkg");
-        let local_db = sempkg_dir.join("qmd").join("index").join("index.sqlite");
-        if local_db.exists() {
-            return Ok((sempkg_dir, pkg.name.clone()));
+        let lance_dir = pkg.abs_path().join(".sempkg").join("lance");
+        if lance_dir.is_dir() {
+            return Ok(lance_dir);
         }
         anyhow::bail!(
-            "Package '{name}' has no QMD index. Run 'sempkg pkg qmd-index {name}' to build one."
+            "Package '{name}' has no LanceDB index. Run 'sempkg pkg lance-index {name}' to build one."
         );
     }
 
-    // Installed bundle (pre-built QMD index inside the bundle)
     if let Some(bundle) = resolve_bundle(name, workspace) {
-        if !bundle.has_qmd() {
+        if !bundle.has_lance() {
             anyhow::bail!(
-                "Bundle '{name}@{}' does not have a QMD documentation index.",
+                "Bundle '{name}@{}' does not have a LanceDB documentation index.",
                 bundle.version
             );
         }
-        return Ok((bundle.bundle_dir, name.to_string()));
+        return Ok(bundle.bundle_dir.join("lance"));
     }
 
     anyhow::bail!("'{name}' not found. Run 'sempkg list' to see available packages and bundles.")

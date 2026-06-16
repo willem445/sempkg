@@ -36,11 +36,11 @@ pub enum SempkgError {
     #[error("codegraph error: {0}")]
     CodegraphError(String),
 
-    #[error("QMD not found on PATH. Install it with: npm install -g @tobilu/qmd")]
-    QmdNotFound,
+    #[error("No LanceDB documentation index found in bundle '{0}'")]
+    NoLanceIndex(String),
 
-    #[error("No QMD index found in bundle '{0}'")]
-    NoQmdIndex(String),
+    #[error("LanceDB error: {0}")]
+    LanceError(String),
 
     #[error("Package '{0}' is not indexed. Run 'sempkg reindex {0}' first.")]
     NotIndexed(String),
@@ -55,7 +55,7 @@ pub enum SempkgError {
     TomlParse(#[from] toml::de::Error),
 
     #[error("Database error: {0}")]
-    Db(#[from] rusqlite::Error),
+    Db(String),
 }
 
 pub type Result<T> = std::result::Result<T, SempkgError>;

@@ -41,42 +41,28 @@ pub fn validate_input_dir(dir: &Path) -> Result<(), PackError> {
     Ok(())
 }
 
-/// Validate that an optional QMD index directory has the required structure.
+/// Validate that an optional Lance index directory has the required structure.
 ///
-/// When `qmd/` is included in a bundle the following must be present
+/// When `lance/` is included in a bundle the following must be present
 /// (spec §9.1):
-/// - `index/index.sqlite` — project-local QMD database
-/// - `embeddings/`        — non-empty vector export directory
-/// - `metadata.json`      — QMD indexing metadata
-/// - `config.json`        — QMD collection configuration
-///
-/// `model.gguf` is optional and is not validated here.
-pub fn validate_qmd_dir(dir: &Path) -> Result<(), PackError> {
-    // Required files (relative to qmd_dir)
-    let required_files = [
-        "index/index.sqlite",
-        "metadata.json",
-        "config.json",
-    ];
-    for file in &required_files {
-        let path = dir.join(file);
-        if !path.is_file() {
-            return Err(PackError::MissingFile(format!("qmd/{file}")));
-        }
+/// - `metadata.json`     — index metadata
+/// - at least one `*.lance/` subdirectory  — the LanceDB table directory
+pub fn validate_lance_dir(dir: &Path) -> Result<(), PackError> {
+    // metadata.json is required
+    if !dir.join("metadata.json").is_file() {
+        return Err(PackError::MissingFile("lance/metadata.json".to_string()));
     }
 
-    // `embeddings/` must exist and be non-empty
-    let embeddings = dir.join("embeddings");
-    if !embeddings.is_dir() {
-        return Err(PackError::MissingDirectory("qmd/embeddings".to_string()));
-    }
-    let has_files = WalkDir::new(&embeddings)
-        .min_depth(1)
-        .into_iter()
+    // At least one *.lance table directory must exist
+    let has_table = std::fs::read_dir(dir)
+        .map_err(|e| PackError::Io(e))?
         .filter_map(|e| e.ok())
-        .any(|e| e.file_type().is_file());
-    if !has_files {
-        return Err(PackError::EmptyDirectory("qmd/embeddings".to_string()));
+        .any(|e| {
+            e.file_name().to_string_lossy().ends_with(".lance") && e.path().is_dir()
+        });
+
+    if !has_table {
+        return Err(PackError::MissingDirectory("lance/*.lance".to_string()));
     }
 
     Ok(())
@@ -194,45 +180,31 @@ mod tests {
         assert!(validate_commit_hash(&bad).is_err());
     }
 
-    // --- validate_qmd_dir ---
+    // --- validate_lance_dir ---
 
     use std::fs;
     use tempfile::TempDir;
 
-    fn make_qmd_dir(dir: &Path) {
-        fs::create_dir_all(dir.join("index")).unwrap();
-        fs::create_dir_all(dir.join("embeddings")).unwrap();
-        fs::write(dir.join("index").join("index.sqlite"), b"sqlite-data").unwrap();
-        fs::write(dir.join("embeddings").join("vectors.bin"), b"vec-data").unwrap();
+    fn make_lance_dir(dir: &Path) {
+        let table_dir = dir.join("docs.lance");
+        fs::create_dir_all(&table_dir).unwrap();
+        fs::write(table_dir.join("0.lance"), b"arrow-data").unwrap();
         fs::write(dir.join("metadata.json"), b"{}").unwrap();
-        fs::write(dir.join("config.json"), b"{}").unwrap();
     }
 
     #[test]
-    fn valid_qmd_dir() {
+    fn valid_lance_dir() {
         let tmp = TempDir::new().unwrap();
-        make_qmd_dir(tmp.path());
-        assert!(validate_qmd_dir(tmp.path()).is_ok());
+        make_lance_dir(tmp.path());
+        assert!(validate_lance_dir(tmp.path()).is_ok());
     }
 
     #[test]
-    fn qmd_missing_sqlite() {
+    fn lance_missing_metadata_json() {
         let tmp = TempDir::new().unwrap();
-        make_qmd_dir(tmp.path());
-        fs::remove_file(tmp.path().join("index").join("index.sqlite")).unwrap();
-        let err = validate_qmd_dir(tmp.path()).unwrap_err();
-        assert!(
-            matches!(err, PackError::MissingFile(ref f) if f.contains("index.sqlite")),
-            "unexpected: {err}"
-        );
-    }
-
-    #[test]
-    fn qmd_missing_metadata_json() {
-        let tmp = TempDir::new().unwrap();
-        make_qmd_dir(tmp.path());
+        make_lance_dir(tmp.path());
         fs::remove_file(tmp.path().join("metadata.json")).unwrap();
-        let err = validate_qmd_dir(tmp.path()).unwrap_err();
+        let err = validate_lance_dir(tmp.path()).unwrap_err();
         assert!(
             matches!(err, PackError::MissingFile(ref f) if f.contains("metadata.json")),
             "unexpected: {err}"
@@ -240,37 +212,12 @@ mod tests {
     }
 
     #[test]
-    fn qmd_missing_config_json() {
+    fn lance_missing_table_dir() {
         let tmp = TempDir::new().unwrap();
-        make_qmd_dir(tmp.path());
-        fs::remove_file(tmp.path().join("config.json")).unwrap();
-        let err = validate_qmd_dir(tmp.path()).unwrap_err();
+        fs::write(tmp.path().join("metadata.json"), b"{}").unwrap();
+        let err = validate_lance_dir(tmp.path()).unwrap_err();
         assert!(
-            matches!(err, PackError::MissingFile(ref f) if f.contains("config.json")),
-            "unexpected: {err}"
-        );
-    }
-
-    #[test]
-    fn qmd_missing_embeddings_dir() {
-        let tmp = TempDir::new().unwrap();
-        make_qmd_dir(tmp.path());
-        fs::remove_dir_all(tmp.path().join("embeddings")).unwrap();
-        let err = validate_qmd_dir(tmp.path()).unwrap_err();
-        assert!(
-            matches!(err, PackError::MissingDirectory(ref d) if d.contains("embeddings")),
-            "unexpected: {err}"
-        );
-    }
-
-    #[test]
-    fn qmd_empty_embeddings_dir() {
-        let tmp = TempDir::new().unwrap();
-        make_qmd_dir(tmp.path());
-        fs::remove_file(tmp.path().join("embeddings").join("vectors.bin")).unwrap();
-        let err = validate_qmd_dir(tmp.path()).unwrap_err();
-        assert!(
-            matches!(err, PackError::EmptyDirectory(ref d) if d.contains("embeddings")),
+            matches!(err, PackError::MissingDirectory(_)),
             "unexpected: {err}"
         );
     }

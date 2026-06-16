@@ -8,8 +8,8 @@ use walkdir::WalkDir;
 
 use crate::checksum::sha256_bytes;
 use crate::error::PackError;
-use crate::manifest::{Manifest, Metadata, QmdMetadata};
-use crate::validate::{validate_commit_hash, validate_input_dir, validate_name, validate_qmd_dir};
+use crate::manifest::{LanceMetadata, Manifest, Metadata};
+use crate::validate::{validate_commit_hash, validate_input_dir, validate_lance_dir, validate_name};
 
 /// Options for the `pack` operation.
 pub struct PackOptions {
@@ -29,12 +29,12 @@ pub struct PackOptions {
     pub indexed_paths: Vec<String>,
     /// Version of CodeGraph used to produce the index.
     pub codegraph_version: String,
-    /// Optional path to a project-local QMD index directory.
+    /// Optional path to a pre-built LanceDB index directory.
     ///
     /// When supplied the directory must contain:
-    /// `index/index.sqlite`, `embeddings/` (non-empty), `metadata.json`, `config.json`.
-    /// `model.gguf` is optional. Spec: cgbundle-spec.md §9.
-    pub qmd_dir: Option<PathBuf>,
+    /// `metadata.json` and at least one `*.lance/` table directory.
+    /// Spec: cgbundle-spec.md §9.
+    pub lance_dir: Option<PathBuf>,
 }
 
 /// In-memory bundle entry: bundle-relative key + raw bytes.
@@ -55,8 +55,8 @@ pub fn pack(opts: PackOptions) -> Result<PathBuf, PackError> {
     validate_name(&opts.name)?;
     validate_commit_hash(&opts.commit_hash)?;
     validate_input_dir(&opts.input_dir)?;
-    if let Some(ref qmd) = opts.qmd_dir {
-        validate_qmd_dir(qmd)?;
+    if let Some(ref lance) = opts.lance_dir {
+        validate_lance_dir(lance)?;
     }
 
     let created_at = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
@@ -100,11 +100,11 @@ pub fn pack(opts: PackOptions) -> Result<PathBuf, PackError> {
         content: serde_json::to_vec_pretty(&metadata)?,
     });
 
-    // --- Optional QMD extension ---
+    // --- Optional Lance extension ---
     let mut extensions: Vec<String> = Vec::new();
-    if let Some(ref qmd_dir) = opts.qmd_dir {
-        collect_qmd_entries(qmd_dir, &created_at, &mut entries)?;
-        extensions.push("qmd".to_string());
+    if let Some(ref lance_dir) = opts.lance_dir {
+        collect_lance_entries(lance_dir, &created_at, &mut entries)?;
+        extensions.push("lance".to_string());
     }
 
     // --- Compute checksums for all non-manifest files ---
@@ -115,7 +115,7 @@ pub fn pack(opts: PackOptions) -> Result<PathBuf, PackError> {
 
     // --- Generate manifest.json (checksums are now final) ---
     let manifest = Manifest {
-        spec_version: "1.1.0".to_string(),
+        spec_version: "1.2.0".to_string(),
         name: opts.name.clone(),
         version: opts.version.clone(),
         source_repo: opts.source_repo.clone(),
@@ -190,48 +190,48 @@ fn collect_dir(dir: &Path, dir_prefix: &str, entries: &mut Vec<Entry>) -> Result
     Ok(())
 }
 
-/// Collect all QMD index files into `qmd/`-prefixed bundle entries.
+/// Collect all LanceDB index files into `lance/`-prefixed bundle entries.
 ///
-/// - `qmd/index/index.sqlite`   — copied verbatim
-/// - `qmd/embeddings/**`        — all files copied verbatim
-/// - `qmd/metadata.json`        — parsed, `created_at` stamped, re-serialised
-/// - `qmd/config.json`          — copied verbatim
-/// - `qmd/model.gguf`           — copied verbatim when present (optional)
-fn collect_qmd_entries(
-    qmd_dir: &Path,
+/// - `lance/metadata.json`   — parsed, `created_at` stamped, re-serialised
+/// - `lance/<table>.lance/**` — all Arrow/Lance data files copied verbatim
+fn collect_lance_entries(
+    lance_dir: &Path,
     created_at: &str,
     entries: &mut Vec<Entry>,
 ) -> Result<(), PackError> {
-    // index/index.sqlite
-    entries.push(Entry {
-        key: "qmd/index/index.sqlite".to_string(),
-        content: std::fs::read(qmd_dir.join("index").join("index.sqlite"))?,
-    });
-
-    // embeddings/**
-    collect_dir(&qmd_dir.join("embeddings"), "qmd/embeddings", entries)?;
-
-    // metadata.json — stamp created_at for cross-field consistency (spec §11.5)
-    let raw_meta = std::fs::read(qmd_dir.join("metadata.json"))?;
-    let mut qmd_meta: QmdMetadata = serde_json::from_slice(&raw_meta)?;
-    qmd_meta.created_at = created_at.to_string();
-    entries.push(Entry {
-        key: "qmd/metadata.json".to_string(),
-        content: serde_json::to_vec_pretty(&qmd_meta)?,
-    });
-
-    // config.json
-    entries.push(Entry {
-        key: "qmd/config.json".to_string(),
-        content: std::fs::read(qmd_dir.join("config.json"))?,
-    });
-
-    // model.gguf (optional)
-    let model_path = qmd_dir.join("model.gguf");
-    if model_path.is_file() {
+    // Stamp metadata.json with the bundle's created_at (spec §11.5)
+    let meta_path = lance_dir.join("metadata.json");
+    if meta_path.is_file() {
+        let raw = std::fs::read(&meta_path)?;
+        let mut meta: LanceMetadata = serde_json::from_slice(&raw)?;
+        meta.created_at = created_at.to_string();
         entries.push(Entry {
-            key: "qmd/model.gguf".to_string(),
-            content: std::fs::read(&model_path)?,
+            key: "lance/metadata.json".to_string(),
+            content: serde_json::to_vec_pretty(&meta)?,
+        });
+    }
+
+    // Copy everything else in the lance directory recursively (table files, FTS index, etc.)
+    for result in WalkDir::new(lance_dir).min_depth(1).sort_by_file_name() {
+        let entry = result?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let rel = entry.path().strip_prefix(lance_dir).unwrap();
+        let rel_key: String = rel
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("/");
+
+        // metadata.json already handled above
+        if rel_key == "metadata.json" {
+            continue;
+        }
+
+        entries.push(Entry {
+            key: format!("lance/{rel_key}"),
+            content: std::fs::read(entry.path())?,
         });
     }
 
@@ -281,31 +281,24 @@ mod tests {
             language: "rust".to_string(),
             indexed_paths: vec!["src".to_string()],
             codegraph_version: "0.3.1".to_string(),
-            qmd_dir: None,
+            lance_dir: None,
         }
     }
 
-    /// Build a minimal but valid QMD index directory.
-    fn make_qmd_dir(dir: &Path) {
-        fs::create_dir_all(dir.join("index")).unwrap();
-        fs::create_dir_all(dir.join("embeddings")).unwrap();
-        fs::write(dir.join("index").join("index.sqlite"), b"sqlite-data").unwrap();
-        fs::write(dir.join("embeddings").join("vectors.bin"), b"vec-data").unwrap();
+    /// Build a minimal but valid LanceDB index directory.
+    fn make_lance_dir(dir: &Path) {
+        let table_dir = dir.join("docs.lance");
+        fs::create_dir_all(&table_dir).unwrap();
+        fs::write(table_dir.join("0.lance"), b"arrow-data").unwrap();
         let meta = serde_json::json!({
-            "qmd_version": "2.5.3",
-            "embed_model": "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf",
-            "embed_model_hash": null,
-            "chunk_strategy": "auto",
-            "embeddings_format": "binary-f32",
-            "embedding_dim": 768,
-            "collection_name": "my-sdk",
+            "table_name": "docs",
             "document_count": 10,
             "chunk_count": 42,
             "indexed_paths": ["docs/**/*.md"],
+            "fts_enabled": true,
             "created_at": "1970-01-01T00:00:00Z"
         });
         fs::write(dir.join("metadata.json"), serde_json::to_vec_pretty(&meta).unwrap()).unwrap();
-        fs::write(dir.join("config.json"), b"{}").unwrap();
     }
 
     /// Extract all entries from a `.cgbundle` file.
@@ -526,7 +519,7 @@ mod tests {
         let (manifest_bytes, _) = extract_bundle(&output);
         let m: Manifest = serde_json::from_slice(&manifest_bytes).unwrap();
 
-        assert_eq!(m.spec_version, "1.1.0");
+        assert_eq!(m.spec_version, "1.2.0");
         assert_eq!(m.name, "my-sdk");
         assert_eq!(m.version, "1.0.0");
         assert_eq!(m.source_repo, "https://github.com/example/my-sdk");
@@ -557,63 +550,61 @@ mod tests {
         );
     }
 
-    // ── QMD extension ─────────────────────────────────────────────────────────
+    // ── Lance extension ───────────────────────────────────────────────────────
 
     #[test]
-    fn pack_with_qmd_succeeds() {
+    fn pack_with_lance_succeeds() {
         let tmp = TempDir::new().unwrap();
         let input = tmp.path().join("input");
-        let qmd = tmp.path().join("qmd");
+        let lance = tmp.path().join("lance");
         make_input(&input);
-        make_qmd_dir(&qmd);
+        make_lance_dir(&lance);
         let output = tmp.path().join("out.cgbundle");
         let mut opts = default_opts(input, output.clone());
-        opts.qmd_dir = Some(qmd);
+        opts.lance_dir = Some(lance);
         assert!(pack(opts).is_ok());
         assert!(output.exists());
     }
 
     #[test]
-    fn qmd_files_present_in_archive() {
+    fn lance_files_present_in_archive() {
         let tmp = TempDir::new().unwrap();
         let input = tmp.path().join("input");
-        let qmd = tmp.path().join("qmd");
+        let lance = tmp.path().join("lance");
         make_input(&input);
-        make_qmd_dir(&qmd);
+        make_lance_dir(&lance);
         let output = tmp.path().join("out.cgbundle");
         let mut opts = default_opts(input, output.clone());
-        opts.qmd_dir = Some(qmd);
+        opts.lance_dir = Some(lance);
         pack(opts).unwrap();
 
         let (_, files) = extract_bundle(&output);
-        assert!(files.contains_key("qmd/index/index.sqlite"), "qmd/index/index.sqlite missing");
-        assert!(files.contains_key("qmd/metadata.json"), "qmd/metadata.json missing");
-        assert!(files.contains_key("qmd/config.json"), "qmd/config.json missing");
+        assert!(files.contains_key("lance/metadata.json"), "lance/metadata.json missing");
         assert!(
-            files.keys().any(|k| k.starts_with("qmd/embeddings/")),
-            "no qmd/embeddings/ files"
+            files.keys().any(|k| k.starts_with("lance/docs.lance/")),
+            "no lance/docs.lance/ files"
         );
     }
 
     #[test]
-    fn qmd_extension_declared_in_manifest() {
+    fn lance_extension_declared_in_manifest() {
         let tmp = TempDir::new().unwrap();
         let input = tmp.path().join("input");
-        let qmd = tmp.path().join("qmd");
+        let lance = tmp.path().join("lance");
         make_input(&input);
-        make_qmd_dir(&qmd);
+        make_lance_dir(&lance);
         let output = tmp.path().join("out.cgbundle");
         let mut opts = default_opts(input, output.clone());
-        opts.qmd_dir = Some(qmd);
+        opts.lance_dir = Some(lance);
         pack(opts).unwrap();
 
         let (manifest_bytes, _) = extract_bundle(&output);
         let m: Manifest = serde_json::from_slice(&manifest_bytes).unwrap();
-        assert!(m.extensions.iter().any(|e| e == "qmd"), "\"qmd\" not in extensions");
+        assert!(m.extensions.iter().any(|e| e == "lance"), "\"lance\" not in extensions");
     }
 
     #[test]
-    fn no_qmd_extension_without_qmd_dir() {
+    fn no_lance_extension_without_lance_dir() {
         let tmp = TempDir::new().unwrap();
         let input = tmp.path().join("input");
         make_input(&input);
@@ -622,83 +613,48 @@ mod tests {
 
         let (manifest_bytes, _) = extract_bundle(&output);
         let m: Manifest = serde_json::from_slice(&manifest_bytes).unwrap();
-        assert!(!m.extensions.iter().any(|e| e == "qmd"), "\"qmd\" should not be in extensions");
+        assert!(!m.extensions.iter().any(|e| e == "lance"), "\"lance\" should not be in extensions");
     }
 
     #[test]
-    fn qmd_metadata_created_at_stamped() {
+    fn lance_metadata_created_at_stamped() {
         let tmp = TempDir::new().unwrap();
         let input = tmp.path().join("input");
-        let qmd = tmp.path().join("qmd");
+        let lance = tmp.path().join("lance");
         make_input(&input);
-        make_qmd_dir(&qmd);
+        make_lance_dir(&lance);
         let output = tmp.path().join("out.cgbundle");
         let mut opts = default_opts(input, output.clone());
-        opts.qmd_dir = Some(qmd);
+        opts.lance_dir = Some(lance);
         pack(opts).unwrap();
 
         let (manifest_bytes, files) = extract_bundle(&output);
         let m: Manifest = serde_json::from_slice(&manifest_bytes).unwrap();
-        let qmd_meta: serde_json::Value =
-            serde_json::from_slice(files.get("qmd/metadata.json").unwrap()).unwrap();
-        // created_at in qmd/metadata.json must match manifest created_at (spec §11.5)
-        assert_eq!(qmd_meta["created_at"], m.created_at);
-        // Must not keep the placeholder value written by make_qmd_dir
-        assert_ne!(qmd_meta["created_at"], "1970-01-01T00:00:00Z");
+        let lance_meta: serde_json::Value =
+            serde_json::from_slice(files.get("lance/metadata.json").unwrap()).unwrap();
+        // created_at in lance/metadata.json must match manifest created_at (spec §11.5)
+        assert_eq!(lance_meta["created_at"], m.created_at);
+        assert_ne!(lance_meta["created_at"], "1970-01-01T00:00:00Z");
     }
 
     #[test]
-    fn qmd_with_model_gguf_included() {
+    fn lance_checksums_include_all_lance_files() {
         let tmp = TempDir::new().unwrap();
         let input = tmp.path().join("input");
-        let qmd = tmp.path().join("qmd");
+        let lance = tmp.path().join("lance");
         make_input(&input);
-        make_qmd_dir(&qmd);
-        // Add optional model.gguf
-        fs::write(qmd.join("model.gguf"), b"gguf-bytes").unwrap();
+        make_lance_dir(&lance);
         let output = tmp.path().join("out.cgbundle");
         let mut opts = default_opts(input, output.clone());
-        opts.qmd_dir = Some(qmd);
-        pack(opts).unwrap();
-
-        let (manifest_bytes, files) = extract_bundle(&output);
-        assert!(files.contains_key("qmd/model.gguf"), "qmd/model.gguf missing from archive");
-        let m: Manifest = serde_json::from_slice(&manifest_bytes).unwrap();
-        assert!(m.checksums.contains_key("qmd/model.gguf"), "qmd/model.gguf missing from checksums");
-    }
-
-    #[test]
-    fn qmd_without_model_gguf_still_valid() {
-        let tmp = TempDir::new().unwrap();
-        let input = tmp.path().join("input");
-        let qmd = tmp.path().join("qmd");
-        make_input(&input);
-        make_qmd_dir(&qmd);
-        let output = tmp.path().join("out.cgbundle");
-        let mut opts = default_opts(input, output.clone());
-        opts.qmd_dir = Some(qmd);
-        let result = pack(opts);
-        assert!(result.is_ok(), "pack without model.gguf should succeed");
-    }
-
-    #[test]
-    fn qmd_checksums_include_all_qmd_files() {
-        let tmp = TempDir::new().unwrap();
-        let input = tmp.path().join("input");
-        let qmd = tmp.path().join("qmd");
-        make_input(&input);
-        make_qmd_dir(&qmd);
-        let output = tmp.path().join("out.cgbundle");
-        let mut opts = default_opts(input, output.clone());
-        opts.qmd_dir = Some(qmd);
+        opts.lance_dir = Some(lance);
         pack(opts).unwrap();
 
         let (manifest_bytes, files) = extract_bundle(&output);
         let m: Manifest = serde_json::from_slice(&manifest_bytes).unwrap();
-        for key in files.keys().filter(|k| k.starts_with("qmd/")) {
+        for key in files.keys().filter(|k| k.starts_with("lance/")) {
             assert!(
                 m.checksums.contains_key(key),
-                "qmd file '{key}' missing from checksums"
+                "lance file '{key}' missing from checksums"
             );
         }
     }

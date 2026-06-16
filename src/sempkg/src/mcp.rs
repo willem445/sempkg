@@ -1,4 +1,4 @@
-/// MCP server — JSON-RPC 2.0 over stdio, exposing codegraph + QMD tools.
+/// MCP server — JSON-RPC 2.0 over stdio, exposing codegraph + LanceDB tools.
 ///
 /// Protocol: https://spec.modelcontextprotocol.io
 /// Transport: stdin/stdout (newline-delimited JSON)
@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 
 use crate::packages::PackageRegistry;
 use crate::store::{list_all_bundles, resolve_bundle};
-use crate::{codegraph, qmd};
+use crate::{codegraph, lance};
 
 // ---------------------------------------------------------------------------
 // JSON-RPC types
@@ -100,7 +100,7 @@ fn all_tools() -> Value {
     json!([
         tool_schema(
             "list_packages",
-            "List all registered local packages and installed bundles with their index and QMD status.",
+            "List all registered local packages and installed bundles with their index and LanceDB doc status.",
             json!({}),
             &[]
         ),
@@ -166,7 +166,7 @@ fn all_tools() -> Value {
         ),
         tool_schema(
             "search_docs",
-            "Search the QMD documentation index for a specific bundle. \
+            "Search the LanceDB documentation index for a specific bundle. \
              Returns BM25-ranked excerpts scoped to that bundle only.",
             json!({
                 "package": { "type": "string", "description": "Bundle name" },
@@ -177,7 +177,7 @@ fn all_tools() -> Value {
         ),
         tool_schema(
             "docs_metadata",
-            "Show QMD metadata (model, chunk strategy, document count) for a bundle.",
+            "Show LanceDB metadata (table name, document count, chunk count, FTS status) for a bundle.",
             json!({
                 "package": { "type": "string", "description": "Bundle name" }
             }),
@@ -239,34 +239,29 @@ impl McpContext {
         Err(format!("Package '{name}' not found.{hint}"))
     }
 
-    /// Resolve a package/bundle name to `(bundle_dir, collection_name)` for QMD queries.
+    /// Resolve a package/bundle name to its LanceDB directory path.
     /// Checks local packages first (scoped index), then installed bundles.
-    ///
-    /// For local packages: bundle_dir = <pkg>/.sempkg/ so qmd_db_path() resolves correctly.
-    /// For bundles:        bundle_dir = <store>/<name>/<version>/
-    fn resolve_qmd_path(&self, name: &str) -> Result<(PathBuf, String), String> {
-        // Local package with a scoped QMD index at <pkg>/.sempkg/qmd/index/index.sqlite
+    fn resolve_lance_path(&self, name: &str) -> Result<PathBuf, String> {
+        // Local package with a scoped LanceDB index at <pkg>/.sempkg/lance/
         if let Some(pkg) = self.registry.get(name) {
-            let sempkg_dir = pkg.abs_path().join(".sempkg");
-            let local_db = sempkg_dir.join("qmd").join("index").join("index.sqlite");
-            if local_db.exists() {
-                return Ok((sempkg_dir, pkg.name.clone()));
+            let lance_dir = pkg.abs_path().join(".sempkg").join("lance");
+            if lance_dir.is_dir() {
+                return Ok(lance_dir);
             }
             return Err(format!(
-                "Package '{name}' has no QMD index. Run 'sempkg pkg qmd-index {name}' to build one."
+                "Package '{name}' has no LanceDB index. Run 'sempkg pkg lance-index {name}' to build one."
             ));
         }
 
         // Installed bundle
         if let Some(bundle) = resolve_bundle(name, self.workspace().map(|p| p.as_path())) {
-            if !bundle.has_qmd() {
+            if !bundle.has_lance() {
                 return Err(format!(
-                    "Bundle '{name}@{}' does not have a QMD documentation index.",
+                    "Bundle '{name}@{}' does not have a LanceDB documentation index.",
                     bundle.version
                 ));
             }
-            let collection = bundle.name.clone();
-            return Ok((bundle.bundle_dir, collection));
+            return Ok(bundle.bundle_dir.join("lance"));
         }
 
         Err(format!("'{name}' not found. Use 'sempkg list' to see available packages and bundles."))
@@ -309,14 +304,14 @@ impl McpContext {
             lines.push("**Installed bundles:**".to_string());
             for b in &bundles {
                 let idx = if b.is_indexed() { "indexed" } else { "no graph" };
-                let qmd = if b.has_qmd() { "  +qmd" } else { "" };
+                let lance = if b.has_lance() { "  +lance" } else { "" };
                 let scope = match b.scope {
                     crate::store::BundleScope::Workspace => "workspace",
                     crate::store::BundleScope::Global => "global",
                 };
                 lines.push(format!(
-                    "  • **{}** @ {}  [{}]  [{}]{}",
-                    b.name, b.version, idx, scope, qmd
+                    "  \u{2022} **{}** @ {}  [{}]  [{}]{}",
+                    b.name, b.version, idx, scope, lance
                 ));
             }
         }
@@ -379,11 +374,11 @@ impl McpContext {
     }
 
     fn tool_search_docs(&self, package: &str, query: &str, limit: usize) -> String {
-        match self.resolve_qmd_path(package) {
+        match self.resolve_lance_path(package) {
             Err(e) => e,
-            Ok((bundle_dir, collection)) => {
-                match qmd::search(&bundle_dir, query, limit, Some(&collection)) {
-                    Ok(results) => qmd::format_results(&results, query),
+            Ok(lance_dir) => {
+                match lance::search(&lance_dir, query, limit) {
+                    Ok(results) => lance::format_results(&results, query),
                     Err(e) => format!("Error searching docs: {e}"),
                 }
             }
@@ -391,29 +386,30 @@ impl McpContext {
     }
 
     fn tool_docs_metadata(&self, package: &str) -> String {
-        match self.resolve_qmd_path(package) {
+        match self.resolve_lance_path(package) {
             Err(e) => e,
-            Ok((bundle_dir, _)) => {
-                if let Some(meta) = qmd::load_metadata(&bundle_dir) {
-                    format!(
-                        "**QMD metadata for '{package}'**\n\
-                         - Version: {}\n\
-                         - Model: {}\n\
-                         - Chunk strategy: {}\n\
-                         - Collection: {}\n\
+            Ok(lance_dir) => {
+                // load_metadata expects bundle_dir (parent of lance/), but lance_dir IS the lance dir
+                // so we read metadata.json directly
+                let meta_path = lance_dir.join("metadata.json");
+                match std::fs::read_to_string(&meta_path)
+                    .ok()
+                    .and_then(|s| serde_json::from_str::<lance::LanceMetadata>(&s).ok())
+                {
+                    Some(meta) => format!(
+                        "**LanceDB metadata for '{package}'**\n\
+                         - Table: {}\n\
                          - Documents: {}\n\
                          - Chunks: {}\n\
+                         - FTS enabled: {}\n\
                          - Indexed at: {}",
-                        meta.qmd_version.as_deref().unwrap_or("unknown"),
-                        meta.embed_model.as_deref().unwrap_or("unknown"),
-                        meta.chunk_strategy.as_deref().unwrap_or("unknown"),
-                        meta.collection_name.as_deref().unwrap_or("unknown"),
+                        meta.table_name.as_deref().unwrap_or("docs"),
                         meta.document_count.unwrap_or(0),
                         meta.chunk_count.unwrap_or(0),
+                        meta.fts_enabled.unwrap_or(false),
                         meta.created_at.as_deref().unwrap_or("unknown"),
-                    )
-                } else {
-                    format!("No QMD metadata found for bundle '{package}'.")
+                    ),
+                    None => format!("No LanceDB metadata found for bundle '{package}'."),
                 }
             }
         }

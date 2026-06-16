@@ -6,7 +6,7 @@ from pathlib import Path
 from fastmcp import FastMCP
 
 from .bundle_store import get_all_bundle_packages, get_global_store, get_workspace_store
-from . import qmd as qmd_mod
+from . import lance as lance_mod
 from .codegraph import (
     callers,
     callees,
@@ -26,7 +26,7 @@ from .registry import Registry
 mcp = FastMCP(
     "codegraph-hub",
     instructions=textwrap.dedent("""\
-        codegraph-hub exposes CodeGraph symbol/call-graph intelligence and QMD
+        codegraph-hub exposes CodeGraph symbol/call-graph intelligence and LanceDB
         documentation search for internally registered packages and installed
         .cgbundle archives.
 
@@ -35,7 +35,7 @@ mcp = FastMCP(
         2. Call search_package to find a class, function, or module by name.
         3. Call get_context with a task description for AI-optimized code context.
         4. Call get_callers / get_callees to understand call relationships.
-        5. Call search_bundle_docs to search bundled documentation (QMD).
+        5. Call search_bundle_docs to search bundled documentation (LanceDB BM25).
         6. Call read_file for the full source of a specific file (packages only).
 
         Always start with list_packages when unsure which package contains a symbol.
@@ -111,9 +111,9 @@ def list_packages() -> str:
         lines.append("\n**Installed bundles:**\n")
         for bp in bundle_pkgs:
             status_icon = "✓ indexed" if bp.is_indexed else "✗ not queryable"
-            qmd_flag = "  *(+QMD docs)*" if bp.has_qmd() else ""
+            lance_flag = "  *(+Lance docs)*" if bp.has_lance() else ""
             scope = "workspace" if ".codegraph_hub" in str(bp.abs_path) else "global"
-            lines.append(f"  • **{bp.name}** @ {bp.version}  [{status_icon}]  [{scope}]{qmd_flag}")
+            lines.append(f"  • **{bp.name}** @ {bp.version}  [{status_icon}]  [{scope}]{lance_flag}")
             lines.append(f"    path: {bp.path}")
 
     return "\n".join(lines)
@@ -608,15 +608,15 @@ def search_bundle_docs(
     workspace_dir: str = "",
     limit: int = 10,
 ) -> str:
-    """Search the QMD documentation index of an installed bundle.
+    """Search the LanceDB documentation index of an installed bundle.
 
     Performs BM25 full-text search over documentation files (markdown, rst, txt)
-    that were indexed into the bundle's QMD database during packing.
+    that were indexed into the bundle's LanceDB table during packing.
 
     Workspace bundles are checked first, then global bundles.
 
     Args:
-        bundle_name:     Bundle name to search, or "" to search all bundles with QMD.
+        bundle_name:     Bundle name to search, or "" to search all bundles with Lance.
         query_str:       Documentation search query (keywords or natural language).
         bundle_version:  Specific version to target (optional; uses first match if omitted).
         workspace_dir:   Workspace root for scoped bundle resolution (default: cwd).
@@ -626,19 +626,19 @@ def search_bundle_docs(
     bundle_pkgs = get_all_bundle_packages(ws_dir)
 
     if not bundle_name:
-        qmd_bundles = [bp for bp in bundle_pkgs if bp.has_qmd()]
-        if not qmd_bundles:
+        lance_bundles = [bp for bp in bundle_pkgs if bp.has_lance()]
+        if not lance_bundles:
             return (
-                "No installed bundles have a QMD documentation index.\n"
-                "Bundles must be packed with the --qmd-dir option to include a QMD index."
+                "No installed bundles have a LanceDB documentation index.\n"
+                "Bundles must be packed with the --lance-dir option to include a Lance index."
             )
         sections: list[str] = []
-        for bp in qmd_bundles:
-            result = qmd_mod.qmd_search(bp.abs_path, query_str, limit)
+        for bp in lance_bundles:
+            result = lance_mod.lance_search(bp.abs_path, query_str, limit)
             if result and not result.startswith("(no results"):
                 sections.append(f"### {bp.name} @ {bp.version}\n\n{result}")
         if not sections:
-            return f"No QMD documentation results for '{query_str}' across installed bundles."
+            return f"No LanceDB documentation results for '{query_str}' across installed bundles."
         return "\n\n---\n\n".join(sections)
 
     # Find a specific bundle by name (and optionally version)
@@ -654,12 +654,12 @@ def search_bundle_docs(
             f"Bundle '{spec}' not found. "
             "Use list_bundle_packages to see available bundles."
         )
-    if not target.has_qmd():
+    if not target.has_lance():
         return (
-            f"Bundle '{target.name}@{target.version}' does not have a QMD documentation index.\n"
-            "Bundles must be packed with the --qmd-dir option to include a QMD index."
+            f"Bundle '{target.name}@{target.version}' does not have a LanceDB documentation index.\n"
+            "Bundles must be packed with the --lance-dir option to include a Lance index."
         )
-    return qmd_mod.qmd_search(target.abs_path, query_str, limit)
+    return lance_mod.lance_search(target.abs_path, query_str, limit)
 
 
 def main() -> None:

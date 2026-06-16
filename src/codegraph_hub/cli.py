@@ -7,7 +7,7 @@ import urllib.request
 from pathlib import Path
 
 from . import codegraph as cg
-from . import qmd as qmd_mod
+from . import lance as lance_mod
 from .bundle_store import (
     BundleInstallError,
     BundlePackage,
@@ -46,9 +46,9 @@ def cmd_list(registry: Registry, args: argparse.Namespace) -> int:
         print("Installed bundles:")
         for bp in bundle_pkgs:
             status = "indexed" if bp.is_indexed else "NOT indexed"
-            qmd_flag = "  +qmd" if bp.has_qmd() else ""
+            lance_flag = "  +lance" if bp.has_lance() else ""
             scope = "workspace" if (Path(bp.path).parents[2].name == ".codegraph_hub") else "global"
-            print(f"  {bp.name:<20} @ {bp.version:<12} [{status}]  [{scope}]{qmd_flag}")
+            print(f"  {bp.name:<20} @ {bp.version:<12} [{status}]  [{scope}]{lance_flag}")
     return 0
 
 
@@ -526,14 +526,13 @@ def cmd_bundle_search_registry(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_bundle_qmd_search(args: argparse.Namespace) -> int:
-    """Search the QMD documentation index of one or all installed bundles."""
+def cmd_bundle_lance_search(args: argparse.Namespace) -> int:
+    """Search the LanceDB documentation index of one or all installed bundles."""
     query = args.query
     limit = args.limit
 
     if args.pkg_version:
         name, version = _parse_pkg_version(args.pkg_version)
-        # Resolve from workspace store first, then global
         ws_store = get_workspace_store()
         bundle_dir = ws_store.resolve(name, version)
         if bundle_dir is None:
@@ -541,22 +540,22 @@ def cmd_bundle_qmd_search(args: argparse.Namespace) -> int:
         if bundle_dir is None:
             print(f"Bundle '{name}@{version}' is not installed.", file=sys.stderr)
             return 1
-        if not qmd_mod.has_qmd(bundle_dir):
-            print(f"Bundle '{name}@{version}' does not have a QMD documentation index.", file=sys.stderr)
+        if not lance_mod.has_lance(bundle_dir):
+            print(f"Bundle '{name}@{version}' does not have a LanceDB documentation index.", file=sys.stderr)
             return 1
-        print(qmd_mod.qmd_search(bundle_dir, query, limit))
+        print(lance_mod.lance_search(bundle_dir, query, limit))
         return 0
 
-    # No specific bundle — search all installed bundles with QMD indexes
+    # No specific bundle — search all installed bundles with Lance indexes
     bundle_pkgs = get_all_bundle_packages()
-    qmd_bundles = [bp for bp in bundle_pkgs if qmd_mod.has_qmd(bp.abs_path)]
-    if not qmd_bundles:
-        print("No installed bundles have a QMD documentation index.", file=sys.stderr)
+    lance_bundles = [bp for bp in bundle_pkgs if lance_mod.has_lance(bp.abs_path)]
+    if not lance_bundles:
+        print("No installed bundles have a LanceDB documentation index.", file=sys.stderr)
         return 1
 
     found_any = False
-    for bp in qmd_bundles:
-        result = qmd_mod.qmd_search(bp.abs_path, query, limit)
+    for bp in lance_bundles:
+        result = lance_mod.lance_search(bp.abs_path, query, limit)
         if result and not result.startswith("(no results"):
             if found_any:
                 print("\n" + "─" * 60 + "\n")
@@ -565,7 +564,7 @@ def cmd_bundle_qmd_search(args: argparse.Namespace) -> int:
             found_any = True
 
     if not found_any:
-        print(f"No QMD documentation results for '{query}' across installed bundles.")
+        print(f"No LanceDB documentation results for '{query}' across installed bundles.")
     return 0
 
 
@@ -690,11 +689,11 @@ def main_cli() -> None:
     pb_search = bundle_sub.add_parser("search-registry", help="List packages available on a registry")
     pb_search.add_argument("url", metavar="URL", help="Registry base URL")
 
-    pb_qmd = bundle_sub.add_parser("qmd-search", help="Full-text search the QMD documentation index of a bundle")
-    pb_qmd.add_argument("pkg_version", metavar="<pkg>@<version>", nargs="?", default=None,
-                        help="Bundle name@version (omit to search all bundles with QMD)")
-    pb_qmd.add_argument("query", help="Documentation search query")
-    pb_qmd.add_argument("-n", "--limit", type=int, default=10, help="Max results (default: 10)")
+    pb_lance = bundle_sub.add_parser("lance-search", help="Full-text search the LanceDB documentation index of a bundle")
+    pb_lance.add_argument("pkg_version", metavar="<pkg>@<version>", nargs="?", default=None,
+                          help="Bundle name@version (omit to search all bundles with Lance)")
+    pb_lance.add_argument("query", help="Documentation search query")
+    pb_lance.add_argument("-n", "--limit", type=int, default=10, help="Max results (default: 10)")
 
     pb_add = bundle_sub.add_parser("add", help="Add a bundle dependency and install it")
     pb_add.add_argument("pkg_version", metavar="<pkg>@<version>")
@@ -729,7 +728,7 @@ def main_cli() -> None:
             "add":             cmd_bundle_add,
             "sync":            cmd_bundle_sync,
             "lock":            cmd_bundle_lock,
-            "qmd-search":      cmd_bundle_qmd_search,
+            "lance-search":    cmd_bundle_lance_search,
         }
         sys.exit(bundle_dispatch[args.bundle_command](args))
 
