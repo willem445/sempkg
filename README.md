@@ -48,7 +48,7 @@ sempkg init --registry https://your-registry.example.com
 
 # Add a dependency and install
 sempkg add my-sdk@1.2.0
-sempkg add pkg@4.6.1 --url https://github.com/org/repo/releases/download/pkg-v4.6.1/pkg-v4.6.1.cgbundle
+sempkg add pkg@4.6.1 --url https://github.com/org/repo/releases/download/pkg-v4.6.1/pkg-v4.6.1.sembundle
 sempkg sync
 ```
 

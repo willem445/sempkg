@@ -1,6 +1,6 @@
 # sempkg — Developer Guide
 
-`sempkg` is a native Rust CLI and MCP server for managing cgbundle semantic index packages, querying CodeGraph and LanceDB documentation indexes, and serving context to AI agents.
+`sempkg` is a native Rust CLI and MCP server for managing sembundle semantic index packages, querying CodeGraph and LanceDB documentation indexes, and serving context to AI agents.
 
 ---
 
@@ -181,9 +181,9 @@ All tools accept a `package` argument that scopes the query to exactly one packa
 
 ## Bundle Verification
 
-Pass `--verify-key path/to/pubkey.pem` to `sempkg install` or add a `verify_key` to `[workspace]` in `sempkg.toml`. The tool fetches `<bundle>.cgbundle.sig` from the registry and verifies the Ed25519 signature over the bundle's SHA-256 digest.
+Pass `--verify-key path/to/pubkey.pem` to `sempkg install` or add a `verify_key` to `[workspace]` in `sempkg.toml`. The tool fetches `<bundle>.sembundle.sig` from the registry and verifies the Ed25519 signature over the bundle's SHA-256 digest.
 
-Generate a key pair with `cgbundle keygen`.
+Generate a key pair with `sembundle keygen`.
 
 ---
 
