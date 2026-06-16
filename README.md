@@ -16,13 +16,45 @@ A semantic package manager and MCP server for [CodeGraph](https://github.com/col
 
 ---
 
-## Quick Start
+## Installation
 
-### Install `sempkg` (from source)
+### Pre-built binaries (recommended)
 
+**Linux / macOS:**
+```sh
+curl -fsSL https://raw.githubusercontent.com/willem445/codegraph-hub/main/install.sh | sh
+```
+
+**Windows (PowerShell):**
 ```powershell
+irm https://raw.githubusercontent.com/willem445/codegraph-hub/main/install.ps1 | iex
+```
+
+Both scripts install `sembundle` and `sempkg` to `~/.local/bin` (Linux/macOS) or `%USERPROFILE%\.local\bin` (Windows). The PowerShell script automatically adds the directory to your user `PATH`.
+
+**Options** (pass after `--` for sh, as flags for ps1):
+
+| Flag | Description |
+|------|-------------|
+| `--only sembundle` / `-Only sembundle` | Install only `sembundle` |
+| `--only sempkg` / `-Only sempkg` | Install only `sempkg` |
+| `--version v1.2.0` / `-Version v1.2.0` | Pin a specific release tag |
+| `--dir /custom/path` / `-InstallDir C:\path` | Override install directory |
+
+### Build from source
+
+Requires the [Rust toolchain](https://rustup.rs) and a C/C++ compiler (MSVC on Windows, Xcode CLT on macOS, `cmake`+`clang` on Linux).
+
+```sh
+cargo install --path src/sembundle
 cargo install --path src/sempkg
 ```
+
+---
+
+## Quick Start
+
+### Configure VS Code (workspace)
 
 ### Configure VS Code (workspace)
 
@@ -69,7 +101,7 @@ sempkg sync
 | Requirement | Notes |
 |-------------|-------|
 | [CodeGraph](https://github.com/colbymchenry/codegraph) | Must be on `PATH`. Install with `npm install -g @colbymchenry/codegraph`. |
-| Rust toolchain | Required to build `sempkg` and `sembundle` from source. |
+| Rust toolchain | Required only when building `sempkg` and `sembundle` from source. Not needed when using the install scripts. |
 | Python 3.11+ | Required only for `sempkg-registry`. |
 
 ---
