@@ -218,3 +218,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# codegraph-hub workspace bundle store
+.codegraph_hub/

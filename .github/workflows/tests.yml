@@ -48,3 +48,54 @@ jobs:
           files: ./coverage.xml
           fail_ci_if_error: false
           verbose: true
+
+  rust-test:
+    name: Rust tests — ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache sembundle build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src/sembundle -> target
+          key: test-sembundle-${{ matrix.os }}
+
+      - name: Cache sempkg build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src/sempkg -> target
+          key: test-sempkg-${{ matrix.os }}
+
+      # aws-lc-rs requires cmake + clang on Linux
+      - name: Install build dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y cmake clang
+
+      # NASM improves aws-lc-rs assembly on Windows
+      - name: Install NASM (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/setup-nasm@v1
+
+      # lance-encoding requires protoc at build time
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Test sembundle
+        run: cargo test --manifest-path src/sembundle/Cargo.toml
+
+      - name: Test sempkg
+        run: cargo test --manifest-path src/sempkg/Cargo.toml
