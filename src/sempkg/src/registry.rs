@@ -177,3 +177,47 @@ impl RegistryClient {
         &self.base_url
     }
 }
+
+// ---------------------------------------------------------------------------
+// Standalone URL download (GitHub releases or any direct .cgbundle URL)
+// ---------------------------------------------------------------------------
+
+/// Download a `.cgbundle` from an arbitrary URL and optionally verify its SHA-256.
+///
+/// Use this when a dependency specifies a `url` directly (e.g. a GitHub release
+/// asset) rather than going through a registry.
+pub fn download_from_url(url: &str, expected_sha256: Option<&str>) -> Result<Vec<u8>> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .context("Failed to build HTTP client")?;
+
+    let resp = client
+        .get(url)
+        .send()
+        .with_context(|| format!("Failed to connect to {url}"))?;
+
+    if !resp.status().is_success() {
+        return Err(SempkgError::RegistryError {
+            url: url.to_string(),
+            message: format!("HTTP {}", resp.status()),
+        }
+        .into());
+    }
+
+    let bytes = resp.bytes().context("Failed to read response body")?.to_vec();
+
+    if let Some(expected) = expected_sha256 {
+        let actual = hex::encode(Sha256::digest(&bytes));
+        if actual != expected {
+            return Err(SempkgError::ChecksumMismatch {
+                path: url.to_string(),
+                expected: expected.to_string(),
+                actual,
+            }
+            .into());
+        }
+    }
+
+    Ok(bytes)
+}

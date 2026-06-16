@@ -19,7 +19,7 @@ use sha2::{Digest, Sha256};
 use crate::cli::{Cli, Commands, PkgCommands};
 use crate::manifest::{DependencyEntry, RegistryEntry};
 use crate::packages::PackageRegistry;
-use crate::registry::RegistryClient;
+use crate::registry::{RegistryClient, download_from_url};
 use crate::store::{BundleScope, BundleStore, list_all_bundles, repair_codegraph_view, resolve_bundle};
 
 fn main() {
@@ -107,14 +107,22 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
         // -----------------------------------------------------------------------
         // Add dependency to manifest
         // -----------------------------------------------------------------------
-        Commands::Add { spec, registry_url, registry, group } => {
+        Commands::Add { spec, registry_url, registry, group, url } => {
             let dir = require_workspace(workspace)?;
             let (name, version) = parse_spec(&spec)?;
 
             let mut mf = manifest::load_manifest(dir)?;
 
-            // Add or update registry if a URL was provided
-            if let Some(url) = &registry_url {
+            if let Some(direct_url) = url {
+                // Direct URL dependency — no registry needed
+                let dep = DependencyEntry {
+                    version: version.to_string(),
+                    registry: None,
+                    url: Some(direct_url),
+                };
+                insert_dep(&mut mf, name, dep, group.as_deref());
+            } else if let Some(url) = &registry_url {
+                // Add or update registry if a URL was provided
                 let url = url.trim_end_matches('/');
                 let reg_name = registry.clone().unwrap_or_else(|| "default".to_string());
                 if mf.get_registry(&reg_name).is_none() {
@@ -123,20 +131,21 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
                         url: url.to_string(),
                     });
                 }
-                let dep = DependencyEntry { version: version.to_string(), registry: Some(reg_name) };
+                let dep = DependencyEntry { version: version.to_string(), registry: Some(reg_name), url: None };
                 insert_dep(&mut mf, name, dep, group.as_deref());
             } else {
                 if mf.registries.is_empty() {
                     anyhow::bail!(
                         "No registries defined in sempkg.toml. \
-                         Use --registry-url to add one: sempkg add --registry-url <url> {spec}"
+                         Use --registry-url to add one: sempkg add --registry-url <url> {spec}\n\
+                         Or use --url to add a direct download URL: sempkg add --url <url> {spec}"
                     );
                 }
                 // Resolve the registry name: use --registry if given, otherwise
                 // default to the first defined registry so the saved TOML is explicit.
                 let resolved_registry = registry
                     .or_else(|| mf.default_registry().map(|r| r.name.clone()));
-                let dep = DependencyEntry { version: version.to_string(), registry: resolved_registry };
+                let dep = DependencyEntry { version: version.to_string(), registry: resolved_registry, url: None };
                 insert_dep(&mut mf, name, dep, group.as_deref());
             }
 
@@ -219,24 +228,35 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
                     continue;
                 }
 
-                let reg = mf.registry_for(dep).with_context(|| {
-                    format!("No registry found for dependency '{dep_name}'")
-                })?;
+                let bytes: Vec<u8>;
+                let source_label: String;
 
-                print!("  Installing {dep_name}@{} from {} ... ", dep.version, reg.name);
-                std::io::Write::flush(&mut std::io::stdout())?;
+                if let Some(direct_url) = &dep.url {
+                    // Direct URL dependency (e.g. GitHub release asset)
+                    print!("  Installing {dep_name}@{} from URL ... ", dep.version);
+                    std::io::Write::flush(&mut std::io::stdout())?;
+                    bytes = download_from_url(direct_url, None)?;
+                    source_label = direct_url.clone();
+                } else {
+                    let reg = mf.registry_for(dep).with_context(|| {
+                        format!("No registry found for dependency '{dep_name}'")
+                    })?;
 
-                let client = RegistryClient::new(&reg.url);
-                let index_entry = client.lookup(dep_name, &dep.version).ok();
-                let expected_sha256 = index_entry.as_ref().and_then(|e| e.sha256.as_deref());
+                    print!("  Installing {dep_name}@{} from {} ... ", dep.version, reg.name);
+                    std::io::Write::flush(&mut std::io::stdout())?;
 
-                let bytes = client.download_bundle(dep_name, &dep.version, expected_sha256)?;
+                    let client = RegistryClient::new(&reg.url);
+                    let index_entry = client.lookup(dep_name, &dep.version).ok();
+                    let expected_sha256 = index_entry.as_ref().and_then(|e| e.sha256.as_deref());
+                    bytes = client.download_bundle(dep_name, &dep.version, expected_sha256)?;
+                    source_label = reg.url.clone();
 
-                // Signature verification
-                if let Some(key) = &verify_key {
-                    let sig = client.download_signature(dep_name, &dep.version)?;
-                    verify::verify_bundle_signature(&bytes, &sig, key)
-                        .with_context(|| format!("Signature verification failed for {dep_name}@{}", dep.version))?;
+                    // Signature verification
+                    if let Some(key) = &verify_key {
+                        let sig = client.download_signature(dep_name, &dep.version)?;
+                        verify::verify_bundle_signature(&bytes, &sig, key)
+                            .with_context(|| format!("Signature verification failed for {dep_name}@{}", dep.version))?;
+                    }
                 }
 
                 let info = store.install_bytes(&bytes)?;
@@ -245,9 +265,9 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
                 lock.upsert(manifest::LockEntry {
                     name: dep_name.clone(),
                     version: dep.version.clone(),
-                    registry_url: reg.url.clone(),
+                    registry_url: source_label,
                     sha256: hex::encode(Sha256::digest(&bytes)),
-                    signed: verify_key.is_some(),
+                    signed: verify_key.is_some() && dep.url.is_none(),
                     manifest_checksums: info.manifest.checksums.clone(),
                 });
                 installed.push(format!("{dep_name}@{}", dep.version));
@@ -267,7 +287,7 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
         // -----------------------------------------------------------------------
         // Install — direct download without manifest
         // -----------------------------------------------------------------------
-        Commands::Install { spec, global, registry: reg_url, verify_key } => {
+        Commands::Install { spec, global, registry: reg_url, verify_key, url } => {
             let (name, version) = parse_spec(&spec)?;
 
             let store = if global {
@@ -277,23 +297,40 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
             };
 
             let scope_label = if global { "global" } else { "workspace" };
-            let client = RegistryClient::new(&reg_url);
 
-            let index_entry = client.lookup(name, version).ok();
-            let expected_sha256 = index_entry.as_ref().and_then(|e| e.sha256.as_deref());
+            let bytes = if let Some(direct_url) = &url {
+                print!("Downloading {name}@{version} from URL ... ");
+                std::io::Write::flush(&mut std::io::stdout())?;
+                let b = download_from_url(direct_url, None)?;
+                println!("done.");
+                b
+            } else {
+                let reg_url = reg_url.as_deref().expect("--registry required when --url is not provided");
+                let client = RegistryClient::new(reg_url);
 
-            print!("Downloading {name}@{version} ... ");
-            std::io::Write::flush(&mut std::io::stdout())?;
-            let bytes = client.download_bundle(name, version, expected_sha256)?;
-            println!("done.");
+                let index_entry = client.lookup(name, version).ok();
+                let expected_sha256 = index_entry.as_ref().and_then(|e| e.sha256.as_deref());
 
-            // Signature verification
+                print!("Downloading {name}@{version} ... ");
+                std::io::Write::flush(&mut std::io::stdout())?;
+                let b = client.download_bundle(name, version, expected_sha256)?;
+                println!("done.");
+                b
+            };
+
+            // Signature verification (registry-sourced only, URLs don't carry .sig)
             if let Some(key_path) = &verify_key {
-                let key = verify::load_verifying_key(key_path)?;
-                let sig = client.download_signature(name, version)?;
-                verify::verify_bundle_signature(&bytes, &sig, &key)
-                    .context("Signature verification failed")?;
-                println!("Signature verified.");
+                if url.is_some() {
+                    eprintln!("Warning: signature verification is not supported for direct URL installs.");
+                } else {
+                    let reg_url = reg_url.as_deref().unwrap();
+                    let client = RegistryClient::new(reg_url);
+                    let key = verify::load_verifying_key(key_path)?;
+                    let sig = client.download_signature(name, version)?;
+                    verify::verify_bundle_signature(&bytes, &sig, &key)
+                        .context("Signature verification failed")?;
+                    println!("Signature verified.");
+                }
             }
 
             let info = store.install_bytes(&bytes)?;

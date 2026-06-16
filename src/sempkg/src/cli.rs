@@ -39,6 +39,7 @@ pub enum Commands {
     /// Add a bundle dependency to sempkg.toml.
     ///
     /// Example: sempkg add aws-sdk@1.11.210 --registry https://reg.example.com
+    /// Example: sempkg add mylib@2.0.0 --url https://github.com/owner/repo/releases/download/v2.0.0/mylib-2.0.0.cgbundle
     Add {
         /// Package spec in `name@version` format.
         spec: String,
@@ -50,6 +51,11 @@ pub enum Commands {
         /// Registry name to use (must match a [[registry]] entry in sempkg.toml).
         #[arg(long)]
         registry: Option<String>,
+
+        /// Direct download URL for the bundle asset (e.g. a GitHub release URL).
+        /// When set, no registry is needed.
+        #[arg(long, short = 'u')]
+        url: Option<String>,
 
         /// Add to a named dependency group instead of [dependencies].
         #[arg(long, short = 'g')]
@@ -90,9 +96,14 @@ pub enum Commands {
         #[arg(long, short = 'g')]
         global: bool,
 
-        /// Registry URL to fetch from.
-        #[arg(long, short = 'r')]
-        registry: String,
+        /// Registry URL to fetch from. Required unless --url is provided.
+        #[arg(long, short = 'r', required_unless_present = "url")]
+        registry: Option<String>,
+
+        /// Direct download URL for the bundle asset (e.g. a GitHub release URL).
+        /// When set, --registry is not required.
+        #[arg(long, short = 'u')]
+        url: Option<String>,
 
         /// Path to Ed25519 public key PEM file for signature verification.
         #[arg(long)]

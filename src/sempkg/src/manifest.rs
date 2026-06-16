@@ -54,6 +54,9 @@ pub struct DependencyEntry {
     pub version: String,
     /// Name of the registry to fetch from. Defaults to the first registry.
     pub registry: Option<String>,
+    /// Direct download URL for the bundle asset (e.g. a GitHub release URL).
+    /// When set, `registry` is ignored and the bundle is fetched from this URL.
+    pub url: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -271,6 +274,9 @@ fn dep_inline(dep: &DependencyEntry) -> InlineTable {
     it.insert("version", Value::from(dep.version.as_str()));
     if let Some(reg) = &dep.registry {
         it.insert("registry", Value::from(reg.as_str()));
+    }
+    if let Some(url) = &dep.url {
+        it.insert("url", Value::from(url.as_str()));
     }
     it
 }
