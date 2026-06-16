@@ -89,6 +89,12 @@ jobs:
         if: runner.os == 'Windows'
         uses: ilammy/setup-nasm@v1
 
+      # lance-encoding requires protoc at build time
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Build
         run: cargo build --release --manifest-path ${{ matrix.manifest }} --target ${{ matrix.target }}
 
