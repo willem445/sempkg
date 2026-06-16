@@ -1,4 +1,4 @@
-# CGBundle Format Specification
+# SemBundle Format Specification
 
 **Version:** 1.2.0
 **Status:** Draft
@@ -7,16 +7,16 @@
 
 ## 1. Overview
 
-A **CGBundle** (`.cgbundle`) is a portable, immutable, versioned archive that packages a prebuilt [CodeGraph](https://github.com/colbymchenry/codegraph) semantic index for a specific revision of a source repository.
+A **SemBundle** (`.SemBundle`) is a portable, immutable, versioned archive that packages a prebuilt [CodeGraph](https://github.com/colbymchenry/codegraph) semantic index for a specific revision of a source repository.
 
-CGBundles allow codebases to publish semantic intelligence artifacts alongside their releases. Consumers — agents, IDEs, and tools — can download and mount a bundle without ever cloning the source repository.
+SemBundles allow codebases to publish semantic intelligence artifacts alongside their releases. Consumers — agents, IDEs, and tools — can download and mount a bundle without ever cloning the source repository.
 
 ---
 
 ## 2. File Naming Convention
 
 ```
-<name>-<version>.cgbundle
+<name>-<version>.SemBundle
 ```
 
 | Component | Description |
@@ -27,12 +27,12 @@ CGBundles allow codebases to publish semantic intelligence artifacts alongside t
 **Examples:**
 
 ```
-aws-sdk-1.11.210.cgbundle
-qt-6.7.0.cgbundle
-ros2-humble.cgbundle
+aws-sdk-1.11.210.SemBundle
+qt-6.7.0.SemBundle
+ros2-humble.SemBundle
 ```
 
-A `.cgbundle` file is a **gzip-compressed tar archive** (`.tar.gz` renamed to `.cgbundle`). All paths inside the archive are relative and rooted at a single top-level directory matching the bundle name:
+A `.SemBundle` file is a **gzip-compressed tar archive** (`.tar.gz` renamed to `.SemBundle`). All paths inside the archive are relative and rooted at a single top-level directory matching the bundle name:
 
 ```
 <name>-<version>/
@@ -89,7 +89,7 @@ The manifest is the authoritative descriptor for a bundle. It is generated at pa
 
 | Field               | Type            | Required | Description |
 |---------------------|-----------------|----------|-------------|
-| `spec_version`      | string          | Yes      | CGBundle spec version this bundle conforms to (e.g. `"1.0.0"`) |
+| `spec_version`      | string          | Yes      | SemBundle spec version this bundle conforms to (e.g. `"1.0.0"`) |
 | `name`              | string          | Yes      | Package name. Must match the filename prefix. Pattern: `^[a-z0-9][a-z0-9\-]*[a-z0-9]$` |
 | `version`           | string          | Yes      | Package version. Must match the filename version component. |
 | `source_repo`       | string          | Yes      | Canonical URL of the source repository (e.g. `"https://github.com/org/repo"`) |
@@ -278,7 +278,7 @@ results = table.search("authentication flow", query_type="fts").limit(10).to_lis
 
 ### 9.4 Producing a LanceDB Index
 
-The recommended tool is the `cgbundle build --docs-dir <path>` command, which walks documentation directories, chunks the text, writes a LanceDB `docs` table, and builds a tantivy BM25 full-text search index — all in-process with no external tool dependency.
+The recommended tool is the `SemBundle build --docs-dir <path>` command, which walks documentation directories, chunks the text, writes a LanceDB `docs` table, and builds a tantivy BM25 full-text search index — all in-process with no external tool dependency.
 
 For manual indexing:
 
@@ -307,7 +307,7 @@ tbl.create_index(&["content"], Index::FTS(FtsIndexBuilder::default()))
 
 ## 10. Versioning and Immutability
 
-- Once packed and published, a CGBundle **must not be modified**. It is treated as an immutable artifact.
+- Once packed and published, a SemBundle **must not be modified**. It is treated as an immutable artifact.
 - To publish a correction to an already-released version, a new patch version must be issued.
 - The `spec_version` field in `manifest.json` identifies which version of this specification the bundle was produced against. Consumers must reject bundles whose `spec_version` major component is higher than the version they support.
 

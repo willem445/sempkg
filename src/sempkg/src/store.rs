@@ -1,4 +1,4 @@
-/// Bundle store: manages installed .cgbundle archives at workspace or global scope.
+/// Bundle store: manages installed .sembundle archives at workspace or global scope.
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -26,7 +26,7 @@ pub fn global_store_dir() -> PathBuf {
 }
 
 // ---------------------------------------------------------------------------
-// Bundle manifest JSON (inside the .cgbundle archive)
+// Bundle manifest JSON (inside the .sembundle archive)
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -117,7 +117,7 @@ impl BundleStore {
         self.bundle_dir(name, version).exists()
     }
 
-    /// Install a .cgbundle file from disk into the store.
+    /// Install a .sembundle file from disk into the store.
     pub fn install(&self, bundle_path: &Path) -> Result<BundleInfo> {
         let bytes = std::fs::read(bundle_path)
             .with_context(|| format!("Cannot read bundle: {}", bundle_path.display()))?;
@@ -183,7 +183,7 @@ impl BundleStore {
             .with_context(|| format!("Cannot move bundle to {}", dest.display()))?;
 
         // Create .codegraph -> graph link so the codegraph CLI can find the index.
-        // The cgbundle spec stores the CodeGraph index in graph/ but the codegraph
+        // The sembundle spec stores the CodeGraph index in graph/ but the codegraph
         // CLI looks for .codegraph/ in the working directory.
         create_codegraph_view(&dest)?;
 
@@ -325,7 +325,7 @@ pub fn repair_codegraph_view(bundle_dir: &Path) -> Result<bool> {
     Ok(true)
 }
 
-/// Read `manifest.json` from a .cgbundle archive (without extracting).
+/// Read `manifest.json` from a .sembundle archive (without extracting).
 pub fn read_manifest_from_tar(bytes: &[u8]) -> Result<BundleManifest> {
     use std::io::{Cursor, Read};
 

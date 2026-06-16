@@ -1,7 +1,7 @@
-# cgbundle — Developer Guide
+# sembundle — Developer Guide
 
-`cgbundle` is a Rust CLI that packs CodeGraph output directories into portable
-`.cgbundle` archives (gzip-compressed tar files).
+`sembundle` is a Rust CLI that packs CodeGraph output directories into portable
+`.sembundle` archives (gzip-compressed tar files).
 
 ---
 
@@ -78,7 +78,7 @@ automatically by `cargo`. No manual installation is needed.
 ## 3. Project Structure
 
 ```
-src/cgbundle/
+src/sembundle/
 ├── Cargo.toml          # Package manifest and dependency declarations
 ├── DEV-GUIDE.md        # This file
 └── src/
@@ -95,24 +95,24 @@ src/cgbundle/
 
 ## 4. Build
 
-All commands must be run from the `src/cgbundle/` directory.
+All commands must be run from the `src/sembundle/` directory.
 
 ```powershell
-cd c:\Projects\codegraph-hub\src\cgbundle
+cd c:\Projects\codegraph-hub\src\sembundle
 ```
 
 ### Debug build (fast compile, includes debug symbols)
 
 ```powershell
 cargo build
-# Binary: target\debug\cgbundle.exe
+# Binary: target\debug\sembundle.exe
 ```
 
 ### Release build (optimized, for distribution)
 
 ```powershell
 cargo build --release
-# Binary: target\release\cgbundle.exe
+# Binary: target\release\sembundle.exe
 ```
 
 ---
@@ -154,15 +154,15 @@ test result: ok. 18 passed; 0 failed
 
 There are two ways to create a bundle:
 
-- **`cgbundle build`** — run CodeGraph indexing and (optionally) LanceDB documentation indexing, then pack everything in one step. Recommended for CI.
-- **`cgbundle pack`** — pack a pre-existing CodeGraph output directory. Use this if you already have a `graph/` directory and want to add a pre-built `lance/` extension.
+- **`sembundle build`** — run CodeGraph indexing and (optionally) LanceDB documentation indexing, then pack everything in one step. Recommended for CI.
+- **`sembundle pack`** — pack a pre-existing CodeGraph output directory. Use this if you already have a `graph/` directory and want to add a pre-built `lance/` extension.
 
 ---
 
-### `cgbundle build` — Full pipeline (recommended)
+### `sembundle build` — Full pipeline (recommended)
 
 ```
-cgbundle build --name <name> --version <ver> --source-repo <url> --commit-hash <sha>
+sembundle build --name <name> --version <ver> --source-repo <url> --commit-hash <sha>
                --codegraph-version <ver> --source-dir <dir> [--source-dir <dir> ...]
                [--docs-dir <dir> [--docs-dir <dir> ...] [--docs-glob <pattern>]]
                [--tag <tag>] [--language <lang>] [--output <path>]
@@ -180,12 +180,12 @@ cgbundle build --name <name> --version <ver> --source-repo <url> --commit-hash <
 | `--docs-glob` | No | Glob pattern for doc discovery. Default: `**/*.{md,txt,rst}`. Comma-separate multiple patterns. |
 | `--tag` | No | Git tag |
 | `--language` | No | Primary language (default: `unknown`) |
-| `--output` / `-o` | No | Output `.cgbundle` path (default: `./<name>-<version>.cgbundle`) |
+| `--output` / `-o` | No | Output `.sembundle` path (default: `./<name>-<version>.sembundle`) |
 
 **Example — source only:**
 
 ```powershell
-cgbundle build `
+sembundle build `
   --name aws-sdk `
   --version 1.11.210 `
   --source-repo https://github.com/aws/aws-sdk-cpp `
@@ -198,7 +198,7 @@ cgbundle build `
 **Example — source + LanceDB documentation index:**
 
 ```powershell
-cgbundle build `
+sembundle build `
   --name my-sdk `
   --version 2.0.0 `
   --source-repo https://github.com/org/my-sdk `
@@ -213,14 +213,14 @@ cgbundle build `
 The build step:
 1. Runs `codegraph init --index` on each `--source-dir`
 2. Walks each `--docs-dir`, matches files against `--docs-glob`, chunks them into ~800-char paragraphs, writes a LanceDB `docs` table, and creates a tantivy BM25 FTS index — all in-process, no external tools
-3. Packs everything into a `.cgbundle` archive
+3. Packs everything into a `.sembundle` archive
 
 ---
 
-### `cgbundle pack` — Pack a pre-existing CodeGraph output directory
+### `sembundle pack` — Pack a pre-existing CodeGraph output directory
 
 ```
-cgbundle pack <INPUT_DIR> [OPTIONS]
+sembundle pack <INPUT_DIR> [OPTIONS]
 ```
 
 ### Required arguments
@@ -241,7 +241,7 @@ cgbundle pack <INPUT_DIR> [OPTIONS]
 | `--tag` | none | Git tag associated with this release |
 | `--language` | `unknown` | Primary language indexed (e.g. `python`, `cpp`, `rust`) |
 | `--indexed-paths` | `.` | Comma-separated list of repo-relative paths that were indexed |
-| `--output` / `-o` | `./<name>-<version>.cgbundle` | Output file path |
+| `--output` / `-o` | `./<name>-<version>.sembundle` | Output file path |
 | `--lance-dir` | none | Path to a pre-built LanceDB directory to include as the `lance/` extension. Must contain `metadata.json` and a `docs.lance/` subdirectory. |
 
 ---
@@ -252,11 +252,11 @@ After a release build, copy the binary to a directory on your PATH:
 
 ```powershell
 # Example: add to a local tools directory
-Copy-Item .\target\release\cgbundle.exe $env:USERPROFILE\bin\cgbundle.exe
+Copy-Item .\target\release\sembundle.exe $env:USERPROFILE\bin\sembundle.exe
 ```
 
 Or run it directly:
 
 ```powershell
-.\target\release\cgbundle.exe pack ...
+.\target\release\sembundle.exe pack ...
 ```

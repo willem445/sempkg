@@ -19,7 +19,7 @@ pub struct VerifyOptions {
     pub public_key_path: PathBuf,
 }
 
-/// Verify an Ed25519 .sig file against a .cgbundle.
+/// Verify an Ed25519 .sig file against a .sembundle.
 /// Returns Ok(()) if the signature is valid.
 /// Returns Err(VerifyError::VerificationFailed) if the signature does not match.
 pub fn verify(opts: VerifyOptions) -> Result<(), VerifyError> {

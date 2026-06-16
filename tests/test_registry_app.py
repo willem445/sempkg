@@ -1,4 +1,4 @@
-"""Tests for cgbundle_registry FastAPI application."""
+"""Tests for sempkg_registry FastAPI application."""
 
 from __future__ import annotations
 
@@ -10,16 +10,16 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from cgbundle_registry.app import create_app
-from cgbundle_registry.auth import TokenStore
-from cgbundle_registry.storage import BundleStorage
+from sempkg_registry.app import create_app
+from sempkg_registry.auth import TokenStore
+from sempkg_registry.storage import BundleStorage
 
 
 ADMIN_PASSWORD = "test-admin-secret"
 
 
 def make_bundle(name: str, version: str) -> bytes:
-    """Create a minimal valid .cgbundle (tar.gz) in memory."""
+    """Create a minimal valid .sembundle (tar.gz) in memory."""
     manifest = {
         "name": name,
         "version": version,
@@ -81,7 +81,7 @@ def test_publish_valid_bundle(client_with_token) -> None:
     resp = tc.post(
         "/publish",
         headers={"Authorization": f"Bearer {token}"},
-        files={"file": ("mylib-1.0.0.cgbundle", bundle_data, "application/octet-stream")},
+        files={"file": ("mylib-1.0.0.sembundle", bundle_data, "application/octet-stream")},
     )
     assert resp.status_code == 200
     body = resp.json()
@@ -96,7 +96,7 @@ def test_publish_updates_index(client_with_token) -> None:
     tc.post(
         "/publish",
         headers={"Authorization": f"Bearer {token}"},
-        files={"file": ("mylib-2.0.0.cgbundle", bundle_data, "application/octet-stream")},
+        files={"file": ("mylib-2.0.0.sembundle", bundle_data, "application/octet-stream")},
     )
     resp = tc.get("/index.json")
     assert resp.status_code == 200
@@ -108,7 +108,7 @@ def test_publish_invalid_token(client: TestClient) -> None:
     resp = client.post(
         "/publish",
         headers={"Authorization": "Bearer invalid-token"},
-        files={"file": ("mylib-1.0.0.cgbundle", bundle_data, "application/octet-stream")},
+        files={"file": ("mylib-1.0.0.sembundle", bundle_data, "application/octet-stream")},
     )
     assert resp.status_code == 401
 
@@ -117,7 +117,7 @@ def test_publish_no_token(client: TestClient) -> None:
     bundle_data = make_bundle("mylib", "1.0.0")
     resp = client.post(
         "/publish",
-        files={"file": ("mylib-1.0.0.cgbundle", bundle_data, "application/octet-stream")},
+        files={"file": ("mylib-1.0.0.sembundle", bundle_data, "application/octet-stream")},
     )
     assert resp.status_code == 401
 
@@ -126,11 +126,11 @@ def test_publish_duplicate_version(client_with_token) -> None:
     tc, token, _ = client_with_token
     bundle_data = make_bundle("mylib", "1.0.0")
     headers = {"Authorization": f"Bearer {token}"}
-    files = {"file": ("mylib-1.0.0.cgbundle", bundle_data, "application/octet-stream")}
+    files = {"file": ("mylib-1.0.0.sembundle", bundle_data, "application/octet-stream")}
     tc.post("/publish", headers=headers, files=files)
 
     # Upload again
-    files2 = {"file": ("mylib-1.0.0.cgbundle", bundle_data, "application/octet-stream")}
+    files2 = {"file": ("mylib-1.0.0.sembundle", bundle_data, "application/octet-stream")}
     resp = tc.post("/publish", headers=headers, files=files2)
     assert resp.status_code == 409
 
@@ -140,7 +140,7 @@ def test_publish_malformed_bundle(client_with_token) -> None:
     resp = tc.post(
         "/publish",
         headers={"Authorization": f"Bearer {token}"},
-        files={"file": ("bad.cgbundle", b"not a tar file", "application/octet-stream")},
+        files={"file": ("bad.sembundle", b"not a tar file", "application/octet-stream")},
     )
     assert resp.status_code == 400
 
@@ -156,15 +156,15 @@ def test_download_bundle(client_with_token) -> None:
     tc.post(
         "/publish",
         headers={"Authorization": f"Bearer {token}"},
-        files={"file": ("mylib-1.0.0.cgbundle", bundle_data, "application/octet-stream")},
+        files={"file": ("mylib-1.0.0.sembundle", bundle_data, "application/octet-stream")},
     )
-    resp = tc.get("/bundles/mylib/1.0.0/mylib-1.0.0.cgbundle")
+    resp = tc.get("/bundles/mylib/1.0.0/mylib-1.0.0.sembundle")
     assert resp.status_code == 200
     assert resp.content == bundle_data
 
 
 def test_download_bundle_not_found(client: TestClient) -> None:
-    resp = client.get("/bundles/nolib/9.9.9/nolib-9.9.9.cgbundle")
+    resp = client.get("/bundles/nolib/9.9.9/nolib-9.9.9.sembundle")
     assert resp.status_code == 404
 
 
@@ -174,9 +174,9 @@ def test_download_bundle_wrong_filename(client_with_token) -> None:
     tc.post(
         "/publish",
         headers={"Authorization": f"Bearer {token}"},
-        files={"file": ("mylib-1.0.0.cgbundle", bundle_data, "application/octet-stream")},
+        files={"file": ("mylib-1.0.0.sembundle", bundle_data, "application/octet-stream")},
     )
-    resp = tc.get("/bundles/mylib/1.0.0/wrong-name.cgbundle")
+    resp = tc.get("/bundles/mylib/1.0.0/wrong-name.sembundle")
     assert resp.status_code == 400
 
 
@@ -210,7 +210,7 @@ def test_publish_creates_sha256_sidecar(client_with_token) -> None:
     tc.post(
         "/publish",
         headers={"Authorization": f"Bearer {token}"},
-        files={"file": ("mylib-1.0.0.cgbundle", bundle_data, "application/octet-stream")},
+        files={"file": ("mylib-1.0.0.sembundle", bundle_data, "application/octet-stream")},
     )
     sha256_file = storage.storage_dir / "mylib" / "1.0.0" / "mylib-1.0.0.sha256"
     assert sha256_file.exists()
@@ -223,7 +223,7 @@ def test_index_includes_sha256_after_publish(client_with_token) -> None:
     tc.post(
         "/publish",
         headers={"Authorization": f"Bearer {token}"},
-        files={"file": ("mylib-1.0.0.cgbundle", bundle_data, "application/octet-stream")},
+        files={"file": ("mylib-1.0.0.sembundle", bundle_data, "application/octet-stream")},
     )
     resp = tc.get("/index.json")
     assert resp.status_code == 200
@@ -239,12 +239,12 @@ def test_publish_with_signature(client_with_token) -> None:
         "/publish",
         headers={"Authorization": f"Bearer {token}"},
         files={
-            "file": ("mylib-1.0.0.cgbundle", bundle_data, "application/octet-stream"),
-            "signature": ("mylib-1.0.0.cgbundle.sig", sig_bytes, "application/octet-stream"),
+            "file": ("mylib-1.0.0.sembundle", bundle_data, "application/octet-stream"),
+            "signature": ("mylib-1.0.0.sembundle.sig", sig_bytes, "application/octet-stream"),
         },
     )
     assert resp.status_code == 200
-    resp2 = tc.get("/bundles/mylib/1.0.0/mylib-1.0.0.cgbundle.sig")
+    resp2 = tc.get("/bundles/mylib/1.0.0/mylib-1.0.0.sembundle.sig")
     assert resp2.status_code == 200
     assert resp2.content == sig_bytes
 
@@ -256,9 +256,9 @@ def test_download_bundle_includes_sha256_header(client_with_token) -> None:
     tc.post(
         "/publish",
         headers={"Authorization": f"Bearer {token}"},
-        files={"file": ("mylib-1.0.0.cgbundle", bundle_data, "application/octet-stream")},
+        files={"file": ("mylib-1.0.0.sembundle", bundle_data, "application/octet-stream")},
     )
-    resp = tc.get("/bundles/mylib/1.0.0/mylib-1.0.0.cgbundle")
+    resp = tc.get("/bundles/mylib/1.0.0/mylib-1.0.0.sembundle")
     assert resp.status_code == 200
     assert "x-bundle-sha256" in resp.headers
     assert resp.headers["x-bundle-sha256"] == hashlib.sha256(bundle_data).hexdigest()
@@ -308,6 +308,6 @@ def test_revoke_token_via_api(client: TestClient) -> None:
     resp = client.post(
         "/publish",
         headers={"Authorization": f"Bearer {token_value}"},
-        files={"file": ("mylib-1.0.0.cgbundle", bundle_data, "application/octet-stream")},
+        files={"file": ("mylib-1.0.0.sembundle", bundle_data, "application/octet-stream")},
     )
     assert resp.status_code == 401

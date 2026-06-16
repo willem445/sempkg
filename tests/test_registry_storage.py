@@ -1,4 +1,4 @@
-"""Tests for cgbundle_registry BundleStorage."""
+"""Tests for sempkg_registry BundleStorage."""
 
 from __future__ import annotations
 
@@ -9,11 +9,11 @@ from pathlib import Path
 
 import pytest
 
-from cgbundle_registry.storage import BundleStorage, StoreResult, VersionExistsError
+from sempkg_registry.storage import BundleStorage, StoreResult, VersionExistsError
 
 
 def make_bundle(name: str, version: str) -> bytes:
-    """Create a minimal valid .cgbundle (tar.gz) in memory."""
+    """Create a minimal valid .sembundle (tar.gz) in memory."""
     manifest = {
         "name": name,
         "version": version,
@@ -43,7 +43,7 @@ def test_store_creates_file(storage: BundleStorage) -> None:
     result = storage.store("mylib", "1.0.0", data)
     assert isinstance(result, StoreResult)
     assert result.path.exists()
-    assert result.path.name == "mylib-1.0.0.cgbundle"
+    assert result.path.name == "mylib-1.0.0.sembundle"
 
 
 def test_store_raises_on_duplicate(storage: BundleStorage) -> None:

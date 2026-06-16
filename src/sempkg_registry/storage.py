@@ -1,4 +1,4 @@
-"""Bundle file storage and index management for cgbundle_registry."""
+"""Bundle file storage and index management for sempkg_registry."""
 
 from __future__ import annotations
 
@@ -20,10 +20,10 @@ class VersionExistsError(Exception):
 
 
 class BundleStorage:
-    """Manages on-disk storage of .cgbundle files and index.json."""
+    """Manages on-disk storage of .sembundle files and index.json."""
 
     def __init__(self, storage_dir: Path | None = None) -> None:
-        self.storage_dir = storage_dir or Path.home() / ".cgbundle-registry" / "bundles"
+        self.storage_dir = storage_dir or Path.home() / ".sempkg-registry" / "bundles"
         self.storage_dir.mkdir(parents=True, exist_ok=True)
 
     # ------------------------------------------------------------------
@@ -33,7 +33,7 @@ class BundleStorage:
     def store(self, name: str, version: str, data: bytes, sig_bytes: bytes | None = None) -> StoreResult:
         """Write bundle bytes to disk. Raises VersionExistsError if already present."""
         dest_dir = self.storage_dir / name / version
-        dest_file = dest_dir / f"{name}-{version}.cgbundle"
+        dest_file = dest_dir / f"{name}-{version}.sembundle"
         if dest_file.exists():
             raise VersionExistsError(f"{name} {version} already exists")
         dest_dir.mkdir(parents=True, exist_ok=True)
@@ -46,7 +46,7 @@ class BundleStorage:
 
     def get_path(self, name: str, version: str) -> Path | None:
         """Return the Path to the bundle file, or None if not found."""
-        path = self.storage_dir / name / version / f"{name}-{version}.cgbundle"
+        path = self.storage_dir / name / version / f"{name}-{version}.sembundle"
         return path if path.exists() else None
 
     def get_signature_path(self, name: str, version: str) -> Path | None:
@@ -69,7 +69,7 @@ class BundleStorage:
             versions = sorted(
                 v.name
                 for v in name_dir.iterdir()
-                if v.is_dir() and (v / f"{name}-{v.name}.cgbundle").exists()
+                if v.is_dir() and (v / f"{name}-{v.name}.sembundle").exists()
             )
             if not versions:
                 continue

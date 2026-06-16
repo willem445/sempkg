@@ -2,7 +2,7 @@
 name = "sempkg"
 version = "0.1.0"
 edition = "2021"
-description = "sempkg — semantic package manager for cgbundle archives with MCP server support"
+description = "sempkg — semantic package manager for sembundle archives with MCP server support"
 
 [[bin]]
 name = "sempkg"

@@ -1,11 +1,11 @@
 [package]
-name = "cgbundle"
+name = "sembundle"
 version = "0.1.0"
 edition = "2021"
-description = "CGBundle CLI — pack and unpack CodeGraph semantic index archives"
+description = "SemBundle CLI — pack and publish semantic index archives"
 
 [[bin]]
-name = "cgbundle"
+name = "sembundle"
 path = "src/main.rs"
 
 [dependencies]

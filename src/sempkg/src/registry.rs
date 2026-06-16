@@ -78,7 +78,7 @@ impl RegistryClient {
         expected_sha256: Option<&str>,
     ) -> Result<Vec<u8>> {
         let url = format!(
-            "{}/bundles/{}/{}/{}-{}.cgbundle",
+            "{}/bundles/{}/{}/{}-{}.sembundle",
             self.base_url, package, version, package, version
         );
 
@@ -103,7 +103,7 @@ impl RegistryClient {
             let actual = hex::encode(Sha256::digest(&bytes));
             if actual != expected {
                 return Err(SempkgError::ChecksumMismatch {
-                    path: format!("{package}-{version}.cgbundle"),
+                    path: format!("{package}-{version}.sembundle"),
                     expected: expected.to_string(),
                     actual,
                 }
@@ -117,7 +117,7 @@ impl RegistryClient {
     /// Download the Ed25519 signature file for a bundle.
     pub fn download_signature(&self, package: &str, version: &str) -> Result<Vec<u8>> {
         let url = format!(
-            "{}/bundles/{}/{}/{}-{}.cgbundle.sig",
+            "{}/bundles/{}/{}/{}-{}.sembundle.sig",
             self.base_url, package, version, package, version
         );
 
@@ -179,10 +179,10 @@ impl RegistryClient {
 }
 
 // ---------------------------------------------------------------------------
-// Standalone URL download (GitHub releases or any direct .cgbundle URL)
+// Standalone URL download (GitHub releases or any direct .sembundle URL)
 // ---------------------------------------------------------------------------
 
-/// Download a `.cgbundle` from an arbitrary URL and optionally verify its SHA-256.
+/// Download a `.sembundle` from an arbitrary URL and optionally verify its SHA-256.
 ///
 /// Use this when a dependency specifies a `url` directly (e.g. a GitHub release
 /// asset) rather than going through a registry.

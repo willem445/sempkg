@@ -3,7 +3,7 @@
 import sys
 from pathlib import Path
 
-# Add src directory to path so we can import codegraph_hub
+# Add src directory to path so we can import sempkg_registry
 project_root = Path(__file__).parent.parent
 src_dir = project_root / "src"
 if str(src_dir) not in sys.path:

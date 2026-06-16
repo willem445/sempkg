@@ -21,8 +21,8 @@ use verify::VerifyOptions;
 
 #[derive(Parser)]
 #[command(
-    name = "cgbundle",
-    about = "Pack CodeGraph output directories into portable .cgbundle archives",
+    name = "sembundle",
+    about = "Pack CodeGraph output directories into portable .sembundle archives",
     version
 )]
 struct Cli {
@@ -32,7 +32,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Pack a CodeGraph output directory into a .cgbundle archive
+    /// Pack a CodeGraph output directory into a .sembundle archive
     Pack {
         /// Path to the CodeGraph output directory.
         /// Must contain: graph/, embeddings/, config.json
@@ -71,8 +71,8 @@ enum Commands {
         #[arg(long, value_delimiter = ',')]
         indexed_paths: Vec<String>,
 
-        /// Output .cgbundle file path
-        /// (default: ./<name>-<version>.cgbundle)
+        /// Output .sembundle file path
+        /// (default: ./<name>-<version>.sembundle)
         #[arg(long, short = 'o')]
         output: Option<PathBuf>,
 
@@ -86,23 +86,23 @@ enum Commands {
         lance_dir: Option<PathBuf>,
     },
 
-    /// Publish a .cgbundle to a registry server
+    /// Publish a .sembundle to a registry server
     Publish {
-        /// Path to the .cgbundle file to publish
+        /// Path to the .sembundle file to publish
         bundle_path: PathBuf,
 
         /// Registry server base URL (e.g. http://192.168.1.10:8765).
-        /// Can also be set via CGBUNDLE_REGISTRY_URL env var.
-        #[arg(long, env = "CGBUNDLE_REGISTRY_URL")]
+        /// Can also be set via SemBundle_REGISTRY_URL env var.
+        #[arg(long, env = "SemBundle_REGISTRY_URL")]
         registry: Option<String>,
 
         /// Publish token for authentication.
-        /// Can also be set via CGBUNDLE_TOKEN env var.
-        #[arg(long, env = "CGBUNDLE_TOKEN")]
+        /// Can also be set via SemBundle_TOKEN env var.
+        #[arg(long, env = "SemBundle_TOKEN")]
         token: Option<String>,
     },
 
-    /// Index source and docs directories, then pack everything into a .cgbundle
+    /// Index source and docs directories, then pack everything into a .sembundle
     Build {
         // --- Bundle identity ---
         /// Package name (lowercase letters, digits, and hyphens; min 2 chars)
@@ -133,7 +133,7 @@ enum Commands {
         #[arg(long, default_value = "unknown")]
         language: String,
 
-        /// Output .cgbundle file path (default: ./<name>-<version>.cgbundle)
+        /// Output .sembundle file path (default: ./<name>-<version>.sembundle)
         #[arg(long, short = 'o')]
         output: Option<PathBuf>,
 
@@ -161,9 +161,9 @@ enum Commands {
         output_dir: PathBuf,
     },
 
-    /// Sign a .cgbundle file with an Ed25519 private key
+    /// Sign a .sembundle file with an Ed25519 private key
     Sign {
-        /// Path to the .cgbundle file to sign
+        /// Path to the .sembundle file to sign
         bundle_path: PathBuf,
         /// Path to the Ed25519 private key PEM file
         #[arg(long, short = 'k')]
@@ -173,9 +173,9 @@ enum Commands {
         output: Option<PathBuf>,
     },
 
-    /// Verify a .cgbundle signature
+    /// Verify a .sembundle signature
     Verify {
-        /// Path to the .cgbundle file
+        /// Path to the .sembundle file
         bundle_path: PathBuf,
         /// Path to the .sig file
         #[arg(long, short = 's')]

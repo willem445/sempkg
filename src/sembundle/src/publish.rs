@@ -7,7 +7,7 @@ use thiserror::Error;
 pub enum PublishError {
     #[error("bundle file not found: {0}")]
     FileNotFound(PathBuf),
-    #[error("file does not have .cgbundle extension: {0}")]
+    #[error("file does not have .sembundle extension: {0}")]
     InvalidExtension(PathBuf),
     #[error("HTTP error {status}: {body}")]
     HttpError { status: u16, body: String },
@@ -15,9 +15,9 @@ pub enum PublishError {
     Network(#[from] reqwest::Error),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("token is required (use --token or set CGBUNDLE_TOKEN env var)")]
+    #[error("token is required (use --token or set SemBundle_TOKEN env var)")]
     MissingToken,
-    #[error("registry URL is required (use --registry or set CGBUNDLE_REGISTRY_URL env var)")]
+    #[error("registry URL is required (use --registry or set SemBundle_REGISTRY_URL env var)")]
     MissingRegistry,
 }
 
@@ -33,9 +33,9 @@ pub fn publish(opts: PublishOptions) -> Result<(String, String), PublishError> {
         return Err(PublishError::FileNotFound(opts.bundle_path));
     }
 
-    // Validate .cgbundle extension
+    // Validate .sembundle extension
     match opts.bundle_path.extension().and_then(|e| e.to_str()) {
-        Some("cgbundle") => {}
+        Some("sembundle") => {}
         _ => return Err(PublishError::InvalidExtension(opts.bundle_path)),
     }
 
@@ -44,7 +44,7 @@ pub fn publish(opts: PublishOptions) -> Result<(String, String), PublishError> {
         .bundle_path
         .file_name()
         .and_then(|n| n.to_str())
-        .unwrap_or("bundle.cgbundle")
+        .unwrap_or("bundle.sembundle")
         .to_string();
 
     // Read file bytes

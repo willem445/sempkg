@@ -1,9 +1,10 @@
-# Copilot Instructions for codegraph-hub
+# Copilot Instructions for sempkg
 
 ## Project context
-- This package is `codegraph-hub`, a multi-repo MCP server for GitHub Copilot.
-- It registers locally cloned internal Python packages and indexes them with `codegraph`.
-- It exposes one MCP endpoint for querying symbols, call graphs, and source files across registered packages.
+- This repository contains the `sempkg` Rust CLI/MCP server and the `sempkg-registry` Python server.
+- `sempkg` is a semantic package manager: it installs and queries `.sembundle` semantic index archives and exposes them via MCP tools to GitHub Copilot.
+- `sembundle` is the Rust CLI for packing, signing, and publishing `.sembundle` archives.
+- `sempkg-registry` is a self-hosted FastAPI server for storing and serving `.sembundle` files.
 
 ## Development preferences
 - Prefer `uv` for Python package management and environment tasks.

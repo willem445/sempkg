@@ -1,4 +1,4 @@
-"""CLI entry point for cgbundle_registry."""
+"""CLI entry point for sempkg_registry."""
 
 from __future__ import annotations
 
@@ -9,10 +9,10 @@ from pathlib import Path
 
 
 def _cmd_serve(args: argparse.Namespace) -> None:
-    admin_password = os.environ.get("CGBUNDLE_REGISTRY_ADMIN_PASSWORD")
+    admin_password = os.environ.get("sempkg_registry_ADMIN_PASSWORD")
     if not admin_password:
         sys.exit(
-            "Error: CGBUNDLE_REGISTRY_ADMIN_PASSWORD environment variable is not set. "
+            "Error: sempkg_registry_ADMIN_PASSWORD environment variable is not set. "
             "Set it before starting the server."
         )
 
@@ -68,8 +68,8 @@ def _cmd_token_revoke(args: argparse.Namespace) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        prog="cgbundle-registry",
-        description="Self-hosted cgbundle registry server",
+        prog="sempkg-registry",
+        description="Self-hosted SemBundle Registry server",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 

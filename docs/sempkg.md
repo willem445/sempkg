@@ -1,9 +1,9 @@
 # sempkg — User Guide
 
 `sempkg` is a native Rust CLI and MCP server for managing
-[CGBundle](cgbundle-spec.md) semantic index packages.
+[SemBundle](SemBundle-spec.md) semantic index packages.
 
-It exposes the same intelligence as the Python `codegraph-hub` server but compiles
+It exposes the same intelligence as the Python `sempkg` server but compiles
 to a single self-contained binary with no Python runtime dependency.
 
 ---
@@ -157,7 +157,7 @@ sempkg files my-sdk -f "*.rs"
 
 ## Documentation Search (LanceDB)
 
-Bundles packed with `cgbundle build --docs-dir` (or `cgbundle pack --lance-dir`) contain a
+Bundles packed with `SemBundle build --docs-dir` (or `SemBundle pack --lance-dir`) contain a
 LanceDB documentation index. `sempkg` searches it with BM25 full-text search — no external
 tools or model downloads required.
 
@@ -287,17 +287,17 @@ All tools accept a `package` name that can be either:
 
 `sempkg` supports Ed25519 signature verification for bundles downloaded from a registry.
 
-Generate a key pair with `cgbundle`:
+Generate a key pair with `SemBundle`:
 
 ```powershell
-cgbundle keygen --output-dir keys/
+SemBundle keygen --output-dir keys/
 # Writes: keys/private.pem  keys/public.pem
 ```
 
 Sign a bundle before publishing:
 
 ```powershell
-cgbundle sign my-sdk-1.2.0.cgbundle --key keys/private.pem
+SemBundle sign my-sdk-1.2.0.SemBundle --key keys/private.pem
 ```
 
 Verify at install time:

@@ -3,17 +3,13 @@ requires = ["uv_build>=0.11.19,<0.12"]
 build-backend = "uv_build"
 
 [project]
-name = "codegraph-hub"
+name = "sempkg-registry"
 version = "0.1.0"
-description = "Multi-repo codegraph MCP server for GitHub Copilot — indexes internal packages and exposes them via MCP tools"
+description = "Self-hosted sembundle registry server for semantic index packages"
 license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.11"
-dependencies = [
-    "fastmcp>=3.4.1",
-    "tomli-w>=1.0",
-    "lancedb>=0.14",
-]
+dependencies = []
 
 [project.optional-dependencies]
 dev = [
@@ -29,15 +25,14 @@ registry = [
 ]
 
 [project.scripts]
-codegraph-hub = "codegraph_hub.cli:main_cli"
-cgbundle-registry = "cgbundle_registry.cli:main"
+sempkg-registry = "sempkg_registry.cli:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
-addopts = "-v --cov=src/codegraph_hub --cov-report=term-missing"
+addopts = "-v --cov=src/sempkg_registry --cov-report=term-missing"
 
 [tool.uv]
 # Prefer uv for dependency management and environment sync in this project.

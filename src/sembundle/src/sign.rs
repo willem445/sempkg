@@ -16,7 +16,7 @@ pub struct SignOptions {
     pub output: Option<PathBuf>,
 }
 
-/// Sign a .cgbundle file. Writes a hex-encoded Ed25519 signature to the .sig file.
+/// Sign a .sembundle file. Writes a hex-encoded Ed25519 signature to the .sig file.
 /// Returns the path of the written .sig file.
 pub fn sign(opts: SignOptions) -> Result<PathBuf, SignError> {
     use ed25519_dalek::pkcs8::DecodePrivateKey;

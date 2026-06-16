@@ -43,12 +43,12 @@ This transforms CodeGraph from a local analysis tool into a **package manager fo
 
 # **Roadmap**
 
-## **1. Portable CodeGraph Bundles (CGBundle Format)**
+## **1. Portable CodeGraph Bundles (SemBundle Format)**
 
 Define a portable artifact format:
 
 ```
-my-sdk-1.2.3.cgbundle
+my-sdk-1.2.3.SemBundle
 ```
 
 Containing:
@@ -74,9 +74,9 @@ Introduce a registry system:
 
 ```
 registry/
-  qt/6.7.0.cgbundle
-  ros2/humble.cgbundle
-  aws-sdk/1.11.210.cgbundle
+  qt/6.7.0.SemBundle
+  ros2/humble.SemBundle
+  aws-sdk/1.11.210.SemBundle
 ```
 
 ### Goals

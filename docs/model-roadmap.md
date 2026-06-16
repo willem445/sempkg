@@ -4,11 +4,11 @@ Below are **15 sequential prompts**, each representing one major deliverable in 
 
 ---
 
-# **TASK 1 — Define the CGBundle Specification**
+# **TASK 1 — Define the SemBundle Specification**
 **Prompt to give your agent:**
 
 ```
-Create a formal specification for a "CGBundle" file format used to package CodeGraph (https://github.com/colbymchenry/codegraph) index artifacts.
+Create a formal specification for a "SemBundle" file format used to package CodeGraph (https://github.com/colbymchenry/codegraph) index artifacts.
 
 Requirements:
 - The bundle must contain: graph/, embeddings/, metadata.json, config.json.
@@ -30,15 +30,15 @@ Output:
 
 ---
 
-# **TASK 2 — Implement a CGBundle Packer CLI**
+# **TASK 2 — Implement a SemBundle Packer CLI**
 **Prompt:**
 
 ```
-Implement a CLI tool called `cgbundle pack`.
+Implement a CLI tool called `SemBundle pack`.
 
 Requirements:
 - Input: path to a CodeGraph output directory.
-- Output: a .cgbundle tar.gz file.
+- Output: a .SemBundle tar.gz file.
 - Generate manifest.json automatically.
 - Compute SHA256 checksums for all files.
 - Validate required directories exist.
@@ -52,14 +52,14 @@ Requirements:
 
 ---
 
-# **TASK 3 — Implement a CGBundle Unpacker**
+# **TASK 3 — Implement a SemBundle Unpacker**
 **Prompt:**
 
 ```
-Implement an unpacking feature into codegraph-hub CLI tool. This will eventually be connected up to a "codegraph-hub add dep@x.y.z" command which pulls down the bundle from the register, unpacks it (this feature) into a repository equivalent of a python .venv or npm node_modules. This task is just implementing the unpack feature + unit tests.
+Implement an unpacking feature into sempkg CLI tool. This will eventually be connected up to a "sempkg add dep@x.y.z" command which pulls down the bundle from the register, unpacks it (this feature) into a repository equivalent of a python .venv or npm node_modules. This task is just implementing the unpack feature + unit tests.
 
 Requirements:
-- Input: .cgbundle file
+- Input: .SemBundle file
 - Output: extracted directory
 - Validate checksums
 - Validate manifest.json
@@ -76,13 +76,13 @@ Requirements:
 **Prompt:**
 
 ```
-Implement a local registry cache for Codegraph-Hub.
+Implement a local registry cache for sempkg.
 
-TBDL should support repository specific node_modules style or globally in the ~/.codegraph-hub user folder.
+TBDL should support repository specific node_modules style or globally in the ~/.sempkg user folder.
 
 Requirements:
-- Store registry.json in ~/.codegraph-hub/registry.json
-- Store bundles in ~/.codegraph-hub/bundles/<package>/<version>/
+- Store registry.json in ~/.sempkg/registry.json
+- Store bundles in ~/.sempkg/bundles/<package>/<version>/
 - Implement:
   - load_registry()
   - save_registry()
@@ -112,7 +112,7 @@ Requirements:
 - Support multiple registries.
 - Detect new versions.
 - Update local registry.json.
-- Provide a CLI command: `codegraph-hub registry sync`.
+- Provide a CLI command: `sempkg registry sync`.
 ```
 
 ---
@@ -124,11 +124,11 @@ Requirements:
 Implement a bundle downloader.
 
 Requirements:
-- Download .cgbundle files from registry URLs.
+- Download .SemBundle files from registry URLs.
 - Verify SHA256 checksum from manifest.json.
-- Extract into ~/.codegraph-hub/bundles/<package>/<version>/
+- Extract into ~/.sempkg/bundles/<package>/<version>/
 - Cache bundles locally.
-- Provide CLI: `codegraph-hub bundle install <package>@<version>`
+- Provide CLI: `sempkg bundle install <package>@<version>`
 ```
 
 ---
@@ -152,7 +152,7 @@ Requirements:
   - load_project_profile()
   - resolve_dependencies()
   - auto-install missing bundles
-- Provide CLI: `codegraph-hub project sync`
+- Provide CLI: `sempkg project sync`
 ```
 
 ---
@@ -161,7 +161,7 @@ Requirements:
 **Prompt:**
 
 ```
-Implement a dynamic graph loader for Codegraph-Hub.
+Implement a dynamic graph loader for sempkg.
 
 Requirements:
 - Load CodeGraph graphs from bundle directories.
@@ -222,7 +222,7 @@ Create a GitHub Action workflow that:
 1. Detects new tags.
 2. Clones the repo.
 3. Runs CodeGraph indexing.
-4. Packages the result into a .cgbundle.
+4. Packages the result into a .SemBundle.
 5. Uploads the bundle to the registry.
 6. Updates index.json.
 
@@ -254,7 +254,7 @@ Requirements:
 
 ## ✅ Implemented
 
-### Registry server — `cgbundle-registry` (`src/cgbundle_registry/`)
+### Registry server — `SemBundle-registry` (`src/SemBundle_registry/`)
 - FastAPI application (`app.py`) with endpoints:
   - `GET  /bundles` — list all published bundles
   - `GET  /bundles/{name}` — list versions for a package
@@ -265,28 +265,28 @@ Requirements:
 - File-backed storage with manifest index (`storage.py`)
 - `Dockerfile` for self-hosted deployment
 
-### `cgbundle publish` — Rust CLI command (`src/cgbundle/`)
-- `cgbundle publish <bundle.cgbundle> --registry <url> --token <token>`
+### `SemBundle publish` — Rust CLI command (`src/SemBundle/`)
+- `SemBundle publish <bundle.SemBundle> --registry <url> --token <token>`
 - Streams the bundle to the registry's upload endpoint
 - Validates server response and reports success/failure
 
-### Bundle store — `codegraph-hub` (`src/codegraph_hub/bundle_store.py`)
+### Bundle store — `sempkg` (`src/sempkg/bundle_store.py`)
 - `BundleStore` class managing workspace-scoped and global bundle installations
-- Workspace store: `.codegraph_hub/bundles/` relative to the active workspace
-- Global store: `~/.codegraph_hub/bundles/` shared across all workspaces
+- Workspace store: `.sempkg/bundles/` relative to the active workspace
+- Global store: `~/.sempkg/bundles/` shared across all workspaces
 - `install(bundle_path)` — validate checksums, extract, write manifest
 - `install_from_registry(package, version, registry_url)` — download then install
 - `list_installed()` — enumerate all installed bundles
 - `resolve(name, version)` — return extracted bundle dir path or `None`
 - `remove(name, version)` — uninstall a bundle
 
-### CLI commands (`src/codegraph_hub/cli.py`)
+### CLI commands (`src/sempkg/cli.py`)
 - `bundle install <name>@<version> [--registry <url>]`
 - `bundle list [--workspace <dir>]`
 - `bundle remove <name>@<version> [--workspace <dir>]`
 - `bundle search-registry <query> [--registry <url>]`
 
-### MCP tools (`src/codegraph_hub/server.py`)
+### MCP tools (`src/sempkg/server.py`)
 - `list_bundle_packages(workspace_dir)` — list workspace and global installed bundles
 - `get_bundle_info(name, version, workspace_dir)` — manifest details for a bundle
 - `search_bundle_symbol(bundle_name, bundle_version, query, workspace_dir)` — query symbols in a bundle's pre-built CodeGraph index
@@ -295,17 +295,17 @@ Requirements:
 
 ---
 
-# **TASK 14 — Implement Codegraph-Hub CLI UX**
+# **TASK 14 — Implement sempkg CLI UX**
 **Prompt:**
 
 ```
 Implement the main CLI commands:
 
-- codegraph-hub registry sync
-- codegraph-hub bundle install <pkg>@<ver>
-- codegraph-hub project sync
-- codegraph-hub list
-- codegraph-hub mcp serve
+- sempkg registry sync
+- sempkg bundle install <pkg>@<ver>
+- sempkg project sync
+- sempkg list
+- sempkg mcp serve
 
 Requirements:
 - Clean UX
@@ -322,7 +322,7 @@ Requirements:
 ```
 Write documentation for:
 
-- CGBundle format
+- SemBundle format
 - Registry architecture
 - How to publish bundles
 - How to consume bundles

@@ -1,4 +1,4 @@
-"""Token management for cgbundle_registry.
+"""Token management for sempkg_registry.
 
 Security design
 ---------------
@@ -50,7 +50,7 @@ class TokenStore:
     """
 
     def __init__(self, config_dir: Path | None = None) -> None:
-        self.config_dir = config_dir or Path.home() / ".cgbundle-registry"
+        self.config_dir = config_dir or Path.home() / ".sempkg-registry"
         self.config_dir.mkdir(parents=True, exist_ok=True)
         self._path = self.config_dir / "tokens.json"
 

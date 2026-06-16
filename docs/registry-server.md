@@ -1,15 +1,15 @@
 # Bundle Registry Server Guide
 
-This guide covers how to run a local or self-hosted bundle registry, create and manage publish tokens, publish bundles with cgbundle, and pull bundles with codegraph-hub.
+This guide covers how to run a local or self-hosted bundle registry, create and manage publish tokens, publish bundles with SemBundle, and pull bundles with sempkg.
 
 ## Overview
 
-The bundle registry server is provided by the cgbundle-registry CLI in this repository.
+The bundle registry server is provided by the SemBundle-registry CLI in this repository.
 
 Core endpoints:
 - GET /index.json: lists available packages/versions with SHA-256 hash and signing status per version
-- GET /bundles/<package>/<version>/<package>-<version>.cgbundle: downloads bundle archive (includes X-Bundle-SHA256 header)
-- GET /bundles/<package>/<version>/<package>-<version>.cgbundle.sig: downloads Ed25519 signature file (if published)
+- GET /bundles/<package>/<version>/<package>-<version>.SemBundle: downloads bundle archive (includes X-Bundle-SHA256 header)
+- GET /bundles/<package>/<version>/<package>-<version>.SemBundle.sig: downloads Ed25519 signature file (if published)
 - POST /publish: uploads a bundle and optional signature (Bearer token required)
 - POST /admin/tokens: creates publish token (admin password required)
 - GET /admin/tokens: lists token metadata (admin password required)
@@ -21,7 +21,7 @@ Bundles are protected by two independent layers:
 
 1. SHA-256 whole-bundle integrity — the registry stores and serves a SHA-256 hash of every bundle. Clients verify this hash before extraction, catching server-side tampering and in-transit corruption.
 
-2. Ed25519 publisher signing — a maintainer generates a keypair (`cgbundle keygen`) and signs each bundle (`cgbundle sign`) before publishing. Consumers verify the signature against the public key (`bundle install --verify-key`) to confirm the bundle was produced by the expected party and has not been modified.
+2. Ed25519 publisher signing — a maintainer generates a keypair (`SemBundle keygen`) and signs each bundle (`SemBundle sign`) before publishing. Consumers verify the signature against the public key (`bundle install --verify-key`) to confirm the bundle was produced by the expected party and has not been modified.
 
 ## Install Prerequisites
 
@@ -44,13 +44,13 @@ This installs FastAPI, uvicorn, and multipart support used by the registry serve
 Set an admin password (required):
 
 ```powershell
-$env:CGBUNDLE_REGISTRY_ADMIN_PASSWORD = "change-me-now"
+$env:SemBundle_REGISTRY_ADMIN_PASSWORD = "change-me-now"
 ```
 
 Start server on all interfaces so other LAN machines can reach it:
 
 ```powershell
-cgbundle-registry serve --host 0.0.0.0 --port 8765 --storage-dir C:\registry\bundles --config-dir C:\registry\config
+SemBundle-registry serve --host 0.0.0.0 --port 8765 --storage-dir C:\registry\bundles --config-dir C:\registry\config
 ```
 
 Notes:
@@ -64,13 +64,13 @@ Notes:
 Build image from repository root:
 
 ```powershell
-docker build -f src/cgbundle_registry/Dockerfile -t cgbundle-registry .
+docker build -f src/SemBundle_registry/Dockerfile -t SemBundle-registry .
 ```
 
 Run container:
 
 ```powershell
-docker run --rm -p 8765:8765 -e CGBUNDLE_REGISTRY_ADMIN_PASSWORD="change-me-now" -v C:\registry-data:/data cgbundle-registry python -m cgbundle_registry serve --host 0.0.0.0 --port 8765 --storage-dir /data/bundles --config-dir /data/config
+docker run --rm -p 8765:8765 -e SemBundle_REGISTRY_ADMIN_PASSWORD="change-me-now" -v C:\registry-data:/data SemBundle-registry python -m SemBundle_registry serve --host 0.0.0.0 --port 8765 --storage-dir /data/bundles --config-dir /data/config
 ```
 
 ## Token Management
@@ -80,19 +80,19 @@ docker run --rm -p 8765:8765 -e CGBUNDLE_REGISTRY_ADMIN_PASSWORD="change-me-now"
 Create token:
 
 ```powershell
-cgbundle-registry token add --label "ci-publisher" --config-dir C:\registry\config
+SemBundle-registry token add --label "ci-publisher" --config-dir C:\registry\config
 ```
 
 List tokens (metadata only):
 
 ```powershell
-cgbundle-registry token list --config-dir C:\registry\config
+SemBundle-registry token list --config-dir C:\registry\config
 ```
 
 Revoke token:
 
 ```powershell
-cgbundle-registry token revoke <TOKEN_VALUE> --config-dir C:\registry\config
+SemBundle-registry token revoke <TOKEN_VALUE> --config-dir C:\registry\config
 ```
 
 ### Option B: Admin API token management
@@ -126,7 +126,7 @@ Invoke-RestMethod -Method Delete -Uri "http://127.0.0.1:8765/admin/tokens/$token
 Generate an Ed25519 keypair. Do this once per publisher (e.g., CI service account, maintainer):
 
 ```powershell
-cgbundle keygen --output-dir C:\keys
+SemBundle keygen --output-dir C:\keys
 ```
 
 Produces:
@@ -138,21 +138,21 @@ On Linux/macOS `private.pem` is written with mode 0600 (owner read/write only).
 ### Signing a bundle before publish
 
 ```powershell
-cgbundle sign my-lib-1.2.0.cgbundle --key C:\keys\private.pem
+SemBundle sign my-lib-1.2.0.SemBundle --key C:\keys\private.pem
 ```
 
-Produces `my-lib-1.2.0.cgbundle.sig` in the same directory. The signature covers the hex-encoded SHA-256 of the bundle file — it is interoperable with any Ed25519 verifier (Python `cryptography` library, `openssl`, etc.).
+Produces `my-lib-1.2.0.SemBundle.sig` in the same directory. The signature covers the hex-encoded SHA-256 of the bundle file — it is interoperable with any Ed25519 verifier (Python `cryptography` library, `openssl`, etc.).
 
 To write the `.sig` to a custom path:
 
 ```powershell
-cgbundle sign my-lib-1.2.0.cgbundle --key C:\keys\private.pem --output releases\my-lib-1.2.0.sig
+SemBundle sign my-lib-1.2.0.SemBundle --key C:\keys\private.pem --output releases\my-lib-1.2.0.sig
 ```
 
 ### Verifying a bundle locally
 
 ```powershell
-cgbundle verify my-lib-1.2.0.cgbundle --sig my-lib-1.2.0.cgbundle.sig --key C:\keys\public.pem
+SemBundle verify my-lib-1.2.0.SemBundle --sig my-lib-1.2.0.SemBundle.sig --key C:\keys\public.pem
 ```
 
 Prints `Signature valid.` on success; exits with a non-zero code and an error message on failure.
@@ -161,19 +161,19 @@ Prints `Signature valid.` on success; exits with a non-zero code and an error me
 
 ### Publish without signature (integrity only)
 
-1. Build or pack a .cgbundle archive.
-2. Publish it with cgbundle.
+1. Build or pack a .SemBundle archive.
+2. Publish it with SemBundle.
 
 ```powershell
-cgbundle publish .\my-lib-1.2.0.cgbundle --registry http://127.0.0.1:8765 --token <TOKEN_VALUE>
+SemBundle publish .\my-lib-1.2.0.SemBundle --registry http://127.0.0.1:8765 --token <TOKEN_VALUE>
 ```
 
 Environment variable equivalent:
 
 ```powershell
-$env:CGBUNDLE_REGISTRY_URL = "http://127.0.0.1:8765"
-$env:CGBUNDLE_TOKEN = "<TOKEN_VALUE>"
-cgbundle publish .\my-lib-1.2.0.cgbundle
+$env:SemBundle_REGISTRY_URL = "http://127.0.0.1:8765"
+$env:SemBundle_TOKEN = "<TOKEN_VALUE>"
+SemBundle publish .\my-lib-1.2.0.SemBundle
 ```
 
 The server computes and stores the bundle's SHA-256 hash automatically. Clients verify this hash on download.
@@ -184,13 +184,13 @@ Sign the bundle first, then publish both files:
 
 ```powershell
 # 1. Sign
-cgbundle sign .\my-lib-1.2.0.cgbundle --key C:\keys\private.pem
+SemBundle sign .\my-lib-1.2.0.SemBundle --key C:\keys\private.pem
 
 # 2. Publish bundle + signature together
-cgbundle publish .\my-lib-1.2.0.cgbundle --registry http://127.0.0.1:8765 --token <TOKEN_VALUE> --sig .\my-lib-1.2.0.cgbundle.sig
+SemBundle publish .\my-lib-1.2.0.SemBundle --registry http://127.0.0.1:8765 --token <TOKEN_VALUE> --sig .\my-lib-1.2.0.SemBundle.sig
 ```
 
-(The `--sig` flag is passed to `cgbundle publish` and attached in the multipart upload.)
+(The `--sig` flag is passed to `SemBundle publish` and attached in the multipart upload.)
 
 The server will:
 - validate token
@@ -202,17 +202,17 @@ The server will:
 
 ## Workspace Manifest and Lock File
 
-Like `package.json` + `package-lock.json`, `codegraph-hub` supports a declarative workspace manifest and a lock file for reproducible, authenticated installs across machines.
+Like `package.json` + `package-lock.json`, `sempkg` supports a declarative workspace manifest and a lock file for reproducible, authenticated installs across machines.
 
-**Commit both files to git.** Other developers clone the repo and run `codegraph-hub bundle sync` to get the exact same bundles.
+**Commit both files to git.** Other developers clone the repo and run `sempkg bundle sync` to get the exact same bundles.
 
-### `codegraph-hub.toml` — manifest
+### `sempkg.toml` — manifest
 
 Created automatically by `bundle add`, or write it by hand:
 
 ```toml
-# codegraph-hub workspace bundle manifest
-# Run: codegraph-hub bundle sync
+# sempkg workspace bundle manifest
+# Run: sempkg bundle sync
 
 [[registries]]
 name = "default"
@@ -235,12 +235,12 @@ aws-sdk = { version = "1.11.210", registry = "public"  }
 - Each dependency references a registry by `name`. If `registry` is omitted, the first entry is used.
 - `verify_key` is optional; when set, `bundle sync` verifies Ed25519 signatures before installing.
 
-### `codegraph-hub.lock` — lock file
+### `sempkg.lock` — lock file
 
 Auto-generated by `bundle lock` or `bundle sync`. Contains the SHA-256 of each bundle and the internal file checksums from the bundle's own `manifest.json`:
 
 ```toml
-# Auto-generated by codegraph-hub. DO NOT EDIT.
+# Auto-generated by sempkg. DO NOT EDIT.
 # Commit this file to ensure reproducible installs.
 
 [[package]]
@@ -258,26 +258,26 @@ signed       = true
 ### Adding a new bundle dependency
 
 ```powershell
-# With a named registry already in codegraph-hub.toml:
-codegraph-hub bundle add my-lib@1.2.0 --registry default
+# With a named registry already in sempkg.toml:
+sempkg bundle add my-lib@1.2.0 --registry default
 
 # With an inline URL (creates/reuses registry entry automatically):
-codegraph-hub bundle add my-lib@1.2.0 --registry-url http://192.168.1.25:8765
+sempkg bundle add my-lib@1.2.0 --registry-url http://192.168.1.25:8765
 ```
 
-This updates `codegraph-hub.toml`, fetches the SHA-256 from the registry to refresh `codegraph-hub.lock`, and installs the bundle into the workspace store.
+This updates `sempkg.toml`, fetches the SHA-256 from the registry to refresh `sempkg.lock`, and installs the bundle into the workspace store.
 
 ### Syncing a workspace (reproducible install)
 
 ```powershell
 # Install all deps from the manifest, using lock file for hashes:
-codegraph-hub bundle sync
+sempkg bundle sync
 
 # With signature verification:
-codegraph-hub bundle sync --verify-key keys/publisher.pem
+sempkg bundle sync --verify-key keys/publisher.pem
 
 # Force reinstall even if already present:
-codegraph-hub bundle sync --reinstall
+sempkg bundle sync --reinstall
 ```
 
 Already-installed bundles are skipped unless `--reinstall` is passed. The lock file is refreshed automatically if any dep is missing from it.
@@ -285,23 +285,23 @@ Already-installed bundles are skipped unless `--reinstall` is passed. The lock f
 ### Refreshing the lock file without installing
 
 ```powershell
-codegraph-hub bundle lock
+sempkg bundle lock
 ```
 
-Contacts each registry, fetches current SHA-256 and checksums for every pinned version, and writes `codegraph-hub.lock`. Does not install anything. Run this to update hashes after republishing a bundle (not recommended — prefer bumping the version).
+Contacts each registry, fetches current SHA-256 and checksums for every pinned version, and writes `sempkg.lock`. Does not install anything. Run this to update hashes after republishing a bundle (not recommended — prefer bumping the version).
 
-## Pull Bundles with codegraph-hub (ad-hoc)
+## Pull Bundles with sempkg (ad-hoc)
 
 ### Inspect registry index
 
 ```powershell
-codegraph-hub bundle search-registry http://127.0.0.1:8765
+sempkg bundle search-registry http://127.0.0.1:8765
 ```
 
 ### Install into workspace scope (integrity check only)
 
 ```powershell
-codegraph-hub bundle install my-lib@1.2.0 --registry http://127.0.0.1:8765
+sempkg bundle install my-lib@1.2.0 --registry http://127.0.0.1:8765
 ```
 
 The client automatically fetches `index.json`, checks the bundle's SHA-256 against the server-recorded hash, and rejects the download if they differ.
@@ -311,13 +311,13 @@ The client automatically fetches `index.json`, checks the bundle's SHA-256 again
 Obtain the publisher's `public.pem` out-of-band (e.g., from the project's GitHub repository), then:
 
 ```powershell
-codegraph-hub bundle install my-lib@1.2.0 --registry http://127.0.0.1:8765 --verify-key C:\keys\public.pem
+sempkg bundle install my-lib@1.2.0 --registry http://127.0.0.1:8765 --verify-key C:\keys\public.pem
 ```
 
 The client will:
 1. Fetch index.json and read the expected SHA-256
 2. Download the bundle and verify SHA-256
-3. Download `my-lib-1.2.0.cgbundle.sig` from the registry
+3. Download `my-lib-1.2.0.SemBundle.sig` from the registry
 4. Verify the Ed25519 signature against the bundle hash using the supplied public key
 5. Reject installation if either check fails
 
@@ -326,8 +326,8 @@ Requires the `cryptography` package: `uv pip install cryptography`
 ### Install into global scope
 
 ```powershell
-codegraph-hub bundle install my-lib@1.2.0 --registry http://127.0.0.1:8765 --global
-codegraph-hub bundle install my-lib@1.2.0 --registry http://127.0.0.1:8765 --global --verify-key C:\keys\public.pem
+sempkg bundle install my-lib@1.2.0 --registry http://127.0.0.1:8765 --global
+sempkg bundle install my-lib@1.2.0 --registry http://127.0.0.1:8765 --global --verify-key C:\keys\public.pem
 ```
 
 ### List and remove installed bundles
@@ -335,16 +335,16 @@ codegraph-hub bundle install my-lib@1.2.0 --registry http://127.0.0.1:8765 --glo
 List:
 
 ```powershell
-codegraph-hub bundle list
-codegraph-hub bundle list --workspace
-codegraph-hub bundle list --global
+sempkg bundle list
+sempkg bundle list --workspace
+sempkg bundle list --global
 ```
 
 Remove:
 
 ```powershell
-codegraph-hub bundle remove my-lib@1.2.0
-codegraph-hub bundle remove my-lib@1.2.0 --global
+sempkg bundle remove my-lib@1.2.0
+sempkg bundle remove my-lib@1.2.0 --global
 ```
 
 ## Registry Index Format
@@ -373,13 +373,13 @@ The server-generated index.json has this structure:
 }
 ```
 
-- `sha256`: SHA-256 of the raw `.cgbundle` file bytes. Clients verify this before extracting.
+- `sha256`: SHA-256 of the raw `.SemBundle` file bytes. Clients verify this before extracting.
 - `signed`: `true` if a `.sig` file was published alongside the bundle.
 
 ## Troubleshooting
 
-- Error: CGBUNDLE_REGISTRY_ADMIN_PASSWORD environment variable is not set
-  - Set the variable before running cgbundle-registry serve.
+- Error: SemBundle_REGISTRY_ADMIN_PASSWORD environment variable is not set
+  - Set the variable before running SemBundle-registry serve.
 
 - Publish returns 401
   - Token missing/invalid. Confirm Bearer token and correct config-dir.
@@ -387,17 +387,17 @@ The server-generated index.json has this structure:
 - Publish returns 409
   - That package version already exists. Publish a new version.
 
-- codegraph-hub bundle install fails with "SHA-256 mismatch: bundle may have been tampered with"
+- sempkg bundle install fails with "SHA-256 mismatch: bundle may have been tampered with"
   - The downloaded bundle does not match the hash stored in the registry's index. The bundle on disk may be corrupted, replaced, or the registry may have been modified. Contact the registry administrator.
 
-- codegraph-hub bundle install fails with "Signature verification failed"
+- sempkg bundle install fails with "Signature verification failed"
   - The Ed25519 signature does not match the bundle. Either the bundle has been tampered with after signing, or you are using the wrong public key. Do not install this bundle.
 
-- codegraph-hub bundle install fails with "Install 'cryptography' to use signature verification"
+- sempkg bundle install fails with "Install 'cryptography' to use signature verification"
   - Run: `uv pip install cryptography` (or `pip install cryptography`)
 
 - Registry looks empty after publish
   - Confirm server uses expected storage-dir and inspect <storage-dir>/index.json.
 
-- cgbundle verify prints "Signature verification FAILED"
+- SemBundle verify prints "Signature verification FAILED"
   - The bundle has been modified since signing, or the wrong public key was used. Do not distribute this bundle.

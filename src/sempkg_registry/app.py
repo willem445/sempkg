@@ -1,4 +1,4 @@
-"""FastAPI application factory for cgbundle_registry."""
+"""FastAPI application factory for sempkg_registry."""
 
 from __future__ import annotations
 
@@ -40,7 +40,7 @@ def _safe_path_component(value: str, label: str = "value") -> str:
 
 
 def _extract_manifest(data: bytes) -> dict:
-    """Extract and parse manifest.json from a .cgbundle (tar.gz) byte blob.
+    """Extract and parse manifest.json from a .sembundle (tar.gz) byte blob.
 
     Raises HTTPException 400 if the archive is invalid or manifest is missing.
     """
@@ -73,7 +73,7 @@ def create_app(
     if not admin_password:
         raise ValueError("admin_password must not be empty")
 
-    app = FastAPI(title="cgbundle Registry", version="0.1.0")
+    app = FastAPI(title="SemBundle Registry", version="0.1.0")
 
     # ------------------------------------------------------------------
     # GET /index.json
@@ -93,8 +93,8 @@ def create_app(
         _safe_path_component(version, "version")
         _safe_path_component(filename, "filename")
 
-        expected_bundle = f"{package}-{version}.cgbundle"
-        expected_sig = f"{package}-{version}.cgbundle.sig"
+        expected_bundle = f"{package}-{version}.sembundle"
+        expected_sig = f"{package}-{version}.sembundle.sig"
 
         if filename == expected_sig:
             sig_path = storage.get_signature_path(package, version)

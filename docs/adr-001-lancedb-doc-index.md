@@ -2,13 +2,13 @@
 
 **Date:** 2026-06-15
 **Status:** Accepted
-**Deciders:** codegraph-hub maintainers
+**Deciders:** sempkg maintainers
 
 ---
 
 ## Context
 
-CGBundle 1.1.0 introduced an optional `qmd/` extension for bundling documentation search.
+SemBundle 1.1.0 introduced an optional `qmd/` extension for bundling documentation search.
 It worked by invoking the external **QMD** CLI (a Node.js tool) to:
 
 1. Walk documentation directories (`*.md`, `*.txt`, `*.rst`)
@@ -16,7 +16,7 @@ It worked by invoking the external **QMD** CLI (a Node.js tool) to:
 3. Store the results in an SQLite database (`qmd/index/index.sqlite`)
 
 At query time, `sempkg` opened the SQLite file via **rusqlite** (with a bundled SQLite3 build)
-and ran FTS5 queries against it. The Python `codegraph_hub` server did the same via `sqlite3`.
+and ran FTS5 queries against it. The Python `sempkg` server did the same via `sqlite3`.
 
 ### Problems with QMD
 
@@ -38,8 +38,8 @@ Replace the `qmd/` bundle extension and all associated tooling with **LanceDB**:
 - The `qmd/` directory in bundles is replaced by `lance/`
 - The external `qmd` CLI is removed; indexing is done **in-process in pure Rust**
 - The `rusqlite` dependency is removed from `sempkg`
-- `lancedb`, `arrow-array`, `arrow-schema`, and `futures` are added to `sempkg` and `cgbundle`
-- `lancedb` is added to `codegraph_hub` Python dependencies
+- `lancedb`, `arrow-array`, `arrow-schema`, and `futures` are added to `sempkg` and `SemBundle`
+- `lancedb` is added to `sempkg` Python dependencies
 
 The bundle spec is bumped from **1.1.0 → 1.2.0**.
 
@@ -65,7 +65,7 @@ provides.
 
 Meilisearch has an embedded Rust mode but it is not designed for portable archive
 distribution (it maintains mutable index state). Rejected because bundle immutability
-is a first-class requirement of the CGBundle spec.
+is a first-class requirement of the SemBundle spec.
 
 ### D: Use LanceDB (chosen)
 
@@ -84,7 +84,7 @@ quality of QMD's FTS5 search without any external tooling.
 
 ### Positive
 
-- **No external tools required** for indexing or querying. `cgbundle build --docs-dir` runs entirely in-process.
+- **No external tools required** for indexing or querying. `SemBundle build --docs-dir` runs entirely in-process.
 - **No model download.** BM25 is statistical; no embedding model is needed for keyword search.
 - **Windows-native.** LanceDB's Rust crate compiles cleanly on all platforms.
 - **Cleaner spec.** The `lance/` extension has exactly two entries: `metadata.json` and `docs.lance/`. No optional sub-files.
@@ -94,8 +94,8 @@ quality of QMD's FTS5 search without any external tooling.
 ### Negative / Trade-offs
 
 - **No semantic (vector) search.** QMD produced embedding vectors for semantic similarity search. LanceDB supports vector search but we are not generating embeddings at index time. Keyword BM25 search is the only mode in 1.2.0. Vector search can be added later (see §Future Work below).
-- **Larger binary.** `lancedb` and its Arrow dependencies add ~15–20 MB to the `sempkg` and `cgbundle` binaries compared to `rusqlite`.
-- **Async tokio required.** The lancedb Rust API is fully async. `cgbundle build` and `sempkg` are synchronous entry points; both now create a `tokio::Runtime` with `block_on` for the Lance calls. This is idiomatic but adds a runtime.
+- **Larger binary.** `lancedb` and its Arrow dependencies add ~15–20 MB to the `sempkg` and `SemBundle` binaries compared to `rusqlite`.
+- **Async tokio required.** The lancedb Rust API is fully async. `SemBundle build` and `sempkg` are synchronous entry points; both now create a `tokio::Runtime` with `block_on` for the Lance calls. This is idiomatic but adds a runtime.
 - **Bundles are not backward-compatible.** Bundles built with spec 1.1.0 (QMD extension) will not provide doc search in `sempkg` 1.2.0+. `sempkg` detects the `lance` extension string and reports no docs index for 1.1.0 bundles.
 
 ---
@@ -104,8 +104,8 @@ quality of QMD's FTS5 search without any external tooling.
 
 ### For bundle publishers
 
-1. Upgrade `cgbundle` to the current version.
-2. Replace `cgbundle pack --qmd-dir <dir>` with `cgbundle build --docs-dir <dir>` (or pass `--lance-dir` to `cgbundle pack` if you have a pre-built LanceDB directory).
+1. Upgrade `SemBundle` to the current version.
+2. Replace `SemBundle pack --qmd-dir <dir>` with `SemBundle build --docs-dir <dir>` (or pass `--lance-dir` to `SemBundle pack` if you have a pre-built LanceDB directory).
 3. Remove the `--qmd-collection-name`, `--qmd-glob`, `--qmd-chunk-strategy` flags — the new `--docs-glob` accepts a comma-separated glob list.
 4. Republish bundles. Consumers running `sempkg sync` will pick up the new bundles.
 
@@ -113,7 +113,7 @@ quality of QMD's FTS5 search without any external tooling.
 
 No action required if you only run `sempkg sync` / `sempkg docs`. The `sempkg` binary handles the `lance/` extension transparently. Old 1.1.0 bundles simply show no doc index.
 
-### For `codegraph_hub` Python users
+### For `sempkg` Python users
 
 Install the updated package (`uv pip install -e .`). The `lancedb` Python package is now a hard dependency. Old bundle directories with `qmd/` sub-directories will show "(no LanceDB documentation index in this bundle)" in doc search until republished.
 

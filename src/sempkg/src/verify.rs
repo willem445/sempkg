@@ -1,7 +1,7 @@
-/// Ed25519 signature verification for cgbundle packages.
+/// Ed25519 signature verification for sembundle packages.
 ///
 /// The signature is over the hex-encoded SHA-256 digest of the bundle bytes,
-/// matching the convention used by `cgbundle publish`.
+/// matching the convention used by `sembundle publish`.
 use std::path::Path;
 
 use anyhow::{Context, Result};

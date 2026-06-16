@@ -15,7 +15,7 @@ use crate::validate::{validate_commit_hash, validate_input_dir, validate_lance_d
 pub struct PackOptions {
     /// Path to the CodeGraph output directory containing `graph/`, `embeddings/`, `config.json`.
     pub input_dir: PathBuf,
-    /// Where to write the `.cgbundle` file. Defaults to `./<name>-<version>.cgbundle`.
+    /// Where to write the `.sembundle` file. Defaults to `./<name>-<version>.sembundle`.
     pub output_path: Option<PathBuf>,
     pub name: String,
     pub version: String,
@@ -33,7 +33,7 @@ pub struct PackOptions {
     ///
     /// When supplied the directory must contain:
     /// `metadata.json` and at least one `*.lance/` table directory.
-    /// Spec: cgbundle-spec.md §9.
+    /// Spec: sembundle-spec.md §9.
     pub lance_dir: Option<PathBuf>,
 }
 
@@ -44,7 +44,7 @@ struct Entry {
     content: Vec<u8>,
 }
 
-/// Pack a CodeGraph output directory into a `.cgbundle` gzip tar archive.
+/// Pack a CodeGraph output directory into a `.sembundle` gzip tar archive.
 ///
 /// Returns the path of the produced bundle file on success.
 ///
@@ -138,7 +138,7 @@ pub fn pack(opts: PackOptions) -> Result<PathBuf, PackError> {
     // --- Write archive ---
     let output_path = opts
         .output_path
-        .unwrap_or_else(|| PathBuf::from(format!("{}.cgbundle", prefix)));
+        .unwrap_or_else(|| PathBuf::from(format!("{}.sembundle", prefix)));
 
     {
         let file = std::fs::File::create(&output_path)?;
@@ -301,7 +301,7 @@ mod tests {
         fs::write(dir.join("metadata.json"), serde_json::to_vec_pretty(&meta).unwrap()).unwrap();
     }
 
-    /// Extract all entries from a `.cgbundle` file.
+    /// Extract all entries from a `.sembundle` file.
     /// Returns `(manifest_bytes, map_of_key → bytes)` where key excludes the
     /// top-level directory prefix.
     fn extract_bundle(path: &Path) -> (Vec<u8>, HashMap<String, Vec<u8>>) {
@@ -340,7 +340,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let input = tmp.path().join("input");
         make_input(&input);
-        let output = tmp.path().join("out.cgbundle");
+        let output = tmp.path().join("out.sembundle");
 
         let result = pack(default_opts(input, output.clone()));
         assert!(result.is_ok(), "pack failed: {:?}", result.err());
@@ -354,7 +354,7 @@ mod tests {
         make_input(&input);
 
         // Change working directory is risky in tests; instead supply explicit output.
-        let output = tmp.path().join("my-sdk-1.0.0.cgbundle");
+        let output = tmp.path().join("my-sdk-1.0.0.sembundle");
         let mut opts = default_opts(input, output.clone());
         opts.output_path = Some(output.clone());
 
@@ -475,7 +475,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let input = tmp.path().join("input");
         make_input(&input);
-        let output = tmp.path().join("out.cgbundle");
+        let output = tmp.path().join("out.sembundle");
         pack(default_opts(input, output.clone())).unwrap();
 
         let (manifest_bytes, files) = extract_bundle(&output);
@@ -495,7 +495,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let input = tmp.path().join("input");
         make_input(&input);
-        let output = tmp.path().join("out.cgbundle");
+        let output = tmp.path().join("out.sembundle");
         pack(default_opts(input, output.clone())).unwrap();
 
         let (manifest_bytes, _) = extract_bundle(&output);
@@ -513,7 +513,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let input = tmp.path().join("input");
         make_input(&input);
-        let output = tmp.path().join("out.cgbundle");
+        let output = tmp.path().join("out.sembundle");
         pack(default_opts(input, output.clone())).unwrap();
 
         let (manifest_bytes, _) = extract_bundle(&output);
@@ -534,7 +534,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let input = tmp.path().join("input");
         make_input(&input);
-        let output = tmp.path().join("out.cgbundle");
+        let output = tmp.path().join("out.sembundle");
         pack(default_opts(input, output.clone())).unwrap();
 
         let (_, files) = extract_bundle(&output);
@@ -559,7 +559,7 @@ mod tests {
         let lance = tmp.path().join("lance");
         make_input(&input);
         make_lance_dir(&lance);
-        let output = tmp.path().join("out.cgbundle");
+        let output = tmp.path().join("out.sembundle");
         let mut opts = default_opts(input, output.clone());
         opts.lance_dir = Some(lance);
         assert!(pack(opts).is_ok());
@@ -573,7 +573,7 @@ mod tests {
         let lance = tmp.path().join("lance");
         make_input(&input);
         make_lance_dir(&lance);
-        let output = tmp.path().join("out.cgbundle");
+        let output = tmp.path().join("out.sembundle");
         let mut opts = default_opts(input, output.clone());
         opts.lance_dir = Some(lance);
         pack(opts).unwrap();
@@ -593,7 +593,7 @@ mod tests {
         let lance = tmp.path().join("lance");
         make_input(&input);
         make_lance_dir(&lance);
-        let output = tmp.path().join("out.cgbundle");
+        let output = tmp.path().join("out.sembundle");
         let mut opts = default_opts(input, output.clone());
         opts.lance_dir = Some(lance);
         pack(opts).unwrap();
@@ -608,7 +608,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let input = tmp.path().join("input");
         make_input(&input);
-        let output = tmp.path().join("out.cgbundle");
+        let output = tmp.path().join("out.sembundle");
         pack(default_opts(input, output.clone())).unwrap();
 
         let (manifest_bytes, _) = extract_bundle(&output);
@@ -623,7 +623,7 @@ mod tests {
         let lance = tmp.path().join("lance");
         make_input(&input);
         make_lance_dir(&lance);
-        let output = tmp.path().join("out.cgbundle");
+        let output = tmp.path().join("out.sembundle");
         let mut opts = default_opts(input, output.clone());
         opts.lance_dir = Some(lance);
         pack(opts).unwrap();
@@ -644,7 +644,7 @@ mod tests {
         let lance = tmp.path().join("lance");
         make_input(&input);
         make_lance_dir(&lance);
-        let output = tmp.path().join("out.cgbundle");
+        let output = tmp.path().join("out.sembundle");
         let mut opts = default_opts(input, output.clone());
         opts.lance_dir = Some(lance);
         pack(opts).unwrap();

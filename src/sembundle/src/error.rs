@@ -1,8 +1,8 @@
 use thiserror::Error;
 
-/// Errors produced by the CGBundle packer.
+/// Errors produced by the SemBundle packer.
 ///
-/// Error codes align with the validation rules in cgbundle-spec.md §10-11.
+/// Error codes align with the validation rules in sembundle-spec.md §10-11.
 #[derive(Debug, Error)]
 pub enum PackError {
     /// E_MISSING_DIR — a required subdirectory is absent from the input.

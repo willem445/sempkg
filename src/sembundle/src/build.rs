@@ -1,7 +1,7 @@
-ï»¿//! Build pipeline: run codegraph and LanceDB against source / docs directories,
-//! then pack the results into a `.cgbundle` archive.
+//! Build pipeline: run codegraph and LanceDB against source / docs directories,
+//! then pack the results into a `.sembundle` archive.
 //!
-//! This is the implementation behind the `cgbundle build` subcommand.
+//! This is the implementation behind the `SemBundle build` subcommand.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -31,7 +31,7 @@ pub struct BuildOptions {
     pub tag: Option<String>,
     pub language: String,
     pub codegraph_version: String,
-    /// Where to write the finished `.cgbundle`. Defaults to `./<name>-<version>.cgbundle`.
+    /// Where to write the finished `.sembundle`. Defaults to `./<name>-<version>.sembundle`.
     pub output_path: Option<PathBuf>,
 
     // --- CodeGraph inputs ---
@@ -63,14 +63,14 @@ pub fn build(opts: BuildOptions) -> Result<PathBuf, PackError> {
     std::fs::create_dir_all(&cg_out)?;
 
     // Step 1: index source directories with codegraph.
-    eprintln!("[cgbundle] Running codegraph ...");
+    eprintln!("[sembundle] Running codegraph ...");
     run_codegraph(&opts.source_dirs, &cg_out)?;
 
     // Step 2: index docs directories with LanceDB (optional).
     let lance_out = if !opts.docs_dirs.is_empty() {
         let lance_dir = work.path().join("lance-out");
         let glob = opts.docs_glob.as_deref().unwrap_or("**/*.{md,txt,rst}");
-        eprintln!("[cgbundle] Building LanceDB documentation index ...");
+        eprintln!("[sembundle] Building LanceDB documentation index ...");
         run_lance(&opts.docs_dirs, &lance_dir, glob)?;
         Some(lance_dir)
     } else {
@@ -78,7 +78,7 @@ pub fn build(opts: BuildOptions) -> Result<PathBuf, PackError> {
     };
 
     // Step 3: pack.
-    eprintln!("[cgbundle] Packing bundle ...");
+    eprintln!("[sembundle] Packing bundle ...");
     let bundle_path = pack(PackOptions {
         input_dir: cg_out,
         output_path: opts.output_path,
@@ -112,7 +112,7 @@ fn run_codegraph(source_dirs: &[PathBuf], out_dir: &Path) -> Result<(), PackErro
 
     for source_dir in source_dirs {
         eprintln!(
-            "[cgbundle]   codegraph: indexing {} ...",
+            "[sembundle]   codegraph: indexing {} ...",
             source_dir.display()
         );
         invoke(
@@ -165,8 +165,8 @@ fn run_codegraph(source_dirs: &[PathBuf], out_dir: &Path) -> Result<(), PackErro
 /// Build a LanceDB documentation index from `docs_dirs` and write it to `out_dir`.
 ///
 /// The output directory will contain:
-///   out_dir/metadata.json    â€” index metadata
-///   out_dir/docs.lance/      â€” LanceDB table with tantivy FTS index
+///   out_dir/metadata.json    — index metadata
+///   out_dir/docs.lance/      — LanceDB table with tantivy FTS index
 fn run_lance(
     docs_dirs: &[PathBuf],
     out_dir: &Path,
@@ -234,7 +234,7 @@ async fn run_lance_inner(
     if chunk_count == 0 {
         return Err(PackError::InvalidField {
             field: "docs_dirs".to_string(),
-            reason: "no documents matched the glob pattern â€” check --docs-dir and --docs-glob"
+            reason: "no documents matched the glob pattern — check --docs-dir and --docs-glob"
                 .to_string(),
         });
     }
@@ -287,7 +287,7 @@ async fn run_lance_inner(
 
     if !fts_ok {
         eprintln!(
-            "[cgbundle] Warning: FTS index creation failed â€” search will use full scan."
+            "[sembundle] Warning: FTS index creation failed — search will use full scan."
         );
     }
 
@@ -308,7 +308,7 @@ async fn run_lance_inner(
     )?;
 
     eprintln!(
-        "[cgbundle]   lance: indexed {doc_count} documents, {chunk_count} chunks{}.",
+        "[sembundle]   lance: indexed {doc_count} documents, {chunk_count} chunks{}.",
         if fts_ok { " (FTS enabled)" } else { "" }
     );
 
@@ -448,7 +448,7 @@ mod tests {
 
     #[test]
     fn error_when_tool_not_found() {
-        let err = find_tool("cgbundle-nonexistent-tool-xyz-abc").unwrap_err();
+        let err = find_tool("SemBundle-nonexistent-tool-xyz-abc").unwrap_err();
         assert!(
             matches!(err, PackError::ToolNotFound(_)),
             "expected ToolNotFound, got {err:?}"

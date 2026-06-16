@@ -7,8 +7,8 @@ use clap::{Parser, Subcommand};
 #[command(
     name = "sempkg",
     version,
-    about = "Semantic package manager for cgbundle archives",
-    long_about = "sempkg manages cgbundle semantic index packages, provides scoped \
+    about = "Semantic package manager for sembundle archives",
+    long_about = "sempkg manages sembundle semantic index packages, provides scoped \
                   CodeGraph and LanceDB doc queries, and runs an MCP server for AI agents."
 )]
 pub struct Cli {
@@ -39,7 +39,7 @@ pub enum Commands {
     /// Add a bundle dependency to sempkg.toml.
     ///
     /// Example: sempkg add aws-sdk@1.11.210 --registry https://reg.example.com
-    /// Example: sempkg add mylib@2.0.0 --url https://github.com/owner/repo/releases/download/v2.0.0/mylib-2.0.0.cgbundle
+    /// Example: sempkg add mylib@2.0.0 --url https://github.com/owner/repo/releases/download/v2.0.0/mylib-2.0.0.sembundle
     Add {
         /// Package spec in `name@version` format.
         spec: String,

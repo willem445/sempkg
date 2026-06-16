@@ -1,11 +1,11 @@
-"""Tests for cgbundle_registry TokenStore."""
+"""Tests for sempkg_registry TokenStore."""
 
 from __future__ import annotations
 
 import pytest
 from pathlib import Path
 
-from cgbundle_registry.auth import TokenStore
+from sempkg_registry.auth import TokenStore
 
 
 @pytest.fixture
