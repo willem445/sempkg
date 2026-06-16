@@ -339,3 +339,75 @@ def get_global_store() -> BundleStore:
 def get_workspace_store(workspace_dir: Path | None = None) -> BundleStore:
     cwd = workspace_dir or Path.cwd()
     return BundleStore(cwd / WORKSPACE_BUNDLE_STORE_DIR_NAME)
+
+
+# ---------------------------------------------------------------------------
+# Package-like adapter for installed bundles
+# ---------------------------------------------------------------------------
+
+@dataclass
+class BundlePackage:
+    """Thin wrapper around a BundleInfo that exposes the same interface as
+    :class:`~codegraph_hub.registry.Package` so bundle store entries can be
+    passed directly to codegraph query helpers.
+
+    The ``abs_path`` points to the extracted bundle store directory, which
+    contains ``graph/``, ``embeddings/``, ``config.json``, etc.
+    """
+
+    name: str
+    path: str       # str form of the store_dir path
+    version: str
+    description: str = ""
+
+    @property
+    def abs_path(self) -> Path:
+        return Path(self.path)
+
+    @property
+    def is_indexed(self) -> bool:
+        """Bundle is queryable if its ``graph/`` directory exists."""
+        return (Path(self.path) / "graph").exists()
+
+    def has_qmd(self) -> bool:
+        """Return True when the bundle contains a QMD documentation index."""
+        return (Path(self.path) / "qmd" / "index" / "index.sqlite").exists()
+
+
+def get_all_bundle_packages(workspace_dir: Path | None = None) -> list[BundlePackage]:
+    """Return all installed bundles as :class:`BundlePackage` objects.
+
+    Workspace bundles are listed first so that workspace-scoped versions take
+    precedence when callers iterate and stop at the first name match.
+    Global bundles that share a ``name@version`` with a workspace bundle are
+    omitted (deduplicated).
+    """
+    seen: set[str] = set()
+    result: list[BundlePackage] = []
+
+    ws_store = get_workspace_store(workspace_dir)
+    for info in ws_store.list_installed():
+        key = f"{info.name}@{info.version}"
+        result.append(
+            BundlePackage(
+                name=info.name,
+                path=str(info.store_dir),
+                version=info.version,
+                description=info.manifest.get("source_repo", ""),
+            )
+        )
+        seen.add(key)
+
+    for info in get_global_store().list_installed():
+        key = f"{info.name}@{info.version}"
+        if key not in seen:
+            result.append(
+                BundlePackage(
+                    name=info.name,
+                    path=str(info.store_dir),
+                    version=info.version,
+                    description=info.manifest.get("source_repo", ""),
+                )
+            )
+
+    return result

@@ -44,7 +44,7 @@ class TestCmdList:
         result = cli.cmd_list(registry, args)
         assert result == 0
         captured = capsys.readouterr()
-        assert "No packages registered" in captured.out
+        assert "No packages or bundles registered" in captured.out
 
     def test_cmd_list_with_packages(self, registry, temp_project_dir, capsys):
         """Test list command with registered packages."""

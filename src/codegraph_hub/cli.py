@@ -7,9 +7,12 @@ import urllib.request
 from pathlib import Path
 
 from . import codegraph as cg
+from . import qmd as qmd_mod
 from .bundle_store import (
     BundleInstallError,
+    BundlePackage,
     VersionExistsError,
+    get_all_bundle_packages,
     get_global_store,
     get_workspace_store,
 )
@@ -22,13 +25,30 @@ from .registry import Registry
 
 def cmd_list(registry: Registry, args: argparse.Namespace) -> int:
     packages = registry.list_all()
-    if not packages:
-        print("No packages registered. Use 'codegraph-hub add <name> <path>' to add one.")
+    bundle_pkgs = get_all_bundle_packages()
+
+    if not packages and not bundle_pkgs:
+        print("No packages or bundles registered.")
+        print("  Packages: 'codegraph-hub add <name> <path>'")
+        print("  Bundles:  'codegraph-hub bundle sync' or 'codegraph-hub bundle add <pkg>@<ver>'")
         return 0
-    for pkg in packages:
-        status = "indexed" if pkg.is_indexed else "NOT indexed"
-        desc = f"  # {pkg.description}" if pkg.description else ""
-        print(f"  {pkg.name:<20} [{status}]  {pkg.path}{desc}")
+
+    if packages:
+        print("Registered packages:")
+        for pkg in packages:
+            status = "indexed" if pkg.is_indexed else "NOT indexed"
+            desc = f"  # {pkg.description}" if pkg.description else ""
+            print(f"  {pkg.name:<24} [{status}]  {pkg.path}{desc}")
+
+    if bundle_pkgs:
+        if packages:
+            print()
+        print("Installed bundles:")
+        for bp in bundle_pkgs:
+            status = "indexed" if bp.is_indexed else "NOT indexed"
+            qmd_flag = "  +qmd" if bp.has_qmd() else ""
+            scope = "workspace" if (Path(bp.path).parents[2].name == ".codegraph_hub") else "global"
+            print(f"  {bp.name:<20} @ {bp.version:<12} [{status}]  [{scope}]{qmd_flag}")
     return 0
 
 
@@ -94,10 +114,25 @@ def cmd_status(registry: Registry, args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 def _require_indexed(registry: Registry, name: str):
-    """Return (pkg, error_code). Prints error and returns (None, 1) on failure."""
+    """Return (pkg_or_bundle, error_code). Checks registry first, then bundle stores."""
     pkg = registry.get(name)
     if pkg is None:
-        print(f"Package '{name}' not found. Use 'codegraph-hub list' to see registered packages.", file=sys.stderr)
+        # Check installed bundles (workspace-first precedence)
+        for bp in get_all_bundle_packages():
+            if bp.name == name:
+                if not bp.is_indexed:
+                    print(
+                        f"Bundle '{name}@{bp.version}' is installed but not queryable "
+                        "(missing graph/ directory).",
+                        file=sys.stderr,
+                    )
+                    return None, 1
+                return bp, 0
+        print(
+            f"Package '{name}' not found. "
+            "Use 'codegraph-hub list' to see registered packages and bundles.",
+            file=sys.stderr,
+        )
         return None, 1
     if not pkg.is_indexed:
         print(f"Package '{name}' is not indexed. Run 'codegraph-hub reindex {name}' first.", file=sys.stderr)
@@ -105,17 +140,31 @@ def _require_indexed(registry: Registry, name: str):
     return pkg, 0
 
 
+def _all_queryable(registry: Registry) -> list:
+    """Return all queryable sources: indexed registry packages + indexed bundles."""
+    reg_pkgs = [p for p in registry.list_all() if p.is_indexed]
+    bundle_pkgs = [b for b in get_all_bundle_packages() if b.is_indexed]
+    combined = reg_pkgs + bundle_pkgs
+    if not combined:
+        print(
+            "No indexed packages or bundles found.\n"
+            "  Packages: 'codegraph-hub add <name> <path>'\n"
+            "  Bundles:  'codegraph-hub bundle sync' or "
+            "'codegraph-hub bundle add <pkg>@<ver>'",
+            file=sys.stderr,
+        )
+    return combined
+
+
 def _all_indexed(registry: Registry) -> list:
-    pkgs = [p for p in registry.list_all() if p.is_indexed]
-    if not pkgs:
-        print("No indexed packages. Use 'codegraph-hub add <name> <path>' to register one.", file=sys.stderr)
-    return pkgs
+    """Legacy alias — delegates to _all_queryable."""
+    return _all_queryable(registry)
 
 
 def cmd_search(registry: Registry, args: argparse.Namespace) -> int:
     kind = getattr(args, "kind", None) or None
     if not args.package:
-        pkgs = _all_indexed(registry)
+        pkgs = _all_queryable(registry)
         if not pkgs:
             return 1
         print(cg.run_across_packages(pkgs, lambda p: cg.query(p.abs_path, args.query, kind, args.limit)))
@@ -129,7 +178,7 @@ def cmd_search(registry: Registry, args: argparse.Namespace) -> int:
 
 def cmd_context(registry: Registry, args: argparse.Namespace) -> int:
     if not args.package:
-        pkgs = _all_indexed(registry)
+        pkgs = _all_queryable(registry)
         if not pkgs:
             return 1
         print(cg.run_across_packages(pkgs, lambda p: cg.context(p.abs_path, args.task)))
@@ -146,10 +195,9 @@ def cmd_symbol(registry: Registry, args: argparse.Namespace) -> int:
     context_lines = getattr(args, "context", 0) or 0
 
     if not args.package:
-        pkgs = _all_indexed(registry)
+        pkgs = _all_queryable(registry)
         if not pkgs:
             return 1
-        # stop_on_first=True: return the first package that has the symbol
         result = cg.run_across_packages(
             pkgs,
             lambda p: _symbol_source(p, args.symbol, kind, context_lines),
@@ -171,6 +219,10 @@ def cmd_symbol(registry: Registry, args: argparse.Namespace) -> int:
 
 
 def _symbol_source(pkg, symbol: str, kind, context_lines: int) -> str:
+    """Return formatted symbol source. For bundles (no source files), falls back to CLI search."""
+    if isinstance(pkg, BundlePackage):
+        # Bundles carry the graph index but not source files; use CLI search as best-effort.
+        return cg.query(pkg.abs_path, symbol, kind, limit=5)
     matches = cg.find_symbols(pkg.abs_path, symbol, kind)
     if not matches:
         return ""
@@ -179,7 +231,7 @@ def _symbol_source(pkg, symbol: str, kind, context_lines: int) -> str:
 
 def cmd_callers(registry: Registry, args: argparse.Namespace) -> int:
     if not args.package:
-        pkgs = _all_indexed(registry)
+        pkgs = _all_queryable(registry)
         if not pkgs:
             return 1
         print(cg.run_across_packages(pkgs, lambda p: cg.callers(p.abs_path, args.symbol, args.limit)))
@@ -193,7 +245,7 @@ def cmd_callers(registry: Registry, args: argparse.Namespace) -> int:
 
 def cmd_callees(registry: Registry, args: argparse.Namespace) -> int:
     if not args.package:
-        pkgs = _all_indexed(registry)
+        pkgs = _all_queryable(registry)
         if not pkgs:
             return 1
         print(cg.run_across_packages(pkgs, lambda p: cg.callees(p.abs_path, args.symbol, args.limit)))
@@ -207,7 +259,7 @@ def cmd_callees(registry: Registry, args: argparse.Namespace) -> int:
 
 def cmd_impact(registry: Registry, args: argparse.Namespace) -> int:
     if not args.package:
-        pkgs = _all_indexed(registry)
+        pkgs = _all_queryable(registry)
         if not pkgs:
             return 1
         print(cg.run_across_packages(pkgs, lambda p: cg.impact(p.abs_path, args.symbol, args.depth)))
@@ -221,7 +273,7 @@ def cmd_impact(registry: Registry, args: argparse.Namespace) -> int:
 
 def cmd_files(registry: Registry, args: argparse.Namespace) -> int:
     if not args.package:
-        pkgs = _all_indexed(registry)
+        pkgs = _all_queryable(registry)
         if not pkgs:
             return 1
         print(cg.run_across_packages(pkgs, lambda p: cg.files(p.abs_path, args.filter or None)))
@@ -474,6 +526,49 @@ def cmd_bundle_search_registry(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_bundle_qmd_search(args: argparse.Namespace) -> int:
+    """Search the QMD documentation index of one or all installed bundles."""
+    query = args.query
+    limit = args.limit
+
+    if args.pkg_version:
+        name, version = _parse_pkg_version(args.pkg_version)
+        # Resolve from workspace store first, then global
+        ws_store = get_workspace_store()
+        bundle_dir = ws_store.resolve(name, version)
+        if bundle_dir is None:
+            bundle_dir = get_global_store().resolve(name, version)
+        if bundle_dir is None:
+            print(f"Bundle '{name}@{version}' is not installed.", file=sys.stderr)
+            return 1
+        if not qmd_mod.has_qmd(bundle_dir):
+            print(f"Bundle '{name}@{version}' does not have a QMD documentation index.", file=sys.stderr)
+            return 1
+        print(qmd_mod.qmd_search(bundle_dir, query, limit))
+        return 0
+
+    # No specific bundle — search all installed bundles with QMD indexes
+    bundle_pkgs = get_all_bundle_packages()
+    qmd_bundles = [bp for bp in bundle_pkgs if qmd_mod.has_qmd(bp.abs_path)]
+    if not qmd_bundles:
+        print("No installed bundles have a QMD documentation index.", file=sys.stderr)
+        return 1
+
+    found_any = False
+    for bp in qmd_bundles:
+        result = qmd_mod.qmd_search(bp.abs_path, query, limit)
+        if result and not result.startswith("(no results"):
+            if found_any:
+                print("\n" + "─" * 60 + "\n")
+            print(f"### {bp.name} @ {bp.version}\n")
+            print(result)
+            found_any = True
+
+    if not found_any:
+        print(f"No QMD documentation results for '{query}' across installed bundles.")
+    return 0
+
+
 def cmd_read(registry: Registry, args: argparse.Namespace) -> int:
     pkg, rc = _require_indexed(registry, args.package)
     if rc:
@@ -595,6 +690,12 @@ def main_cli() -> None:
     pb_search = bundle_sub.add_parser("search-registry", help="List packages available on a registry")
     pb_search.add_argument("url", metavar="URL", help="Registry base URL")
 
+    pb_qmd = bundle_sub.add_parser("qmd-search", help="Full-text search the QMD documentation index of a bundle")
+    pb_qmd.add_argument("pkg_version", metavar="<pkg>@<version>", nargs="?", default=None,
+                        help="Bundle name@version (omit to search all bundles with QMD)")
+    pb_qmd.add_argument("query", help="Documentation search query")
+    pb_qmd.add_argument("-n", "--limit", type=int, default=10, help="Max results (default: 10)")
+
     pb_add = bundle_sub.add_parser("add", help="Add a bundle dependency and install it")
     pb_add.add_argument("pkg_version", metavar="<pkg>@<version>")
     pb_add.add_argument("--registry", metavar="NAME", default=None, help="Registry name from codegraph-hub.toml")
@@ -628,6 +729,7 @@ def main_cli() -> None:
             "add":             cmd_bundle_add,
             "sync":            cmd_bundle_sync,
             "lock":            cmd_bundle_lock,
+            "qmd-search":      cmd_bundle_qmd_search,
         }
         sys.exit(bundle_dispatch[args.bundle_command](args))
 

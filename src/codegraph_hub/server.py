@@ -5,7 +5,8 @@ from pathlib import Path
 
 from fastmcp import FastMCP
 
-from .bundle_store import get_global_store, get_workspace_store
+from .bundle_store import get_all_bundle_packages, get_global_store, get_workspace_store
+from . import qmd as qmd_mod
 from .codegraph import (
     callers,
     callees,
@@ -25,19 +26,20 @@ from .registry import Registry
 mcp = FastMCP(
     "codegraph-hub",
     instructions=textwrap.dedent("""\
-        codegraph-hub indexes your internal Python packages and makes their
-        symbols, call graphs, and source code available without file-reading.
+        codegraph-hub exposes CodeGraph symbol/call-graph intelligence and QMD
+        documentation search for internally registered packages and installed
+        .cgbundle archives.
 
         Workflow:
-        1. Call list_packages to see what internal packages are available.
-        2. Call search_package to find a specific class, function, or module.
-        3. Call get_context with a task description to get AI-optimized context
-           about how to use the package for a specific purpose.
+        1. Call list_packages to see registered packages AND installed bundles.
+        2. Call search_package to find a class, function, or module by name.
+        3. Call get_context with a task description for AI-optimized code context.
         4. Call get_callers / get_callees to understand call relationships.
-        5. Call read_file for the full source of a specific file when needed.
+        5. Call search_bundle_docs to search bundled documentation (QMD).
+        6. Call read_file for the full source of a specific file (packages only).
 
-        Always start with list_packages if you are unsure which package contains
-        the symbol you are looking for.
+        Always start with list_packages when unsure which package contains a symbol.
+        Use search_bundle_docs when looking for documentation, guides, or prose.
     """),
 )
 
@@ -45,18 +47,36 @@ registry = Registry()
 
 
 def _require(package_name: str):
-    """Return a Package or a user-facing error string."""
+    """Return a Package/BundlePackage or a user-facing error string.
+
+    Checks the Registry first, then workspace bundle store, then global bundle
+    store. For bundles, the first (workspace-preferenced) match by name is used.
+    """
     pkg = registry.get(package_name)
-    if pkg is None:
-        pkgs = [p.name for p in registry.list_all()]
-        hint = f" Available packages: {', '.join(pkgs)}" if pkgs else " No packages registered yet."
-        return None, f"Package '{package_name}' not found.{hint}"
-    if not pkg.is_indexed:
-        return None, (
-            f"Package '{package_name}' is registered but not yet indexed. "
-            f"Use reindex_package('{package_name}') to index it."
-        )
-    return pkg, None
+    if pkg is not None:
+        if not pkg.is_indexed:
+            return None, (
+                f"Package '{package_name}' is registered but not yet indexed. "
+                f"Use reindex_package('{package_name}') to index it."
+            )
+        return pkg, None
+
+    # Check bundle stores (workspace first)
+    for bp in get_all_bundle_packages():
+        if bp.name == package_name:
+            if not bp.is_indexed:
+                return None, (
+                    f"Bundle '{package_name}@{bp.version}' is installed but not queryable "
+                    "(missing graph/ directory)."
+                )
+            return bp, None
+
+    # Not found anywhere
+    reg_names = [p.name for p in registry.list_all()]
+    bundle_names = [f"{b.name}@{b.version}" for b in get_all_bundle_packages()]
+    all_names = reg_names + bundle_names
+    hint = f" Available: {', '.join(all_names)}" if all_names else " No packages or bundles registered yet."
+    return None, f"Package '{package_name}' not found.{hint}"
 
 
 # ---------------------------------------------------------------------------
@@ -66,19 +86,36 @@ def _require(package_name: str):
 
 @mcp.tool()
 def list_packages() -> str:
-    """List all registered internal packages and their index status."""
+    """List all registered internal packages and installed bundles with their index status."""
     packages = registry.list_all()
-    if not packages:
+    bundle_pkgs = get_all_bundle_packages()
+
+    if not packages and not bundle_pkgs:
         return (
-            "No internal packages registered.\n"
-            "Use add_package(name, path) to register a locally cloned internal repo."
+            "No internal packages or bundles registered.\n"
+            "  Packages: use add_package(name, path) to register a locally cloned repo.\n"
+            "  Bundles:  run 'codegraph-hub bundle sync' or 'codegraph-hub bundle add <pkg>@<ver>'."
         )
-    lines = ["Registered internal packages:\n"]
-    for pkg in packages:
-        status_icon = "✓ indexed" if pkg.is_indexed else "✗ not indexed (run reindex_package)"
-        desc = f" — {pkg.description}" if pkg.description else ""
-        lines.append(f"  • **{pkg.name}** [{status_icon}]{desc}")
-        lines.append(f"    path: {pkg.path}")
+
+    lines: list[str] = []
+
+    if packages:
+        lines.append("**Registered packages:**\n")
+        for pkg in packages:
+            status_icon = "✓ indexed" if pkg.is_indexed else "✗ not indexed (run reindex_package)"
+            desc = f" — {pkg.description}" if pkg.description else ""
+            lines.append(f"  • **{pkg.name}** [{status_icon}]{desc}")
+            lines.append(f"    path: {pkg.path}")
+
+    if bundle_pkgs:
+        lines.append("\n**Installed bundles:**\n")
+        for bp in bundle_pkgs:
+            status_icon = "✓ indexed" if bp.is_indexed else "✗ not queryable"
+            qmd_flag = "  *(+QMD docs)*" if bp.has_qmd() else ""
+            scope = "workspace" if ".codegraph_hub" in str(bp.abs_path) else "global"
+            lines.append(f"  • **{bp.name}** @ {bp.version}  [{status_icon}]  [{scope}]{qmd_flag}")
+            lines.append(f"    path: {bp.path}")
+
     return "\n".join(lines)
 
 
@@ -164,16 +201,16 @@ def package_status(package_name: str) -> str:
 
 @mcp.tool()
 def search_package(package_name: str, query_str: str, kind: str = "") -> str:
-    """Search for symbols (functions, classes, methods, modules) in an internal package.
+    """Search for symbols (functions, classes, methods, modules) in a package or bundle.
 
     Args:
-        package_name: Name of the registered internal package, or "" to search all packages.
+        package_name: Registered package name or installed bundle name, or "" to search all.
         query_str: Symbol name or keyword to search for.
         kind: Optional type filter — one of: function, class, method, module, variable.
     """
     if not package_name:
-        pkgs = registry.list_all()
-        return run_across_packages(pkgs, lambda p: query(p.abs_path, query_str, kind or None))
+        all_sources = list(registry.list_all()) + get_all_bundle_packages()
+        return run_across_packages(all_sources, lambda p: query(p.abs_path, query_str, kind or None))
     pkg, err = _require(package_name)
     if err:
         return err
@@ -182,18 +219,18 @@ def search_package(package_name: str, query_str: str, kind: str = "") -> str:
 
 @mcp.tool()
 def get_context(package_name: str, task: str) -> str:
-    """Get AI-optimized context for a task or question about an internal package.
+    """Get AI-optimized context for a task or question about a package or bundle.
 
     Returns entry points, related symbols, and code snippets relevant to the task.
 
     Args:
-        package_name: Name of the registered internal package, or "" to query all packages.
+        package_name: Registered package or bundle name, or "" to query all.
         task: What you're trying to understand or do, e.g.
               "how to write a test case", "TestSuite base class and fixtures".
     """
     if not package_name:
-        pkgs = registry.list_all()
-        return run_across_packages(pkgs, lambda p: context(p.abs_path, task))
+        all_sources = list(registry.list_all()) + get_all_bundle_packages()
+        return run_across_packages(all_sources, lambda p: context(p.abs_path, task))
     pkg, err = _require(package_name)
     if err:
         return err
@@ -202,15 +239,18 @@ def get_context(package_name: str, task: str) -> str:
 
 @mcp.tool()
 def get_callers(package_name: str, symbol: str, limit: int = 20) -> str:
-    """Find all callers of a function or method within an internal package.
+    """Find all callers of a function or method within a package or bundle.
 
     Args:
-        package_name: Name of the registered internal package, or "" to search all.
+        package_name: Registered package or bundle name, or "" to search all.
         symbol: Function or method name.
         limit: Maximum number of results (default 20).
     """
     if not package_name:
-        return run_across_packages(registry.list_all(), lambda p: callers(p.abs_path, symbol, limit))
+        return run_across_packages(
+            list(registry.list_all()) + get_all_bundle_packages(),
+            lambda p: callers(p.abs_path, symbol, limit),
+        )
     pkg, err = _require(package_name)
     if err:
         return err
@@ -219,15 +259,18 @@ def get_callers(package_name: str, symbol: str, limit: int = 20) -> str:
 
 @mcp.tool()
 def get_callees(package_name: str, symbol: str, limit: int = 20) -> str:
-    """Find everything a specific function or method calls inside an internal package.
+    """Find everything a specific function or method calls inside a package or bundle.
 
     Args:
-        package_name: Name of the registered internal package, or "" to search all.
+        package_name: Registered package or bundle name, or "" to search all.
         symbol: Function or method name to inspect.
         limit: Maximum number of results (default 20).
     """
     if not package_name:
-        return run_across_packages(registry.list_all(), lambda p: callees(p.abs_path, symbol, limit))
+        return run_across_packages(
+            list(registry.list_all()) + get_all_bundle_packages(),
+            lambda p: callees(p.abs_path, symbol, limit),
+        )
     pkg, err = _require(package_name)
     if err:
         return err
@@ -236,15 +279,18 @@ def get_callees(package_name: str, symbol: str, limit: int = 20) -> str:
 
 @mcp.tool()
 def get_impact(package_name: str, symbol: str, depth: int = 3) -> str:
-    """Analyze what code would be affected by changing a symbol in an internal package.
+    """Analyze what code would be affected by changing a symbol in a package or bundle.
 
     Args:
-        package_name: Name of the registered internal package, or "" to search all.
+        package_name: Registered package or bundle name, or "" to search all.
         symbol: Symbol (function, class, method) to analyze.
         depth: How many levels deep to trace impact (default 3).
     """
     if not package_name:
-        return run_across_packages(registry.list_all(), lambda p: impact(p.abs_path, symbol, depth))
+        return run_across_packages(
+            list(registry.list_all()) + get_all_bundle_packages(),
+            lambda p: impact(p.abs_path, symbol, depth),
+        )
     pkg, err = _require(package_name)
     if err:
         return err
@@ -253,14 +299,17 @@ def get_impact(package_name: str, symbol: str, depth: int = 3) -> str:
 
 @mcp.tool()
 def list_package_files(package_name: str, filter_pattern: str = "") -> str:
-    """List the file structure of an internal package.
+    """List the file structure of a package or bundle.
 
     Args:
-        package_name: Name of the registered internal package, or "" to list all.
+        package_name: Registered package or bundle name, or "" to list all.
         filter_pattern: Optional glob pattern to filter files (e.g. "*.py", "tests/").
     """
     if not package_name:
-        return run_across_packages(registry.list_all(), lambda p: files(p.abs_path, filter_pattern or None))
+        return run_across_packages(
+            list(registry.list_all()) + get_all_bundle_packages(),
+            lambda p: files(p.abs_path, filter_pattern or None),
+        )
     pkg, err = _require(package_name)
     if err:
         return err
@@ -307,30 +356,58 @@ def read_file(package_name: str, file_path: str) -> str:
 
 @mcp.tool()
 def read_symbol(package_name: str, symbol_name: str, kind: str = "", context_lines: int = 0) -> str:
-    """Read the full source of a specific symbol (function, class, method) from an internal package.
+    """Read the full source of a specific symbol from a registered package.
 
     Queries the codegraph index to find the exact file and line range — no need to
     know the file path in advance. Use this after search_package returns a symbol name.
 
+    Note: symbol source reading requires access to the original source files and is
+    only available for registered packages, not for installed bundles. Use
+    search_package for bundles.
+
     Args:
-        package_name: Name of the registered internal package, or "" to search all packages
+        package_name: Name of the registered package, or "" to search all packages
                       (stops at the first package that contains the symbol).
         symbol_name: Exact name of the symbol (function, class, method, etc.).
         kind: Optional — narrow to a specific kind: function, class, method, module, variable.
         context_lines: Extra lines of surrounding context to include above/below (default 0).
     """
+    from .bundle_store import BundlePackage as _BundlePackage
+
     def _fetch(pkg):
+        if isinstance(pkg, _BundlePackage):
+            # No source files in bundles — fall back to CLI symbol search
+            matches = find_symbols(pkg.abs_path, symbol_name, kind or None)
+            if matches:
+                return "\n\n---\n\n".join(
+                    read_symbol_source(pkg.abs_path, m, context_lines) for m in matches
+                )
+            return ""
         matches = find_symbols(pkg.abs_path, symbol_name, kind or None)
         if not matches:
             return ""
         return "\n\n---\n\n".join(read_symbol_source(pkg.abs_path, m, context_lines) for m in matches)
 
     if not package_name:
-        return run_across_packages(registry.list_all(), _fetch, stop_on_first=True)
+        all_sources = list(registry.list_all()) + get_all_bundle_packages()
+        return run_across_packages(all_sources, _fetch, stop_on_first=True)
 
-    pkg = registry.get(package_name)
-    if pkg is None:
+    pkg_or_err = registry.get(package_name)
+    if pkg_or_err is None:
+        # Check bundles
+        for bp in get_all_bundle_packages():
+            if bp.name == package_name:
+                if not bp.is_indexed:
+                    return f"Bundle '{package_name}' is not queryable."
+                result = _fetch(bp)
+                if not result:
+                    return (
+                        f"Symbol '{symbol_name}' not found in bundle '{package_name}'.\n"
+                        f"Try search_package('{package_name}', '{symbol_name}') to find similar names."
+                    )
+                return result
         return f"Package '{package_name}' not found."
+    pkg = pkg_or_err
     if not pkg.is_indexed:
         return f"Package '{package_name}' is not indexed."
     result = _fetch(pkg)
@@ -520,6 +597,69 @@ def list_bundle_callees(
         return callees(bundle_dir, symbol)
     except Exception as exc:
         return f"Error querying bundle: {exc}"
+
+
+
+@mcp.tool()
+def search_bundle_docs(
+    bundle_name: str,
+    query_str: str,
+    bundle_version: str = "",
+    workspace_dir: str = "",
+    limit: int = 10,
+) -> str:
+    """Search the QMD documentation index of an installed bundle.
+
+    Performs BM25 full-text search over documentation files (markdown, rst, txt)
+    that were indexed into the bundle's QMD database during packing.
+
+    Workspace bundles are checked first, then global bundles.
+
+    Args:
+        bundle_name:     Bundle name to search, or "" to search all bundles with QMD.
+        query_str:       Documentation search query (keywords or natural language).
+        bundle_version:  Specific version to target (optional; uses first match if omitted).
+        workspace_dir:   Workspace root for scoped bundle resolution (default: cwd).
+        limit:           Maximum number of results (default 10).
+    """
+    ws_dir = Path(workspace_dir) if workspace_dir else None
+    bundle_pkgs = get_all_bundle_packages(ws_dir)
+
+    if not bundle_name:
+        qmd_bundles = [bp for bp in bundle_pkgs if bp.has_qmd()]
+        if not qmd_bundles:
+            return (
+                "No installed bundles have a QMD documentation index.\n"
+                "Bundles must be packed with the --qmd-dir option to include a QMD index."
+            )
+        sections: list[str] = []
+        for bp in qmd_bundles:
+            result = qmd_mod.qmd_search(bp.abs_path, query_str, limit)
+            if result and not result.startswith("(no results"):
+                sections.append(f"### {bp.name} @ {bp.version}\n\n{result}")
+        if not sections:
+            return f"No QMD documentation results for '{query_str}' across installed bundles."
+        return "\n\n---\n\n".join(sections)
+
+    # Find a specific bundle by name (and optionally version)
+    target = None
+    for bp in bundle_pkgs:
+        if bp.name == bundle_name and (not bundle_version or bp.version == bundle_version):
+            target = bp
+            break
+
+    if target is None:
+        spec = f"{bundle_name}@{bundle_version}" if bundle_version else bundle_name
+        return (
+            f"Bundle '{spec}' not found. "
+            "Use list_bundle_packages to see available bundles."
+        )
+    if not target.has_qmd():
+        return (
+            f"Bundle '{target.name}@{target.version}' does not have a QMD documentation index.\n"
+            "Bundles must be packed with the --qmd-dir option to include a QMD index."
+        )
+    return qmd_mod.qmd_search(target.abs_path, query_str, limit)
 
 
 def main() -> None:
