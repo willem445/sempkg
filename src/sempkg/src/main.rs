@@ -107,7 +107,7 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
         // -----------------------------------------------------------------------
         // Add dependency to manifest
         // -----------------------------------------------------------------------
-        Commands::Add { spec, registry_url, registry } => {
+        Commands::Add { spec, registry_url, registry, group } => {
             let dir = require_workspace(workspace)?;
             let (name, version) = parse_spec(&spec)?;
 
@@ -123,13 +123,8 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
                         url: url.to_string(),
                     });
                 }
-                mf.dependencies.insert(
-                    name.to_string(),
-                    DependencyEntry {
-                        version: version.to_string(),
-                        registry: Some(reg_name),
-                    },
-                );
+                let dep = DependencyEntry { version: version.to_string(), registry: Some(reg_name) };
+                insert_dep(&mut mf, name, dep, group.as_deref());
             } else {
                 if mf.registries.is_empty() {
                     anyhow::bail!(
@@ -137,31 +132,53 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
                          Use --registry-url to add one: sempkg add --registry-url <url> {spec}"
                     );
                 }
-                mf.dependencies.insert(
-                    name.to_string(),
-                    DependencyEntry {
-                        version: version.to_string(),
-                        registry: registry,
-                    },
-                );
+                // Resolve the registry name: use --registry if given, otherwise
+                // default to the first defined registry so the saved TOML is explicit.
+                let resolved_registry = registry
+                    .or_else(|| mf.default_registry().map(|r| r.name.clone()));
+                let dep = DependencyEntry { version: version.to_string(), registry: resolved_registry };
+                insert_dep(&mut mf, name, dep, group.as_deref());
             }
 
             manifest::save_manifest(&mf, dir)?;
-            println!("Added {name}@{version} to sempkg.toml. Run 'sempkg sync' to install.");
+            if let Some(g) = &group {
+                println!("Added {name}@{version} to group '{g}' in sempkg.toml. Run 'sempkg sync --group {g}' to install.");
+            } else {
+                println!("Added {name}@{version} to sempkg.toml. Run 'sempkg sync' to install.");
+            }
             Ok(())
         }
 
         // -----------------------------------------------------------------------
         // Remove dependency from manifest
         // -----------------------------------------------------------------------
-        Commands::Remove { name } => {
+        Commands::Remove { name, group } => {
             let dir = require_workspace(workspace)?;
             let mut mf = manifest::load_manifest(dir)?;
-            if mf.dependencies.remove(&name).is_some() {
-                manifest::save_manifest(&mf, dir)?;
-                println!("Removed '{name}' from sempkg.toml.");
+
+            let removed = if let Some(g) = &group {
+                mf.dependency_groups
+                    .get_mut(g)
+                    .and_then(|grp| grp.remove(&name))
+                    .is_some()
             } else {
-                anyhow::bail!("'{name}' is not in sempkg.toml dependencies.");
+                mf.dependencies.remove(&name).is_some()
+            };
+
+            if removed {
+                manifest::save_manifest(&mf, dir)?;
+                if let Some(g) = &group {
+                    println!("Removed '{name}' from group '{g}' in sempkg.toml.");
+                } else {
+                    println!("Removed '{name}' from sempkg.toml.");
+                }
+            } else {
+                let hint = if group.is_none() {
+                    format!(" Use --group <name> to remove from a specific group.")
+                } else {
+                    String::new()
+                };
+                anyhow::bail!("'{name}' not found in sempkg.toml.{hint}");
             }
             Ok(())
         }
@@ -169,16 +186,24 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
         // -----------------------------------------------------------------------
         // Sync — install all workspace manifest dependencies
         // -----------------------------------------------------------------------
-        Commands::Sync { reinstall } => {
+        Commands::Sync { reinstall, group, all_groups } => {
             let dir = require_workspace(workspace)?;
             let mf = manifest::load_manifest(dir)?;
             let mut lock = manifest::load_lock(dir)?;
             let store = BundleStore::workspace(dir);
             let verify_key_path = mf.verify_key_path(dir);
 
-            if mf.dependencies.is_empty() {
+            let deps = mf.resolve_deps(&group, all_groups);
+
+            if deps.is_empty() {
                 println!("No dependencies in sempkg.toml.");
                 return Ok(());
+            }
+
+            if !group.is_empty() {
+                println!("Installing [dependencies] + groups: {}", group.join(", "));
+            } else if all_groups {
+                println!("Installing [dependencies] + all dependency groups");
             }
 
             let verify_key = verify_key_path
@@ -188,7 +213,7 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
 
             let mut installed = Vec::new();
 
-            for (dep_name, dep) in &mf.dependencies {
+            for (dep_name, dep) in &deps {
                 if !reinstall && store.is_installed(dep_name, &dep.version) {
                     println!("  {dep_name}@{} already installed, skipping.", dep.version);
                     continue;
@@ -532,6 +557,23 @@ fn run_pkg(cmd: PkgCommands) -> Result<()> {
 
 fn require_workspace(workspace: Option<&Path>) -> Result<&Path> {
     workspace.ok_or_else(|| anyhow::anyhow!("Could not determine workspace directory."))
+}
+
+/// Insert a dependency into the manifest, either into [dependencies] or a named group.
+fn insert_dep(
+    mf: &mut manifest::WorkspaceManifest,
+    name: &str,
+    dep: manifest::DependencyEntry,
+    group: Option<&str>,
+) {
+    if let Some(g) = group {
+        mf.dependency_groups
+            .entry(g.to_string())
+            .or_default()
+            .insert(name.to_string(), dep);
+    } else {
+        mf.dependencies.insert(name.to_string(), dep);
+    }
 }
 
 /// Parse `name@version` spec.

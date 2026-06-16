@@ -50,12 +50,20 @@ pub enum Commands {
         /// Registry name to use (must match a [[registry]] entry in sempkg.toml).
         #[arg(long)]
         registry: Option<String>,
+
+        /// Add to a named dependency group instead of [dependencies].
+        #[arg(long, short = 'g')]
+        group: Option<String>,
     },
 
-    /// Remove a bundle dependency from sempkg.toml.
+    /// Remove a bundle dependency from sempkg.toml (from [dependencies] or a group).
     Remove {
         /// Package name to remove.
         name: String,
+
+        /// Remove from this named group instead of [dependencies].
+        #[arg(long, short = 'g')]
+        group: Option<String>,
     },
 
     /// Install all bundles declared in sempkg.toml.
@@ -63,6 +71,14 @@ pub enum Commands {
         /// Re-install even if already present.
         #[arg(long)]
         reinstall: bool,
+
+        /// Also install the named dependency group(s).
+        #[arg(long, short = 'g', value_name = "GROUP")]
+        group: Vec<String>,
+
+        /// Install every dependency group in addition to [dependencies].
+        #[arg(long)]
+        all_groups: bool,
     },
 
     /// Download and install a bundle directly (bypasses manifest).
