@@ -1062,33 +1062,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 
 [[package]]
-name = "sembundle"
-version = "0.1.0"
-dependencies = [
- "arrow-array",
- "arrow-schema",
- "chrono",
- "clap",
- "ed25519-dalek",
- "flate2",
- "glob",
- "hex",
- "lancedb",
- "rand 0.8.6",
- "reqwest",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tar",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "walkdir",
- "which",
- "zeroize",
-]
-
-[[package]]
 name = "chrono"
 version = "0.4.39"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4922,6 +4895,33 @@ checksum = "6ce2691df843ecc5d231c0b14ece2acc3efb62c0a398c7e1d875f3983ce020e3"
 dependencies = [
  "core-foundation-sys",
  "libc",
+]
+
+[[package]]
+name = "sembundle"
+version = "0.1.0"
+dependencies = [
+ "arrow-array",
+ "arrow-schema",
+ "chrono",
+ "clap",
+ "ed25519-dalek",
+ "flate2",
+ "glob",
+ "hex",
+ "lancedb",
+ "rand 0.8.6",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tar",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "walkdir",
+ "which",
+ "zeroize",
 ]
 
 [[package]]
