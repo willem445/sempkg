@@ -1,4 +1,4 @@
-//! Build pipeline: run codegraph and LanceDB against source / docs directories,
+ï»¿//! Build pipeline: run codegraph and LanceDB against source / docs directories,
 //! then pack the results into a `.sembundle` archive.
 //!
 //! This is the implementation behind the `SemBundle build` subcommand.
@@ -165,8 +165,8 @@ fn run_codegraph(source_dirs: &[PathBuf], out_dir: &Path) -> Result<(), PackErro
 /// Build a LanceDB documentation index from `docs_dirs` and write it to `out_dir`.
 ///
 /// The output directory will contain:
-///   out_dir/metadata.json    — index metadata
-///   out_dir/docs.lance/      — LanceDB table with tantivy FTS index
+///   out_dir/metadata.json    â€” index metadata
+///   out_dir/docs.lance/      â€” LanceDB table with tantivy FTS index
 fn run_lance(
     docs_dirs: &[PathBuf],
     out_dir: &Path,
@@ -234,7 +234,7 @@ async fn run_lance_inner(
     if chunk_count == 0 {
         return Err(PackError::InvalidField {
             field: "docs_dirs".to_string(),
-            reason: "no documents matched the glob pattern — check --docs-dir and --docs-glob"
+            reason: "no documents matched the glob pattern â€” check --docs-dir and --docs-glob"
                 .to_string(),
         });
     }
@@ -287,7 +287,7 @@ async fn run_lance_inner(
 
     if !fts_ok {
         eprintln!(
-            "[sembundle] Warning: FTS index creation failed — search will use full scan."
+            "[sembundle] Warning: FTS index creation failed â€” search will use full scan."
         );
     }
 
