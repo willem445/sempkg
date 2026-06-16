@@ -1,0 +1,10 @@
+{
+  "servers": {
+    "sempkg": {
+      "type": "stdio",
+      "command": "sempkg",
+      "args": ["mcp", "-C", "${workspaceFolder}"],
+      "description": "sempkg MCP server — CodeGraph + QMD semantic search for registered packages and cgbundle archives"
+    }
+  }
+}
