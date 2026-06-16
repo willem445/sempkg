@@ -48,6 +48,12 @@ Or with [uv](https://docs.astral.sh/uv/):
 uv pip install -e .
 ```
 
+To run the bundle registry server locally:
+
+```powershell
+uv pip install -e .[registry]
+```
+
 ---
 
 ## Configure GitHub Copilot (VS Code)
@@ -168,6 +174,9 @@ codegraph sync C:\projects\pandas
 
 All functionality is available via command-line. Get help with `codegraph-hub --help` or `codegraph-hub <command> --help`.
 
+Bundle registry and distribution docs:
+- [docs/registry-server.md](docs/registry-server.md)
+
 ### Package Management
 
 | Command | Description | Example |
@@ -219,3 +228,34 @@ All functionality is available via command-line. Get help with `codegraph-hub --
 | Command | Description | Example |
 |---------|-------------|---------|
 | `serve` | Start the MCP server (used by VS Code / Copilot) | `codegraph-hub serve` |
+
+### Bundle Registry Commands
+
+| Command | Description | Example |
+|---------|-------------|---------|
+| `bundle add <pkg>@<ver> --registry <name>` | Add dependency to manifest, install, update lock | `codegraph-hub bundle add my-lib@1.2.0 --registry default` |
+| `bundle add <pkg>@<ver> --registry-url <url>` | Same but with inline URL | `codegraph-hub bundle add my-lib@1.2.0 --registry-url http://127.0.0.1:8765` |
+| `bundle sync` | Install all deps from `codegraph-hub.toml` (reproducible) | `codegraph-hub bundle sync` |
+| `bundle sync --verify-key <path>` | Sync with Ed25519 signature verification | `codegraph-hub bundle sync --verify-key keys/publisher.pem` |
+| `bundle sync --reinstall` | Force reinstall even if already present | `codegraph-hub bundle sync --reinstall` |
+| `bundle lock` | Refresh `codegraph-hub.lock` hashes without installing | `codegraph-hub bundle lock` |
+| `bundle search-registry <url>` | Show packages and versions available on a registry server | `codegraph-hub bundle search-registry http://127.0.0.1:8765` |
+| `bundle install <pkg>@<ver> --registry <url>` | Ad-hoc install without manifest | `codegraph-hub bundle install my-lib@1.2.0 --registry http://127.0.0.1:8765` |
+| `bundle install <pkg>@<ver> --registry <url> --global` | Install into global scope | `codegraph-hub bundle install my-lib@1.2.0 --registry http://127.0.0.1:8765 --global` |
+| `bundle list` | List workspace and global installed bundles | `codegraph-hub bundle list` |
+| `bundle list --workspace` | List workspace-only bundles | `codegraph-hub bundle list --workspace` |
+| `bundle list --global` | List global-only bundles | `codegraph-hub bundle list --global` |
+| `bundle remove <pkg>@<ver>` | Remove bundle from workspace scope | `codegraph-hub bundle remove my-lib@1.2.0` |
+| `bundle remove <pkg>@<ver> --global` | Remove bundle from global scope | `codegraph-hub bundle remove my-lib@1.2.0 --global` |
+
+### cgbundle Registry Publishing
+
+| Command | Description | Example |
+|---------|-------------|---------|
+| `publish <bundle_path> --registry <url> --token <token>` | Publish a bundle archive to a registry | `cgbundle publish .\my-lib-1.2.0.cgbundle --registry http://127.0.0.1:8765 --token <TOKEN>` |
+
+`cgbundle publish` also supports environment variables:
+- `CGBUNDLE_REGISTRY_URL`
+- `CGBUNDLE_TOKEN`
+
+See [docs/registry-server.md](docs/registry-server.md) for self-hosting, token management, and full publish/pull workflows.

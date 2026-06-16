@@ -251,22 +251,47 @@ Requirements:
 ---
 
 # **TASK 13 — Implement a Static Registry Server**
-**Prompt:**
 
-```
-Implement a static registry server.
+## ✅ Implemented
 
-For initial testing, I want to just host this either on my local PC or on a local network server. I mainly want to support local network index server as this will likely be deployed in enterprises where a registry of internal codebases needs to be maintained.
+### Registry server — `cgbundle-registry` (`src/cgbundle_registry/`)
+- FastAPI application (`app.py`) with endpoints:
+  - `GET  /bundles` — list all published bundles
+  - `GET  /bundles/{name}` — list versions for a package
+  - `GET  /bundles/{name}/{version}/{filename}` — download a bundle file
+  - `POST /bundles/{name}/{version}` — upload/publish a bundle (token-authenticated)
+  - `DELETE /bundles/{name}/{version}` — remove a bundle (token-authenticated)
+- Token-based authentication via `Authorization: Bearer <token>` (`auth.py`)
+- File-backed storage with manifest index (`storage.py`)
+- `Dockerfile` for self-hosted deployment
 
-Requirements:
-- Serve index.json and bundles over HTTPS.
-- Support:
-  - GitHub Pages
-  - S3
-  - GCS
-- Provide instructions for deploying registry.
-- Provide a simple Docker image for self-hosting.
-```
+### `cgbundle publish` — Rust CLI command (`src/cgbundle/`)
+- `cgbundle publish <bundle.cgbundle> --registry <url> --token <token>`
+- Streams the bundle to the registry's upload endpoint
+- Validates server response and reports success/failure
+
+### Bundle store — `codegraph-hub` (`src/codegraph_hub/bundle_store.py`)
+- `BundleStore` class managing workspace-scoped and global bundle installations
+- Workspace store: `.codegraph_hub/bundles/` relative to the active workspace
+- Global store: `~/.codegraph_hub/bundles/` shared across all workspaces
+- `install(bundle_path)` — validate checksums, extract, write manifest
+- `install_from_registry(package, version, registry_url)` — download then install
+- `list_installed()` — enumerate all installed bundles
+- `resolve(name, version)` — return extracted bundle dir path or `None`
+- `remove(name, version)` — uninstall a bundle
+
+### CLI commands (`src/codegraph_hub/cli.py`)
+- `bundle install <name>@<version> [--registry <url>]`
+- `bundle list [--workspace <dir>]`
+- `bundle remove <name>@<version> [--workspace <dir>]`
+- `bundle search-registry <query> [--registry <url>]`
+
+### MCP tools (`src/codegraph_hub/server.py`)
+- `list_bundle_packages(workspace_dir)` — list workspace and global installed bundles
+- `get_bundle_info(name, version, workspace_dir)` — manifest details for a bundle
+- `search_bundle_symbol(bundle_name, bundle_version, query, workspace_dir)` — query symbols in a bundle's pre-built CodeGraph index
+- `list_bundle_callers(bundle_name, bundle_version, symbol, workspace_dir)` — callers graph from bundle
+- `list_bundle_callees(bundle_name, bundle_version, symbol, workspace_dir)` — callees graph from bundle
 
 ---
 

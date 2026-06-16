@@ -1,16 +1,23 @@
 mod build;
 mod checksum;
 mod error;
+mod keygen;
 mod manifest;
 mod pack;
+mod publish;
+mod sign;
 mod validate;
+mod verify;
 
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
 use build::BuildOptions;
+use keygen::KeygenOptions;
 use pack::PackOptions;
+use sign::SignOptions;
+use verify::VerifyOptions;
 
 #[derive(Parser)]
 #[command(
@@ -81,6 +88,22 @@ enum Commands {
         qmd_dir: Option<PathBuf>,
     },
 
+    /// Publish a .cgbundle to a registry server
+    Publish {
+        /// Path to the .cgbundle file to publish
+        bundle_path: PathBuf,
+
+        /// Registry server base URL (e.g. http://192.168.1.10:8765).
+        /// Can also be set via CGBUNDLE_REGISTRY_URL env var.
+        #[arg(long, env = "CGBUNDLE_REGISTRY_URL")]
+        registry: Option<String>,
+
+        /// Publish token for authentication.
+        /// Can also be set via CGBUNDLE_TOKEN env var.
+        #[arg(long, env = "CGBUNDLE_TOKEN")]
+        token: Option<String>,
+    },
+
     /// Index source and docs directories, then pack everything into a .cgbundle
     Build {
         // --- Bundle identity ---
@@ -140,12 +163,73 @@ enum Commands {
         #[arg(long, default_value = "auto")]
         qmd_chunk_strategy: String,
     },
+
+    /// Generate an Ed25519 keypair for bundle signing
+    KeyGen {
+        /// Output directory for private.pem and public.pem (default: current directory)
+        #[arg(long, short = 'o', default_value = ".")]
+        output_dir: PathBuf,
+    },
+
+    /// Sign a .cgbundle file with an Ed25519 private key
+    Sign {
+        /// Path to the .cgbundle file to sign
+        bundle_path: PathBuf,
+        /// Path to the Ed25519 private key PEM file
+        #[arg(long, short = 'k')]
+        key: PathBuf,
+        /// Output .sig file path (default: <bundle_path>.sig)
+        #[arg(long, short = 'o')]
+        output: Option<PathBuf>,
+    },
+
+    /// Verify a .cgbundle signature
+    Verify {
+        /// Path to the .cgbundle file
+        bundle_path: PathBuf,
+        /// Path to the .sig file
+        #[arg(long, short = 's')]
+        sig: PathBuf,
+        /// Path to the Ed25519 public key PEM file
+        #[arg(long, short = 'k')]
+        key: PathBuf,
+    },
 }
 
 fn main() {
     let cli = Cli::parse();
 
     let result = match cli.command {
+        Commands::Publish {
+            bundle_path,
+            registry,
+            token,
+        } => {
+            let registry_url = match registry {
+                Some(u) => u,
+                None => {
+                    eprintln!("error: {}", publish::PublishError::MissingRegistry);
+                    std::process::exit(1);
+                }
+            };
+            let token = match token {
+                Some(t) => t,
+                None => {
+                    eprintln!("error: {}", publish::PublishError::MissingToken);
+                    std::process::exit(1);
+                }
+            };
+            publish::publish(publish::PublishOptions {
+                bundle_path,
+                registry_url: registry_url.clone(),
+                token,
+            })
+            .map(|(name, version)| {
+                println!("Published {name}@{version} to {registry_url}");
+            })
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
+        }
+
         Commands::Build {
             name,
             version,
@@ -177,7 +261,8 @@ fn main() {
         })
         .map(|path| {
             println!("Bundle created: {}", path.display());
-        }),
+        })
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error>),
 
         Commands::Pack {
             input_dir,
@@ -185,6 +270,7 @@ fn main() {
             version,
             source_repo,
             commit_hash,
+
             codegraph_version,
             tag,
             language,
@@ -206,7 +292,45 @@ fn main() {
         })
         .map(|path| {
             println!("Bundle created: {}", path.display());
-        }),
+        })
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error>),
+
+        Commands::KeyGen { output_dir } => {
+            keygen::keygen(KeygenOptions { output_dir })
+                .map(|(private_path, public_path)| {
+                    println!("Private key: {}", private_path.display());
+                    println!("Public key: {}", public_path.display());
+                })
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
+        }
+
+        Commands::Sign {
+            bundle_path,
+            key,
+            output,
+        } => sign::sign(SignOptions {
+            bundle_path,
+            private_key_path: key,
+            output,
+        })
+        .map(|path| {
+            println!("Signature written: {}", path.display());
+        })
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error>),
+
+        Commands::Verify {
+            bundle_path,
+            sig,
+            key,
+        } => verify::verify(VerifyOptions {
+            bundle_path,
+            sig_path: sig,
+            public_key_path: key,
+        })
+        .map(|()| {
+            println!("Signature valid.");
+        })
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error>),
     };
 
     if let Err(e) = result {

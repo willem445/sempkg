@@ -5,6 +5,7 @@ from pathlib import Path
 
 from fastmcp import FastMCP
 
+from .bundle_store import get_global_store, get_workspace_store
 from .codegraph import (
     callers,
     callees,
@@ -374,6 +375,151 @@ def read_file_range(package_name: str, file_path: str, start_line: int, end_line
     snippet = "\n".join(lines[s:e])
     lang = full_path.suffix.lstrip(".") or "text"
     return f"# {package_name}/{file_path}  (lines {start_line}–{end_line} of {total})\n\n```{lang}\n{snippet}\n```"
+
+
+# ---------------------------------------------------------------------------
+# Bundle tools (pre-built .cgbundle indexes)
+# ---------------------------------------------------------------------------
+
+def _resolve_bundle(name: str, version: str, workspace_dir: str) -> Path | None:
+    """Try workspace store first, then global. Return extracted bundle dir or None."""
+    ws_store = get_workspace_store(Path(workspace_dir) if workspace_dir else None)
+    bundle_dir = ws_store.resolve(name, version)
+    if bundle_dir is not None:
+        return bundle_dir
+    return get_global_store().resolve(name, version)
+
+
+@mcp.tool()
+def list_bundle_packages(workspace_dir: str = "") -> str:
+    """List all installed .cgbundle packages available in the workspace and globally.
+
+    Workspace bundles are scoped to the current project (.codegraph_hub/ in workspace_dir).
+    Global bundles (~/.codegraph_hub/bundles/) are available across all workspaces.
+    """
+    try:
+        ws_store = get_workspace_store(Path(workspace_dir) if workspace_dir else None)
+        ws_bundles = ws_store.list_installed()
+        global_bundles = get_global_store().list_installed()
+    except Exception as exc:
+        return f"Error listing bundles: {exc}"
+
+    if not ws_bundles and not global_bundles:
+        return (
+            "No installed bundles found.\n"
+            "Use 'cgbundle-hub bundle install <name>@<version>' to install a bundle."
+        )
+
+    lines: list[str] = []
+    if ws_bundles:
+        lines.append("Workspace bundles:\n")
+        for b in ws_bundles:
+            lines.append(f"  • **{b.name}** @ {b.version}  [workspace]")
+            lines.append(f"    path: {b.store_dir}")
+    if global_bundles:
+        lines.append("\nGlobal bundles:\n")
+        for b in global_bundles:
+            lines.append(f"  • **{b.name}** @ {b.version}  [global]")
+            lines.append(f"    path: {b.store_dir}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def get_bundle_info(name: str, version: str, workspace_dir: str = "") -> str:
+    """Get detailed information about an installed bundle including its manifest.
+
+    Checks workspace bundles first, then global bundles.
+    """
+    try:
+        ws_store = get_workspace_store(Path(workspace_dir) if workspace_dir else None)
+        found: object = None
+        scope = ""
+        for b in ws_store.list_installed():
+            if b.name == name and b.version == version:
+                found = b
+                scope = "workspace"
+                break
+        if found is None:
+            for b in get_global_store().list_installed():
+                if b.name == name and b.version == version:
+                    found = b
+                    scope = "global"
+                    break
+    except Exception as exc:
+        return f"Error looking up bundle: {exc}"
+
+    if found is None:
+        return f"Bundle '{name}@{version}' not found. Use list_bundle_packages to see available bundles."
+
+    m = found.manifest
+    lines = [
+        f"**{found.name}** @ {found.version}  [{scope}]",
+        f"  path:              {found.store_dir}",
+        f"  source_repo:       {m.get('source_repo', 'n/a')}",
+        f"  commit_hash:       {m.get('commit_hash', 'n/a')}",
+        f"  created_at:        {m.get('created_at', 'n/a')}",
+        f"  codegraph_version: {m.get('codegraph_version', 'n/a')}",
+        f"  extensions:        {', '.join(m.get('extensions', [])) or 'none'}",
+    ]
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def search_bundle_symbol(
+    bundle_name: str, bundle_version: str, query_str: str, workspace_dir: str = ""
+) -> str:
+    """Search for a symbol in an installed bundle's CodeGraph index.
+
+    Bundles contain pre-built CodeGraph indexes. Workspace bundles are only
+    accessible when querying from within that workspace. Global bundles are
+    accessible from any workspace.
+
+    Use list_bundle_packages to see available bundles.
+    """
+    bundle_dir = _resolve_bundle(bundle_name, bundle_version, workspace_dir)
+    if bundle_dir is None:
+        return (
+            f"Bundle '{bundle_name}@{bundle_version}' not found. "
+            "Use list_bundle_packages to see available bundles."
+        )
+    try:
+        return query(bundle_dir, query_str, kind=None, limit=10)
+    except Exception as exc:
+        return f"Error querying bundle: {exc}"
+
+
+@mcp.tool()
+def list_bundle_callers(
+    bundle_name: str, bundle_version: str, symbol: str, workspace_dir: str = ""
+) -> str:
+    """List callers of a symbol in an installed bundle's CodeGraph index."""
+    bundle_dir = _resolve_bundle(bundle_name, bundle_version, workspace_dir)
+    if bundle_dir is None:
+        return (
+            f"Bundle '{bundle_name}@{bundle_version}' not found. "
+            "Use list_bundle_packages to see available bundles."
+        )
+    try:
+        return callers(bundle_dir, symbol)
+    except Exception as exc:
+        return f"Error querying bundle: {exc}"
+
+
+@mcp.tool()
+def list_bundle_callees(
+    bundle_name: str, bundle_version: str, symbol: str, workspace_dir: str = ""
+) -> str:
+    """List callees (functions called by) a symbol in an installed bundle's CodeGraph index."""
+    bundle_dir = _resolve_bundle(bundle_name, bundle_version, workspace_dir)
+    if bundle_dir is None:
+        return (
+            f"Bundle '{bundle_name}@{bundle_version}' not found. "
+            "Use list_bundle_packages to see available bundles."
+        )
+    try:
+        return callees(bundle_dir, symbol)
+    except Exception as exc:
+        return f"Error querying bundle: {exc}"
 
 
 def main() -> None:

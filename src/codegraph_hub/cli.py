@@ -1,9 +1,18 @@
 """Command-line interface for managing the codegraph-hub package registry."""
 
 import argparse
+import json
 import sys
+import urllib.request
+from pathlib import Path
 
 from . import codegraph as cg
+from .bundle_store import (
+    BundleInstallError,
+    VersionExistsError,
+    get_global_store,
+    get_workspace_store,
+)
 from .registry import Registry
 
 
@@ -224,6 +233,247 @@ def cmd_files(registry: Registry, args: argparse.Namespace) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# Bundle commands
+# ---------------------------------------------------------------------------
+
+def _parse_pkg_version(spec: str) -> tuple[str, str]:
+    """Parse 'name@version' format. Raises SystemExit on bad format."""
+    if "@" not in spec:
+        print(
+            f"Error: expected '<pkg>@<version>', got '{spec}'",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    name, _, version = spec.partition("@")
+    if not name or not version:
+        print(
+            f"Error: expected '<pkg>@<version>', got '{spec}'",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    return name, version
+
+
+def cmd_bundle_install(args: argparse.Namespace) -> int:
+    pkg, version = _parse_pkg_version(args.pkg_version)
+    store = get_global_store() if args.glob else get_workspace_store()
+    verify_key_path = Path(args.verify_key) if args.verify_key else None
+    try:
+        info = store.install_from_registry(pkg, version, args.registry, verify_key_path=verify_key_path)
+    except VersionExistsError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    except BundleInstallError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    print(f"Installed {info.name}@{info.version} to {info.store_dir}")
+    return 0
+
+
+def cmd_bundle_list(args: argparse.Namespace) -> int:
+    show_global = args.glob
+    show_workspace = args.workspace
+    if not show_global and not show_workspace:
+        show_global = True
+        show_workspace = True
+
+    entries: list[tuple[str, str, str]] = []
+    if show_workspace:
+        ws_store = get_workspace_store()
+        for info in ws_store.list_installed():
+            entries.append((f"{info.name}@{info.version}", "workspace", str(info.store_dir)))
+    if show_global:
+        g_store = get_global_store()
+        for info in g_store.list_installed():
+            entries.append((f"{info.name}@{info.version}", "global", str(info.store_dir)))
+
+    if not entries:
+        print("No bundles installed.")
+        return 0
+    for spec, scope, path in entries:
+        print(f"  {spec:<30}  [{scope}]  {path}")
+    return 0
+
+
+def cmd_bundle_remove(args: argparse.Namespace) -> int:
+    pkg, version = _parse_pkg_version(args.pkg_version)
+    store = get_global_store() if args.glob else get_workspace_store()
+    if store.remove(pkg, version):
+        print(f"Removed {pkg}@{version}")
+        return 0
+    print(f"Not found: {pkg}@{version}", file=sys.stderr)
+    return 1
+
+
+def cmd_bundle_add(args: argparse.Namespace) -> int:
+    from .workspace_manifest import (
+        BundleDep,
+        LockFile,
+        RegistryConfig,
+        WorkspaceManifest,
+        MANIFEST_FILENAME,
+        LOCK_FILENAME,
+        load_manifest,
+        save_manifest,
+        load_lock,
+        save_lock,
+        resolve_lock,
+    )
+
+    pkg, version = _parse_pkg_version(args.pkg_version)
+    cwd = Path.cwd()
+
+    # Load or create manifest
+    try:
+        manifest = load_manifest(cwd)
+    except FileNotFoundError:
+        manifest = WorkspaceManifest(registries=[], dependencies={}, verify_key=None)
+
+    registry_name: str | None = args.registry
+    registry_url: str | None = args.registry_url
+
+    if registry_url:
+        registry_url = registry_url.rstrip("/")
+        existing = next((r for r in manifest.registries if r.url == registry_url), None)
+        if existing:
+            registry_name = existing.name
+        else:
+            if not registry_name:
+                if not manifest.registries:
+                    registry_name = "default"
+                else:
+                    registry_name = f"registry-{len(manifest.registries)}"
+            manifest.registries.append(RegistryConfig(name=registry_name, url=registry_url))
+    elif registry_name:
+        if manifest.get_registry(registry_name) is None:
+            print(
+                f"Error: registry '{registry_name}' not found in {MANIFEST_FILENAME}. "
+                "Use --registry-url to add it.",
+                file=sys.stderr,
+            )
+            return 1
+    else:
+        default_reg = manifest.default_registry()
+        if default_reg is None:
+            print(
+                "Error: no registry specified and no registries defined. "
+                "Use --registry-url <url> to specify a registry.",
+                file=sys.stderr,
+            )
+            return 1
+        registry_name = default_reg.name
+
+    manifest.dependencies[pkg] = BundleDep(name=pkg, version=version, registry=registry_name)
+    save_manifest(manifest, cwd)
+
+    # Update lock
+    lock = load_lock(cwd)
+    try:
+        fresh_lock = resolve_lock(manifest, cwd)
+    except Exception as exc:  # noqa: BLE001
+        print(f"Error: could not resolve lock from registry: {exc}", file=sys.stderr)
+        return 1
+    for name, entry in fresh_lock.packages.items():
+        lock.packages[name] = entry
+    save_lock(lock, cwd)
+
+    # Install
+    lock_entry = lock.packages.get(pkg)
+    if lock_entry is None:
+        print(f"Error: could not resolve lock entry for {pkg}@{version}", file=sys.stderr)
+        return 1
+
+    store = get_workspace_store(cwd)
+    try:
+        info = store.install_from_registry(pkg, version, lock_entry.registry_url)
+    except VersionExistsError:
+        print(
+            f"Added {pkg}@{version} (registry: {registry_name}) "
+            f"\u2014 already installed at {store.get_bundle_dir(pkg, version)}"
+        )
+        return 0
+    except BundleInstallError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"Added {pkg}@{version} (registry: {registry_name}) \u2014 installed to {info.store_dir}")
+    return 0
+
+
+def cmd_bundle_sync(args: argparse.Namespace) -> int:
+    from .workspace_manifest import sync_workspace
+
+    cwd = Path.cwd()
+    verify_key_path = Path(args.verify_key) if args.verify_key else None
+    try:
+        installed = sync_workspace(cwd, verify_key_path=verify_key_path, reinstall=args.reinstall)
+    except FileNotFoundError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    except Exception as exc:  # noqa: BLE001
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    if not installed:
+        print("All bundles already installed.")
+    else:
+        for spec in installed:
+            print(f"  Installed {spec}")
+    print(f"Synced {len(installed)} bundle(s).")
+    return 0
+
+
+def cmd_bundle_lock(args: argparse.Namespace) -> int:
+    from .workspace_manifest import (
+        MANIFEST_FILENAME,
+        LOCK_FILENAME,
+        load_manifest,
+        resolve_lock,
+        save_lock,
+    )
+
+    cwd = Path.cwd()
+    try:
+        manifest = load_manifest(cwd)
+    except FileNotFoundError:
+        print(
+            f"Error: {MANIFEST_FILENAME} not found. "
+            "Run 'codegraph-hub bundle add' to create one.",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        lock = resolve_lock(manifest, cwd)
+    except Exception as exc:  # noqa: BLE001
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    save_lock(lock, cwd)
+    print(f"Lock file updated: {LOCK_FILENAME} ({len(lock.packages)} package(s))")
+    return 0
+
+
+def cmd_bundle_search_registry(args: argparse.Namespace) -> int:
+    url = args.url.rstrip("/") + "/index.json"
+    try:
+        with urllib.request.urlopen(url) as resp:  # noqa: S310
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        print(f"Error fetching {url}: {exc}", file=sys.stderr)
+        return 1
+    packages: dict = data.get("packages", {})
+    if not packages:
+        print("Registry is empty.")
+        return 0
+    for name, info in sorted(packages.items()):
+        versions = ", ".join(info.get("versions", []))
+        latest = info.get("latest", "")
+        print(f"  {name:<30}  versions: {versions}  (latest: {latest})")
+    return 0
+
+
 def cmd_read(registry: Registry, args: argparse.Namespace) -> int:
     pkg, rc = _require_indexed(registry, args.package)
     if rc:
@@ -322,6 +572,40 @@ def main_cli() -> None:
     p_read.add_argument("start", nargs="?", type=int, default=None, help="Start line (1-indexed)")
     p_read.add_argument("end", nargs="?", type=int, default=None, help="End line (inclusive)")
 
+    # ---- bundle ------------------------------------------------------------
+
+    p_bundle = sub.add_parser("bundle", help="Manage .cgbundle archives")
+    bundle_sub = p_bundle.add_subparsers(dest="bundle_command", metavar="<bundle-command>")
+    bundle_sub.required = True
+
+    pb_install = bundle_sub.add_parser("install", help="Install a bundle from a registry")
+    pb_install.add_argument("pkg_version", metavar="<pkg>@<version>", help="Package and version, e.g. mylib@1.0.0")
+    pb_install.add_argument("--registry", required=True, metavar="URL", help="Registry base URL")
+    pb_install.add_argument("--global", dest="glob", action="store_true", help="Install to global store")
+    pb_install.add_argument("--verify-key", metavar="PATH", default=None, help="Path to Ed25519 public key PEM file for signature verification")
+
+    pb_list = bundle_sub.add_parser("list", help="List installed bundles")
+    pb_list.add_argument("--global", dest="glob", action="store_true", help="Show only global store")
+    pb_list.add_argument("--workspace", action="store_true", help="Show only workspace store")
+
+    pb_remove = bundle_sub.add_parser("remove", help="Remove an installed bundle")
+    pb_remove.add_argument("pkg_version", metavar="<pkg>@<version>", help="Package and version, e.g. mylib@1.0.0")
+    pb_remove.add_argument("--global", dest="glob", action="store_true", help="Remove from global store")
+
+    pb_search = bundle_sub.add_parser("search-registry", help="List packages available on a registry")
+    pb_search.add_argument("url", metavar="URL", help="Registry base URL")
+
+    pb_add = bundle_sub.add_parser("add", help="Add a bundle dependency and install it")
+    pb_add.add_argument("pkg_version", metavar="<pkg>@<version>")
+    pb_add.add_argument("--registry", metavar="NAME", default=None, help="Registry name from codegraph-hub.toml")
+    pb_add.add_argument("--registry-url", metavar="URL", default=None, help="Registry base URL (adds to manifest if new)")
+
+    pb_sync = bundle_sub.add_parser("sync", help="Install all bundles from codegraph-hub.toml")
+    pb_sync.add_argument("--verify-key", metavar="PATH", default=None)
+    pb_sync.add_argument("--reinstall", action="store_true", help="Reinstall even if already installed")
+
+    bundle_sub.add_parser("lock", help="Refresh codegraph-hub.lock from registries without installing")
+
     # ---- serve -------------------------------------------------------------
 
     sub.add_parser("serve", help="Start the MCP server (used by VS Code / Copilot)")
@@ -334,6 +618,18 @@ def main_cli() -> None:
         from .server import main as serve_main
         serve_main()
         return
+
+    if args.command == "bundle":
+        bundle_dispatch = {
+            "install":         cmd_bundle_install,
+            "list":            cmd_bundle_list,
+            "remove":          cmd_bundle_remove,
+            "search-registry": cmd_bundle_search_registry,
+            "add":             cmd_bundle_add,
+            "sync":            cmd_bundle_sync,
+            "lock":            cmd_bundle_lock,
+        }
+        sys.exit(bundle_dispatch[args.bundle_command](args))
 
     # Merge multi-word task into a single string
     if args.command == "context":
