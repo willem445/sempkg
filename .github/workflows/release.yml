@@ -24,11 +24,6 @@ jobs:
             ext: .exe
           - binary: sembundle
             manifest: src/sembundle/Cargo.toml
-            os: macos-13               # last Intel runner
-            target: x86_64-apple-darwin
-            ext: ""
-          - binary: sembundle
-            manifest: src/sembundle/Cargo.toml
             os: macos-latest           # ARM runner (macos-14+)
             target: aarch64-apple-darwin
             ext: ""
@@ -44,11 +39,6 @@ jobs:
             os: windows-latest
             target: x86_64-pc-windows-msvc
             ext: .exe
-          - binary: sempkg
-            manifest: src/sempkg/Cargo.toml
-            os: macos-13
-            target: x86_64-apple-darwin
-            ext: ""
           - binary: sempkg
             manifest: src/sempkg/Cargo.toml
             os: macos-latest
