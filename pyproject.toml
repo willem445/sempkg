@@ -4,7 +4,8 @@ build-backend = "uv_build"
 
 [project]
 name = "sempkg-registry"
-version = "0.1.0"
+version = "0.2.0"
+
 description = "Self-hosted sembundle registry server for semantic index packages"
 license = "MIT"
 license-files = ["LICENSE"]
