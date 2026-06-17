@@ -1,8 +1,20 @@
 # sempkg
 
-A semantic package manager and MCP server for [CodeGraph](https://github.com/colbymchenry/codegraph) semantic index archives (`.sembundle` files).
+**The missing piece between your AI agent and the code it needs to understand.**
 
-`sempkg` installs and queries prebuilt semantic index bundles and exposes them to GitHub Copilot via an MCP server — no Python runtime, no manual context management.
+`sempkg` combines the power of [CodeGraph](https://github.com/colbymchenry/codegraph) symbol graphs and [QMD](https://github.com/colbymchenry/codegraph) documentation indexes into a single Rust binary that doubles as an MCP server — giving GitHub Copilot and other agents instant, structured access to any codebase's semantic intelligence.
+
+### The version-drift problem — solved
+
+AI agents routinely hallucinate APIs, reference removed methods, or cite docs for the wrong library version. `sempkg` fixes this at the source: dependencies are declared in a `sempkg.toml` manifest pinned to the **exact version you ship**, and the corresponding `.sembundle` index is fetched from a registry and served directly to your agent. Your agent reads the right symbols, the right signatures, and the right docs — for your versions, not someone else's.
+
+### What you get
+
+- **Symbol search & call graphs** — query function definitions, callers, and callees across indexed codebases without reading source files
+- **Semantic doc search** — vector-search over embedded documentation, scoped to the pinned version
+- **Version-pinned bundles** — install prebuilt indexes for your exact dependency versions; no drift, no guessing
+- **Zero runtime overhead** — single self-contained binary, no Python, no Node, no manual context management
+- **Self-hostable registry** — publish and serve your own `.sembundle` archives via `sempkg-registry`
 
 ---
 
