@@ -82,6 +82,8 @@ pub struct WorkspaceManifest {
     pub dependency_groups: BTreeMap<String, BTreeMap<String, DependencyEntry>>,
     #[serde(default)]
     pub packages: BTreeMap<String, PackageEntry>,
+    /// Optional local LLM reranker configuration.
+    pub reranker: Option<crate::reranker::RerankerConfig>,
 }
 
 impl WorkspaceManifest {

@@ -210,6 +210,49 @@ pub enum Commands {
         limit: usize,
     },
 
+    // -----------------------------------------------------------------------
+    // Hybrid search  (BM25 + reranking)
+    // -----------------------------------------------------------------------
+
+    /// Hybrid search: CodeGraph symbols + LanceDB docs + Qwen3-Reranker.
+    ///
+    /// Fetches candidates from both backends, merges the pool, and scores every
+    /// candidate against the query using the local Qwen3-Reranker cross-encoder.
+    /// This is the high-quality search path; use `search` or `docs` for the
+    /// fast BM25-only path.
+    ///
+    /// Search modes (matching QMD levels):
+    ///   search / docs  →  BM25 full-text search only
+    ///   query          →  BM25 (both backends) + Re-ranking
+    ///
+    /// Requires the binary to be built with `--features reranker` and the model
+    /// to be downloaded via `sempkg reranker pull`.
+    Query {
+        /// Package or bundle name.
+        package: String,
+        /// Search query.
+        query: String,
+        /// Restrict query mode to documentation candidates only.
+        #[arg(long, conflicts_with = "code")]
+        docs: bool,
+        /// Restrict query mode to code/symbol candidates only.
+        #[arg(long, conflicts_with = "docs")]
+        code: bool,
+        /// Filter CodeGraph symbol results by kind (function, class, variable, ...).
+        #[arg(long, short = 'k')]
+        kind: Option<String>,
+        /// Number of reranked results to return.
+        #[arg(long, short = 'n', default_value = "5")]
+        limit: usize,
+        /// Override the total hybrid candidate pool size fed into the reranker.
+        ///
+        /// This is a global budget across combined code + docs candidates
+        /// (not per backend). Defaults to `top_k` in [reranker] in
+        /// sempkg.toml (20 if unset).
+        #[arg(long)]
+        top_k: Option<usize>,
+    },
+
     /// Show LanceDB index metadata for a bundle.
     DocsMeta {
         /// Bundle name.
@@ -222,6 +265,14 @@ pub enum Commands {
 
     /// Start the MCP server (JSON-RPC 2.0 over stdio).
     Mcp,
+
+    // -----------------------------------------------------------------------
+    // Local LLM reranker management
+    // -----------------------------------------------------------------------
+
+    /// Manage the optional Qwen3-Reranker-1.7B GGUF model.
+    #[command(subcommand)]
+    Reranker(RerankerCommands),
 }
 
 #[derive(Subcommand)]
@@ -265,5 +316,37 @@ pub enum PkgCommands {
         /// Glob pattern of files to index (default: **/*.{md,rst,txt}).
         #[arg(long, default_value = "**/*.{md,rst,txt}")]
         pattern: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum RerankerCommands {
+    /// Download the Qwen3-Reranker-0.6B GGUF model to ~/.sempkg/models/
+    /// (or the path configured in [reranker] in sempkg.toml).
+    ///
+    /// The default source (ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF on HuggingFace)
+    /// is public and does not require authentication.
+    /// The tokenizer is embedded inside the GGUF — no separate download needed.
+    Pull {
+        /// Override the GGUF download URL.
+        #[arg(long)]
+        gguf_url: Option<String>,
+
+        /// HuggingFace access token for downloading gated models.
+        /// Can also be supplied via the HF_TOKEN environment variable.
+        #[arg(long, env = "HF_TOKEN")]
+        hf_token: Option<String>,
+    },
+
+    /// Show local model status (present / missing, configured paths, build flags).
+    Status,
+
+    /// Score a test query against a document string to verify the model works.
+    Test {
+        /// The query string.
+        query: String,
+
+        /// The document string to score against the query.
+        document: String,
     },
 }

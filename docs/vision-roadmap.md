@@ -31,8 +31,9 @@ This transforms CodeGraph from a local analysis tool into a **package manager fo
 
 - **Local LLM reranking (no cloud required)**
   Query results from both CodeGraph symbol search and LanceDB documentation search can be reranked
-  by a locally running GGUF model, similar to how QMD used embedding-based reranking.
-  No API keys, no data leaving the machine.
+   by a locally running Qwen3-Reranker-0.6B GGUF model (Q8_0, ~640 MB), matching QMD's
+  reranker configuration. No API keys, no data leaving the machine. Enabled via
+  `cargo build --features reranker` + `sempkg reranker pull`.
 
 ---
 
@@ -146,39 +147,65 @@ Extend MCP tools to support:
 
 ---
 
-## **6. Local LLM Reranker for CodeGraph and LanceDB**
+## **6. Local LLM Reranker for CodeGraph and LanceDB** ✓ _Implemented_
 
-Add an optional local LLM reranking stage, similar to what QMD provided via GGUF embedding
-models, but applied at query time rather than at index time. This avoids large model downloads
-at bundle-build time while still enabling semantic relevance ranking for both search surfaces.
+Add an optional local LLM reranking stage, inspired by QMD, applied at query time rather than
+at index time. This avoids large model downloads at bundle-build time while still enabling
+semantic relevance ranking for both search surfaces.
 
 ### How it works
 
 1. A first-pass **candidate retrieval** phase runs the existing fast indexes:
    - CodeGraph BM25/FTS symbol search for `search_symbols` / `get_context`
    - LanceDB BM25 full-text search for `search_docs`
-2. A second-pass **reranking** phase scores the top-N candidates through a locally running GGUF
-   model (e.g. a `nomic-embed` or `bge-reranker` quantised model) via llama.cpp.
-3. Results are re-sorted by model score and returned to the MCP caller.
+2. A second-pass **reranking** phase scores the top-N candidates through a locally running
+   Qwen3-Reranker-0.6B GGUF model (Q8_0, ~640 MB) via the `candle` Rust inference
+   stack. Uses a pointwise yes/no cross-encoder prompt identical to QMD's reranker design.
+3. Results are re-sorted by model score and returned to the MCP caller with relevance
+   annotations.
 
-The reranker is **entirely optional** and **zero-cloud**: if no model is configured, both tools
-fall back to pure BM25 results unchanged. When enabled, the model runs in-process via a Rust
-llama.cpp binding (e.g. the `llm` or `llama-cpp-rs` crate).
+The reranker is **entirely optional** and **zero-cloud**: if no model is configured or the
+binary is built without `--features reranker`, both tools fall back to pure BM25 results.
+When enabled, the model runs fully in-process (CPU, no GPU required).
+
+### CLI usage
+
+```sh
+# Download Qwen3-Reranker-0.6B GGUF + tokenizer (~640 MB, no auth required)
+sempkg reranker pull
+
+# Confirm model is ready
+sempkg reranker status
+
+# Score a query/document pair to test inference
+sempkg reranker test "How does async work?" "async fn run() { ... }"
+```
 
 ### Configuration
 
 ```toml
-# sempkg.toml
+# sempkg.toml  — add this section to enable reranking
 [reranker]
-model    = "~/.sempkg/models/bge-reranker-v2-m3-q4_k_m.gguf"
+enabled  = true
+# model  = "~/.sempkg/models/qwen3-reranker-0.6b-q8_0.gguf"  # default path
 top_k    = 20   # candidates passed to the model
 output_n = 5    # final results returned
 ```
 
+### Build flags
+
+```sh
+# Default build — no reranker compiled in (fast, small binary)
+cargo build --release
+
+# Build with in-process GGUF reranker
+cargo build --release --features reranker
+```
+
 ### Goals
 
-- No API keys or internet access required for semantic reranking
-- Works offline and in air-gapped environments
+- No API keys or internet access required during query time
+- Works offline and in air-gapped environments after `sempkg reranker pull`
 - Reranker model downloaded and managed independently of bundles
 - Improves relevance for both symbol search and documentation search
 
