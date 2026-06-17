@@ -2,13 +2,15 @@
 
 **The missing piece between your AI agent and the code it needs to understand.**
 
-`sempkg` combines the power of [CodeGraph](https://github.com/colbymchenry/codegraph) symbol graphs and [QMD](https://github.com/colbymchenry/codegraph) documentation indexes into a single Rust binary that doubles as an MCP server — giving GitHub Copilot and other agents instant, structured access to any codebase's semantic intelligence.
+`sempkg` combines the power of [CodeGraph](https://github.com/colbymchenry/codegraph) symbol graphs and [QMD](https://github.com/tobi/qmd)-like documentation indexes into a single Rust binary that doubles as an MCP server — giving GitHub Copilot and other agents instant, structured access to any codebase's semantic intelligence.
 
-### The version-drift problem — solved
+![readme-img](README.png)
+
+## The version-drift problem — solved
 
 AI agents routinely hallucinate APIs, reference removed methods, or cite docs for the wrong library version. `sempkg` fixes this at the source: dependencies are declared in a `sempkg.toml` manifest pinned to the **exact version you ship**, and the corresponding `.sembundle` index is fetched from a registry and served directly to your agent. Your agent reads the right symbols, the right signatures, and the right docs — for your versions, not someone else's.
 
-### What you get
+## What you get
 
 - **Symbol search & call graphs** — query function definitions, callers, and callees across indexed codebases without reading source files
 - **Semantic doc search** — vector-search over embedded documentation, scoped to the pinned version
