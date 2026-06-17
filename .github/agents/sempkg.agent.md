@@ -8,16 +8,8 @@ description: >
   impact before changing a symbol; answering "does this API exist in version X?"
   without risking hallucinated or wrong-version answers.
   Requires the sempkg MCP server to be configured in .vscode/mcp.json.
-tools:
-  - mcp_sempkg_list_packages
-  - mcp_sempkg_search_symbols
-  - mcp_sempkg_get_context
-  - mcp_sempkg_get_callers
-  - mcp_sempkg_get_callees
-  - mcp_sempkg_get_impact
-  - mcp_sempkg_list_files
-  - mcp_sempkg_search_docs
-  - mcp_sempkg_docs_metadata
+tools: [agent, search, todo, read, execute, web, edit, sempkg/*]
+agents: ["*"]
 ---
 
 # sempkg Research Agent
