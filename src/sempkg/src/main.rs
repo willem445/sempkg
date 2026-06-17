@@ -769,19 +769,18 @@ fn run_reranker(cmd: RerankerCommands, workspace: Option<&Path>) -> Result<()> {
     match cmd {
         RerankerCommands::Pull { gguf_url, hf_token } => {
             // Allow URL overrides via CLI flags for custom quants / mirrors.
-            let mut pull_cfg = cfg.clone();
-            if let Some(url) = &gguf_url {
-                pull_cfg.model = Some(url.clone());
-            }
+            let pull_cfg = cfg.clone();
 
             let token = hf_token.as_deref();
+            let source_url = gguf_url.as_deref();
 
             println!("Pulling Qwen3-Reranker-0.6B GGUF model...");
-            reranker::pull_model(&pull_cfg, token)?;
+            reranker::pull_model(&pull_cfg, token, source_url)?;
 
             println!();
             println!(
-                "Model ready. Add the following to your sempkg.toml to activate reranking:\n\n\
+                "Model ready. Reranking works without a [reranker] table (defaults apply).\n\
+                 Add this optional section only if you want workspace defaults:\n\n\
                  [reranker]\n\
                  enabled  = true\n\
                  top_k    = 20\n\

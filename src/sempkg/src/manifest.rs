@@ -285,6 +285,18 @@ fn build_document(manifest: &WorkspaceManifest) -> Result<DocumentMut> {
         doc.insert("packages", Item::Table(t));
     }
 
+    // [reranker]
+    if let Some(cfg) = &manifest.reranker {
+        let mut t = Table::new();
+        t.insert("enabled", value(cfg.enabled));
+        if let Some(model) = &cfg.model {
+            t.insert("model", value(model.as_str()));
+        }
+        t.insert("top_k", value(cfg.top_k as i64));
+        t.insert("output_n", value(cfg.output_n as i64));
+        doc.insert("reranker", Item::Table(t));
+    }
+
     Ok(doc)
 }
 
@@ -347,4 +359,53 @@ pub fn init_manifest(workspace_dir: &Path, registry_url: Option<&str>) -> Result
     }
 
     save_manifest(&manifest, workspace_dir)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use tempfile::tempdir;
+
+    use super::{DependencyEntry, WorkspaceManifest, load_manifest, save_manifest};
+
+    #[test]
+    fn save_manifest_preserves_reranker_table() {
+        let dir = tempdir().expect("create temp dir");
+
+        let mut manifest = WorkspaceManifest::default();
+        manifest.dependencies.insert(
+            "demo".to_string(),
+            DependencyEntry {
+                version: "1.0.0".to_string(),
+                registry: None,
+                url: None,
+                git: None,
+                git_ref: None,
+                subdir: None,
+                full: false,
+            },
+        );
+        manifest.reranker = Some(crate::reranker::RerankerConfig {
+            enabled: true,
+            model: Some("~/.sempkg/models/custom.gguf".to_string()),
+            top_k: 42,
+            output_n: 7,
+        });
+
+        save_manifest(&manifest, dir.path()).expect("save manifest");
+
+        let saved = fs::read_to_string(dir.path().join(super::MANIFEST_FILE))
+            .expect("read manifest");
+        assert!(saved.contains("[reranker]"));
+        assert!(saved.contains("top_k = 42"));
+        assert!(saved.contains("output_n = 7"));
+
+        let loaded = load_manifest(dir.path()).expect("load manifest");
+        let reranker = loaded.reranker.expect("reranker section present");
+        assert!(reranker.enabled);
+        assert_eq!(reranker.model.as_deref(), Some("~/.sempkg/models/custom.gguf"));
+        assert_eq!(reranker.top_k, 42);
+        assert_eq!(reranker.output_n, 7);
+    }
 }

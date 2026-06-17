@@ -221,14 +221,15 @@ pub fn download_file(url: &str, dest: &Path, hf_token: Option<&str>) -> Result<(
 /// tokenizer.json download is needed when using llama-cpp-2.
 ///
 /// `hf_token` is forwarded as a `Bearer` authorisation header for gated repos.
-pub fn pull_model(config: &RerankerConfig, hf_token: Option<&str>) -> Result<()> {
+pub fn pull_model(config: &RerankerConfig, hf_token: Option<&str>, gguf_url: Option<&str>) -> Result<()> {
     let model_path = config.resolved_model_path();
+    let source_url = gguf_url.unwrap_or(DEFAULT_GGUF_URL);
 
     if model_path.is_file() {
         println!("Model already present: {}", model_path.display());
     } else {
-        println!("Downloading {}  →  {}", DEFAULT_GGUF_URL, model_path.display());
-        download_file(DEFAULT_GGUF_URL, &model_path, hf_token)
+        println!("Downloading {}  →  {}", source_url, model_path.display());
+        download_file(source_url, &model_path, hf_token)
             .context("Failed to download GGUF model")?;
         println!("  ✓ model saved.");
     }
