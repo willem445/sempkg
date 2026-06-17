@@ -35,12 +35,12 @@ AI agents routinely hallucinate APIs, reference removed methods, or cite docs fo
 
 **Linux / macOS:**
 ```sh
-curl -fsSL https://raw.githubusercontent.com/willem445/codegraph-hub/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/willem445/sempkg/main/install.sh | sh
 ```
 
 **Windows (PowerShell):**
 ```powershell
-irm https://raw.githubusercontent.com/willem445/codegraph-hub/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/willem445/sempkg/main/install.ps1 | iex
 ```
 
 Both scripts install `sembundle` and `sempkg` to `~/.local/bin` (Linux/macOS) or `%USERPROFILE%\.local\bin` (Windows). The PowerShell script automatically adds the directory to your user `PATH`.
