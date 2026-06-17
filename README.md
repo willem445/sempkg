@@ -97,6 +97,9 @@ sempkg init --registry https://your-registry.example.com
 sempkg add my-sdk@1.2.0
 sempkg add pkg@4.6.1 --url https://github.com/org/repo/releases/download/pkg-v4.6.1/pkg-v4.6.1.sembundle
 sempkg sync
+
+# Add & index a dependency directly from Github (bypass index)
+sempkg add https://github.com/pandas-dev/pandas/releases/tag/v3.0.3 --full
 ```
 
 ---
