@@ -316,11 +316,13 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
                 // GitHub-sourced dependency — re-run the build flow
                 if dep.git.is_some() {
                     let git_src = dep.git.as_deref().unwrap_or_default();
-                    let (host, owner, repo) = parse_manifest_git_source(git_src)
-                        .ok_or_else(|| anyhow::anyhow!(
-                            "Invalid git source '{git_src}' for dependency '{dep_name}'. \
+                    let (host, owner, repo) =
+                        parse_manifest_git_source(git_src).ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "Invalid git source '{git_src}' for dependency '{dep_name}'. \
                              Expected github:owner/repo or github:host/owner/repo"
-                        ))?;
+                            )
+                        })?;
 
                     let gh_src = github::GitHubSource {
                         host,
@@ -1293,7 +1295,7 @@ fn add_from_github(
     version_override: Option<&str>,
     workspace: Option<&Path>,
 ) -> Result<()> {
-    let token = github::github_token();
+    let token = github::github_token_for_host(&src.host);
     let token_ref = token.as_deref();
 
     // 1. Resolve the ref to a full commit SHA
