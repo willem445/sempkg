@@ -515,7 +515,11 @@ pub fn lance_results_to_candidates(results: &[crate::lance::SearchResult]) -> Ve
     results
         .iter()
         .map(|r| RerankCandidate {
-            source: r.path.clone(),
+            source: if r.start_line > 0 {
+                format!("{}:{}-{}", r.path, r.start_line, r.end_line)
+            } else {
+                r.path.clone()
+            },
             text:   r.snippet.clone(),
             origin: RerankOrigin::Docs,
         })
