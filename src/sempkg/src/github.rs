@@ -9,7 +9,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
 // ---------------------------------------------------------------------------
@@ -19,6 +19,8 @@ use serde::Deserialize;
 /// A parsed GitHub source reference (not yet resolved to a commit SHA).
 #[derive(Debug, Clone)]
 pub struct GitHubSource {
+    /// GitHub host (e.g. `github.com`, `github.company.com`).
+    pub host: String,
     pub owner: String,
     pub repo: String,
     /// Tag / branch / SHA as supplied. `None` means "resolve default branch".
@@ -30,6 +32,8 @@ pub struct GitHubSource {
 /// A fully resolved GitHub reference, ready for download / manifest population.
 #[derive(Debug, Clone)]
 pub struct ResolvedSource {
+    /// GitHub host (e.g. `github.com`, `github.company.com`).
+    pub host: String,
     pub owner: String,
     pub repo: String,
     /// Concrete tag/branch/sha used for the archive URL.
@@ -108,7 +112,7 @@ impl GhClient {
 pub fn parse_source(spec: &str) -> Option<GitHubSource> {
     let s = spec.trim();
 
-    if s.starts_with("https://github.com/") || s.starts_with("http://github.com/") {
+    if s.starts_with("https://") || s.starts_with("http://") {
         parse_github_url(s)
     } else if looks_like_owner_repo(s) {
         parse_shorthand(s)
@@ -118,15 +122,31 @@ pub fn parse_source(spec: &str) -> Option<GitHubSource> {
 }
 
 fn parse_github_url(url: &str) -> Option<GitHubSource> {
-    let rest = url
-        .strip_prefix("https://github.com/")
-        .or_else(|| url.strip_prefix("http://github.com/"))?;
+    let parsed = reqwest::Url::parse(url).ok()?;
+    let host = parsed.host_str()?.to_ascii_lowercase();
+    if !is_github_host(&host) {
+        return None;
+    }
+
+    let mut rest = parsed.path().trim_start_matches('/');
+    if rest.is_empty() {
+        return None;
+    }
+
+    // Keep compatibility with source forms that append `@ref` before a fragment.
+    let rendered = parsed.to_string();
+    let at_ref_from_url = rendered
+        .find('@')
+        .and_then(|i| rendered[i + 1..].split(['#', '?']).next())
+        .filter(|s| !s.is_empty());
 
     // `@ref` suffix may be appended before any fragment
-    let (rest, at_ref) = split_at_ref(rest);
+    let (path_wo_ref, at_ref_in_path) = split_at_ref(rest);
+    rest = path_wo_ref;
+    let at_ref = at_ref_in_path.or(at_ref_from_url);
 
     // Fragment `#subdir`
-    let (rest, fragment) = split_fragment(rest);
+    let fragment = parsed.fragment();
     let subdir = fragment.map(str::to_owned);
 
     // Strip trailing `.git`
@@ -156,6 +176,7 @@ fn parse_github_url(url: &str) -> Option<GitHubSource> {
     };
 
     Some(GitHubSource {
+        host,
         owner: owner.to_owned(),
         repo: repo.to_owned(),
         git_ref,
@@ -174,6 +195,7 @@ fn parse_shorthand(spec: &str) -> Option<GitHubSource> {
     let repo = validate_ident(repo.strip_suffix(".git").unwrap_or(repo))?;
 
     Some(GitHubSource {
+        host: "github.com".to_owned(),
         owner: owner.to_owned(),
         repo: repo.to_owned(),
         git_ref: at_ref.map(str::to_owned),
@@ -225,6 +247,22 @@ fn validate_ident(s: &str) -> Option<&str> {
     }
 }
 
+fn is_github_host(host: &str) -> bool {
+    host == "github.com" || host.starts_with("github.") || host.contains(".github.")
+}
+
+fn api_base(host: &str) -> String {
+    if host == "github.com" {
+        "https://api.github.com".to_owned()
+    } else {
+        format!("https://{host}/api/v3")
+    }
+}
+
+fn web_base(host: &str) -> String {
+    format!("https://{host}")
+}
+
 // ---------------------------------------------------------------------------
 // Resolution (GitHub API)
 // ---------------------------------------------------------------------------
@@ -232,10 +270,8 @@ fn validate_ident(s: &str) -> Option<&str> {
 /// Resolve a [`GitHubSource`] to a [`ResolvedSource`] with a full commit SHA.
 pub fn resolve(src: &GitHubSource, token: Option<&str>) -> Result<ResolvedSource> {
     let client = GhClient::new(token)?;
-    let base = format!(
-        "https://api.github.com/repos/{}/{}",
-        src.owner, src.repo
-    );
+    let api = api_base(&src.host);
+    let base = format!("{api}/repos/{}/{}", src.owner, src.repo);
 
     let git_ref: String = match &src.git_ref {
         Some(r) => r.clone(),
@@ -245,8 +281,8 @@ pub fn resolve(src: &GitHubSource, token: Option<&str>) -> Result<ResolvedSource
         }
     };
 
-    let commit_sha = resolve_ref_to_sha(&client, &src.owner, &src.repo, &git_ref)?;
-    let is_tag = probe_is_tag(&client, &src.owner, &src.repo, &git_ref);
+    let commit_sha = resolve_ref_to_sha(&client, &api, &src.host, &src.owner, &src.repo, &git_ref)?;
+    let is_tag = probe_is_tag(&client, &api, &src.owner, &src.repo, &git_ref);
     let package_name = sanitize_bundle_name(&src.repo);
 
     let version = if git_ref.len() >= 40 && git_ref.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -256,6 +292,7 @@ pub fn resolve(src: &GitHubSource, token: Option<&str>) -> Result<ResolvedSource
     };
 
     Ok(ResolvedSource {
+        host: src.host.clone(),
         owner: src.owner.clone(),
         repo: src.repo.clone(),
         git_ref,
@@ -263,19 +300,19 @@ pub fn resolve(src: &GitHubSource, token: Option<&str>) -> Result<ResolvedSource
         is_tag,
         package_name,
         version,
-        source_repo_url: format!("https://github.com/{}/{}", src.owner, src.repo),
+        source_repo_url: format!("{}/{}/{}", web_base(&src.host), src.owner, src.repo),
     })
 }
 
 fn resolve_ref_to_sha(
     client: &GhClient,
+    api_base: &str,
+    host: &str,
     owner: &str,
     repo: &str,
     git_ref: &str,
 ) -> Result<String> {
-    let url = format!(
-        "https://api.github.com/repos/{owner}/{repo}/commits/{git_ref}"
-    );
+    let url = format!("{api_base}/repos/{owner}/{repo}/commits/{git_ref}");
 
     let resp = client
         .get(&url)
@@ -296,7 +333,7 @@ fn resolve_ref_to_sha(
             );
         }
         404 => bail!(
-            "Repository or ref not found: github.com/{owner}/{repo} @ {git_ref}. \
+            "Repository or ref not found: {host}/{owner}/{repo} @ {git_ref}. \
              Check that the repo is public and the tag/branch/SHA exists."
         ),
         s if s >= 400 => bail!("GitHub API error {s}: {url}"),
@@ -315,10 +352,8 @@ fn resolve_ref_to_sha(
     Ok(commit.sha.to_lowercase())
 }
 
-fn probe_is_tag(client: &GhClient, owner: &str, repo: &str, git_ref: &str) -> bool {
-    let url = format!(
-        "https://api.github.com/repos/{owner}/{repo}/git/refs/tags/{git_ref}"
-    );
+fn probe_is_tag(client: &GhClient, api_base: &str, owner: &str, repo: &str, git_ref: &str) -> bool {
+    let url = format!("{api_base}/repos/{owner}/{repo}/git/refs/tags/{git_ref}");
     client
         .get(&url)
         .header("Accept", "application/vnd.github+json")
@@ -343,8 +378,11 @@ pub fn find_release_bundle_asset(
 
     let client = GhClient::new(token)?;
     let url = format!(
-        "https://api.github.com/repos/{}/{}/releases/tags/{}",
-        resolved.owner, resolved.repo, resolved.git_ref
+        "{}/repos/{}/{}/releases/tags/{}",
+        api_base(&resolved.host),
+        resolved.owner,
+        resolved.repo,
+        resolved.git_ref
     );
 
     let resp = client
@@ -367,7 +405,12 @@ pub fn find_release_bundle_asset(
         .assets
         .iter()
         .find(|a| a.name == bundle_name)
-        .or_else(|| release.assets.iter().find(|a| a.name.ends_with(".sembundle")))
+        .or_else(|| {
+            release
+                .assets
+                .iter()
+                .find(|a| a.name.ends_with(".sembundle"))
+        })
         .map(|a| a.browser_download_url.clone());
 
     let bundle_url = match bundle_url {
@@ -381,7 +424,10 @@ pub fn find_release_bundle_asset(
         .find(|a| a.name.ends_with(".sembundle.sig"))
         .map(|a| a.browser_download_url.clone());
 
-    Ok(Some(ReleaseAsset { bundle_url, sig_url }))
+    Ok(Some(ReleaseAsset {
+        bundle_url,
+        sig_url,
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -390,22 +436,23 @@ pub fn find_release_bundle_asset(
 
 /// Build the tarball download URL for a resolved source.
 pub fn archive_tarball_url(resolved: &ResolvedSource) -> String {
+    let web = web_base(&resolved.host);
     if resolved.is_tag {
         format!(
-            "https://github.com/{}/{}/archive/refs/tags/{}.tar.gz",
-            resolved.owner, resolved.repo, resolved.git_ref
+            "{}/{}/{}/archive/refs/tags/{}.tar.gz",
+            web, resolved.owner, resolved.repo, resolved.git_ref
         )
     } else if resolved.git_ref.len() >= 40
         && resolved.git_ref.chars().all(|c| c.is_ascii_hexdigit())
     {
         format!(
-            "https://github.com/{}/{}/archive/{}.tar.gz",
-            resolved.owner, resolved.repo, resolved.git_ref
+            "{}/{}/{}/archive/{}.tar.gz",
+            web, resolved.owner, resolved.repo, resolved.git_ref
         )
     } else {
         format!(
-            "https://github.com/{}/{}/archive/refs/heads/{}.tar.gz",
-            resolved.owner, resolved.repo, resolved.git_ref
+            "{}/{}/{}/archive/refs/heads/{}.tar.gz",
+            web, resolved.owner, resolved.repo, resolved.git_ref
         )
     }
 }
@@ -439,13 +486,19 @@ pub fn download_and_extract_tarball(
         .bytes()
         .context("Failed to read archive response body")?;
 
-    eprintln!("[sempkg] Extracting archive ({} KiB) ...", bytes.len() / 1024);
+    eprintln!(
+        "[sempkg] Extracting archive ({} KiB) ...",
+        bytes.len() / 1024
+    );
 
     let cursor = std::io::Cursor::new(bytes);
     let gz = flate2::read::GzDecoder::new(cursor);
     let mut archive = tar::Archive::new(gz);
 
-    for entry in archive.entries().context("Failed to read archive entries")? {
+    for entry in archive
+        .entries()
+        .context("Failed to read archive entries")?
+    {
         let mut entry = entry.context("Bad archive entry")?;
         let raw_path = entry.path().context("Bad entry path")?.to_path_buf();
 
@@ -500,10 +553,11 @@ pub fn download_and_extract_tarball(
 ///
 /// Requires `git` to be installed and on PATH.
 pub fn git_clone_at_ref(resolved: &ResolvedSource, dest: &Path) -> Result<PathBuf> {
-    let git = which::which("git")
-        .map_err(|_| anyhow::anyhow!(
+    let git = which::which("git").map_err(|_| {
+        anyhow::anyhow!(
             "`git` not found on PATH. Install git or omit --full to use the tar.gz archive."
-        ))?;
+        )
+    })?;
 
     let clone_dir = dest.join(&resolved.repo);
     std::fs::create_dir_all(&clone_dir)
@@ -514,12 +568,17 @@ pub fn git_clone_at_ref(resolved: &ResolvedSource, dest: &Path) -> Result<PathBu
         resolved.owner, resolved.repo, resolved.git_ref
     );
 
-    let clone_url = format!("https://github.com/{}/{}.git", resolved.owner, resolved.repo);
+    let clone_url = format!(
+        "{}/{}/{}.git",
+        web_base(&resolved.host),
+        resolved.owner,
+        resolved.repo
+    );
 
     // `--branch` works for both tags and branches; for a raw SHA we fall back
     // to cloning the default branch and then checking out the SHA.
-    let is_raw_sha = resolved.git_ref.len() == 40
-        && resolved.git_ref.chars().all(|c| c.is_ascii_hexdigit());
+    let is_raw_sha =
+        resolved.git_ref.len() == 40 && resolved.git_ref.chars().all(|c| c.is_ascii_hexdigit());
 
     if is_raw_sha {
         // Clone without --branch, then checkout the specific commit.
@@ -528,7 +587,8 @@ pub fn git_clone_at_ref(resolved: &ResolvedSource, dest: &Path) -> Result<PathBu
             &git,
             &[
                 "clone",
-                "--depth", "1",
+                "--depth",
+                "1",
                 "--no-single-branch",
                 &clone_url,
                 clone_dir.to_str().unwrap_or("."),
@@ -540,8 +600,10 @@ pub fn git_clone_at_ref(resolved: &ResolvedSource, dest: &Path) -> Result<PathBu
             &git,
             &[
                 "clone",
-                "--depth", "1",
-                "--branch", &resolved.git_ref,
+                "--depth",
+                "1",
+                "--branch",
+                &resolved.git_ref,
                 "--single-branch",
                 &clone_url,
                 clone_dir.to_str().unwrap_or("."),
@@ -560,11 +622,7 @@ fn run_git(git: &std::path::Path, args: &[&str]) -> Result<()> {
         .with_context(|| format!("Failed to run git with args: {args:?}"))?;
 
     if !status.success() {
-        bail!(
-            "`git {}` exited with status {}",
-            args.join(" "),
-            status
-        );
+        bail!("`git {}` exited with status {}", args.join(" "), status);
     }
     Ok(())
 }
@@ -718,9 +776,7 @@ fn api_get<T: serde::de::DeserializeOwned>(client: &GhClient, url: &str) -> Resu
                  Set GITHUB_TOKEN to raise the limit."
             );
         }
-        404 => bail!(
-            "GitHub API 404: {url} — check the repo/ref exists and is public."
-        ),
+        404 => bail!("GitHub API 404: {url} — check the repo/ref exists and is public."),
         s if s >= 400 => bail!("GitHub API error {s}: {url}"),
         _ => {}
     }
@@ -740,6 +796,7 @@ mod tests {
     #[test]
     fn test_parse_shorthand_with_ref() {
         let src = parse_source("pandas-dev/pandas@v2.2.2").unwrap();
+        assert_eq!(src.host, "github.com");
         assert_eq!(src.owner, "pandas-dev");
         assert_eq!(src.repo, "pandas");
         assert_eq!(src.git_ref.as_deref(), Some("v2.2.2"));
@@ -757,9 +814,19 @@ mod tests {
     #[test]
     fn test_parse_full_url() {
         let src = parse_source("https://github.com/pandas-dev/pandas").unwrap();
+        assert_eq!(src.host, "github.com");
         assert_eq!(src.owner, "pandas-dev");
         assert_eq!(src.repo, "pandas");
         assert!(src.git_ref.is_none());
+    }
+
+    #[test]
+    fn test_parse_enterprise_releases_tag_url() {
+        let src = parse_source("https://github.company.com/org/repo/releases/tag/v3.0.3").unwrap();
+        assert_eq!(src.host, "github.company.com");
+        assert_eq!(src.owner, "org");
+        assert_eq!(src.repo, "repo");
+        assert_eq!(src.git_ref.as_deref(), Some("v3.0.3"));
     }
 
     #[test]
@@ -776,8 +843,7 @@ mod tests {
 
     #[test]
     fn test_parse_url_releases_tag() {
-        let src =
-            parse_source("https://github.com/pandas-dev/pandas/releases/tag/v2.2.2").unwrap();
+        let src = parse_source("https://github.com/pandas-dev/pandas/releases/tag/v2.2.2").unwrap();
         assert_eq!(src.git_ref.as_deref(), Some("v2.2.2"));
     }
 
@@ -814,6 +880,7 @@ mod tests {
     #[test]
     fn test_archive_url_tag() {
         let r = ResolvedSource {
+            host: "github.com".into(),
             owner: "pandas-dev".into(),
             repo: "pandas".into(),
             git_ref: "v2.2.2".into(),
@@ -832,6 +899,7 @@ mod tests {
     #[test]
     fn test_archive_url_branch() {
         let r = ResolvedSource {
+            host: "github.com".into(),
             owner: "owner".into(),
             repo: "repo".into(),
             git_ref: "main".into(),
@@ -844,6 +912,25 @@ mod tests {
         assert_eq!(
             archive_tarball_url(&r),
             "https://github.com/owner/repo/archive/refs/heads/main.tar.gz"
+        );
+    }
+
+    #[test]
+    fn test_archive_url_enterprise_tag() {
+        let r = ResolvedSource {
+            host: "github.company.com".into(),
+            owner: "org".into(),
+            repo: "repo".into(),
+            git_ref: "v3.0.3".into(),
+            commit_sha: "c".repeat(40),
+            is_tag: true,
+            package_name: "repo".into(),
+            version: "3.0.3".into(),
+            source_repo_url: "https://github.company.com/org/repo".into(),
+        };
+        assert_eq!(
+            archive_tarball_url(&r),
+            "https://github.company.com/org/repo/archive/refs/tags/v3.0.3.tar.gz"
         );
     }
 }

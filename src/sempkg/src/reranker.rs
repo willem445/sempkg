@@ -49,9 +49,15 @@ pub struct RerankerConfig {
     pub output_n: usize,
 }
 
-fn default_true() -> bool { true }
-fn default_top_k() -> usize { 20 }
-fn default_output_n() -> usize { 5 }
+fn default_true() -> bool {
+    true
+}
+fn default_top_k() -> usize {
+    20
+}
+fn default_output_n() -> usize {
+    5
+}
 
 // A derived `Default` would zero `top_k`/`output_n` (the `#[serde(default)]`
 // attributes only apply during deserialization), which makes the reranker
@@ -60,9 +66,9 @@ fn default_output_n() -> usize { 5 }
 impl Default for RerankerConfig {
     fn default() -> Self {
         Self {
-            enabled:  default_true(),
-            model:    None,
-            top_k:    default_top_k(),
+            enabled: default_true(),
+            model: None,
+            top_k: default_top_k(),
             output_n: default_output_n(),
         }
     }
@@ -71,14 +77,12 @@ impl Default for RerankerConfig {
 impl RerankerConfig {
     /// Resolve the model path, expanding `~`.
     pub fn resolved_model_path(&self) -> PathBuf {
-        let raw = self.model.clone().unwrap_or_else(|| {
-            default_model_path()
-                .to_string_lossy()
-                .to_string()
-        });
+        let raw = self
+            .model
+            .clone()
+            .unwrap_or_else(|| default_model_path().to_string_lossy().to_string());
         expand_tilde(&raw)
     }
-
 }
 
 /// Default model download directory.
@@ -164,9 +168,8 @@ pub fn download_file(url: &str, dest: &Path, hf_token: Option<&str>) -> Result<(
     use std::io::Write;
 
     if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent).with_context(|| {
-            format!("creating directory {}", parent.display())
-        })?;
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating directory {}", parent.display()))?;
     }
 
     let client = reqwest::blocking::Client::new();
@@ -175,9 +178,7 @@ pub fn download_file(url: &str, dest: &Path, hf_token: Option<&str>) -> Result<(
         req = req.bearer_auth(tok);
     }
 
-    let resp = req
-        .send()
-        .with_context(|| format!("GET {url}"))?;
+    let resp = req.send().with_context(|| format!("GET {url}"))?;
 
     if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
         anyhow::bail!(
@@ -199,17 +200,16 @@ pub fn download_file(url: &str, dest: &Path, hf_token: Option<&str>) -> Result<(
         .with_context(|| format!("HTTP error for {url}"))?;
 
     let total = resp.content_length();
-    let bytes = resp.bytes().with_context(|| format!("reading body of {url}"))?;
+    let bytes = resp
+        .bytes()
+        .with_context(|| format!("reading body of {url}"))?;
 
     if let Some(t) = total {
-        println!(
-            "  downloaded {:.1} MiB",
-            t as f64 / 1_048_576.0
-        );
+        println!("  downloaded {:.1} MiB", t as f64 / 1_048_576.0);
     }
 
-    let mut file = std::fs::File::create(dest)
-        .with_context(|| format!("creating {}", dest.display()))?;
+    let mut file =
+        std::fs::File::create(dest).with_context(|| format!("creating {}", dest.display()))?;
     file.write_all(&bytes)
         .with_context(|| format!("writing {}", dest.display()))?;
 
@@ -221,7 +221,11 @@ pub fn download_file(url: &str, dest: &Path, hf_token: Option<&str>) -> Result<(
 /// tokenizer.json download is needed when using llama-cpp-2.
 ///
 /// `hf_token` is forwarded as a `Bearer` authorisation header for gated repos.
-pub fn pull_model(config: &RerankerConfig, hf_token: Option<&str>, gguf_url: Option<&str>) -> Result<()> {
+pub fn pull_model(
+    config: &RerankerConfig,
+    hf_token: Option<&str>,
+    gguf_url: Option<&str>,
+) -> Result<()> {
     let model_path = config.resolved_model_path();
     let source_url = gguf_url.unwrap_or(DEFAULT_GGUF_URL);
 
@@ -278,9 +282,9 @@ fn build_rerank_prompt(query: &str, document: &str) -> String {
 /// Loaded reranker ready to score (query, document) pairs.
 #[cfg(feature = "reranker")]
 pub struct Reranker {
-    backend:  llama_cpp_2::llama_backend::LlamaBackend,
-    model:    llama_cpp_2::model::LlamaModel,
-    top_k:    usize,
+    backend: llama_cpp_2::llama_backend::LlamaBackend,
+    model: llama_cpp_2::model::LlamaModel,
+    top_k: usize,
     output_n: usize,
 }
 
@@ -308,8 +312,8 @@ impl Reranker {
             );
         }
 
-        let backend = LlamaBackend::init()
-            .map_err(|e| anyhow::anyhow!("llama backend init: {e}"))?;
+        let backend =
+            LlamaBackend::init().map_err(|e| anyhow::anyhow!("llama backend init: {e}"))?;
 
         let model_params = LlamaModelParams::default();
         let model = LlamaModel::load_from_file(&backend, &model_path, &model_params)
@@ -318,7 +322,7 @@ impl Reranker {
         Ok(Self {
             backend,
             model,
-            top_k:    config.top_k,
+            top_k: config.top_k,
             output_n: config.output_n,
         })
     }
@@ -329,9 +333,7 @@ impl Reranker {
     /// state between calls.  Context creation from a loaded model is cheap.
     fn score_pair(&self, query: &str, document: &str) -> Result<f32> {
         use llama_cpp_2::{
-            context::params::LlamaContextParams,
-            llama_batch::LlamaBatch,
-            model::AddBos,
+            context::params::LlamaContextParams, llama_batch::LlamaBatch, model::AddBos,
         };
 
         let prompt = build_rerank_prompt(query, document);
@@ -341,11 +343,13 @@ impl Reranker {
             .with_n_ctx(std::num::NonZeroU32::new(4096))
             .with_embeddings(true);
 
-        let mut ctx = self.model
+        let mut ctx = self
+            .model
             .new_context(&self.backend, ctx_params)
             .map_err(|e| anyhow::anyhow!("creating context: {e}"))?;
 
-        let mut tokens = self.model
+        let mut tokens = self
+            .model
             .str_to_token(&prompt, AddBos::Always)
             .map_err(|e| anyhow::anyhow!("tokenizing prompt: {e}"))?;
 
@@ -381,10 +385,7 @@ impl Reranker {
         query: &str,
         candidates: Vec<RerankCandidate>,
     ) -> Result<Vec<RerankResult>> {
-        let pool: Vec<RerankCandidate> = candidates
-            .into_iter()
-            .take(self.top_k)
-            .collect();
+        let pool: Vec<RerankCandidate> = candidates.into_iter().take(self.top_k).collect();
 
         let mut scored: Vec<RerankResult> = pool
             .into_iter()
@@ -400,7 +401,9 @@ impl Reranker {
             .collect();
 
         scored.sort_by(|a, b| {
-            b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal)
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
         });
         scored.truncate(self.output_n);
         Ok(scored)
@@ -476,7 +479,11 @@ pub fn codegraph_json_to_candidates(json: &str) -> Vec<RerankCandidate> {
             // (e.g. several `connect` methods) stay distinguishable.
             let qualified = get("qualifiedName");
             let name = get("name");
-            let label = if !qualified.is_empty() { qualified } else { name };
+            let label = if !qualified.is_empty() {
+                qualified
+            } else {
+                name
+            };
             let source = if label.is_empty() {
                 "unknown".to_string()
             } else {
@@ -521,7 +528,7 @@ pub fn lance_results_to_candidates(results: &[crate::lance::SearchResult]) -> Ve
             } else {
                 r.path.clone()
             },
-            text:   r.snippet.clone(),
+            text: r.snippet.clone(),
             origin: RerankOrigin::Docs,
         })
         .collect()
@@ -542,7 +549,14 @@ pub fn print_status(config: &RerankerConfig) {
     println!();
 
     let model_ok = model_path.is_file();
-    println!("  model file : {}", if model_ok { "✓ present" } else { "✗ missing" });
+    println!(
+        "  model file : {}",
+        if model_ok {
+            "✓ present"
+        } else {
+            "✗ missing"
+        }
+    );
     println!("  tokenizer  : embedded in GGUF (no separate file needed)");
 
     if model_ok {

@@ -80,7 +80,10 @@ impl BundleInfo {
         // and graph/ must be non-empty (the actual data from the bundle).
         self.bundle_dir.join(".codegraph").exists()
             && self.bundle_dir.join("graph").exists()
-            && self.bundle_dir.join("graph").read_dir()
+            && self
+                .bundle_dir
+                .join("graph")
+                .read_dir()
                 .map(|mut d| d.next().is_some())
                 .unwrap_or(false)
     }
@@ -148,15 +151,18 @@ impl BundleStore {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("Cannot create store directory: {}", parent.display()))?;
 
-        let tmp_dir = tempfile::tempdir_in(parent)
-            .context("Cannot create temp directory for extraction")?;
+        let tmp_dir =
+            tempfile::tempdir_in(parent).context("Cannot create temp directory for extraction")?;
 
         let cursor = Cursor::new(bytes);
         let gz = flate2::read::GzDecoder::new(cursor);
         let mut archive = tar::Archive::new(gz);
 
         // Extract stripping the top-level `<name>-<version>/` prefix
-        for entry in archive.entries().context("Failed to read archive entries")? {
+        for entry in archive
+            .entries()
+            .context("Failed to read archive entries")?
+        {
             let mut entry = entry.context("Bad archive entry")?;
             let entry_path = entry.path().context("Bad entry path")?;
             let entry_path = entry_path.to_path_buf();
@@ -172,7 +178,8 @@ impl BundleStore {
                 std::fs::create_dir_all(parent)?;
             }
             if entry.header().entry_type().is_file() {
-                entry.unpack(&out_path)
+                entry
+                    .unpack(&out_path)
                     .with_context(|| format!("Failed to extract {}", stripped.display()))?;
             }
         }
@@ -290,9 +297,13 @@ pub fn create_codegraph_view(bundle_dir: &Path) -> Result<()> {
         // Directory junctions do not require elevated privileges or developer mode.
         // We shell out to `cmd /c mklink /J` which is universally available.
         let status = std::process::Command::new("cmd")
-            .args(["/C", "mklink", "/J",
-                   &link.to_string_lossy(),
-                   &graph_dir.to_string_lossy()])
+            .args([
+                "/C",
+                "mklink",
+                "/J",
+                &link.to_string_lossy(),
+                &graph_dir.to_string_lossy(),
+            ])
             .output()
             .context("Failed to run mklink to create .codegraph junction")?;
         if !status.status.success() {
@@ -307,8 +318,12 @@ pub fn create_codegraph_view(bundle_dir: &Path) -> Result<()> {
     }
     #[cfg(unix)]
     {
-        std::os::unix::fs::symlink("graph", &link)
-            .with_context(|| format!("Failed to create .codegraph symlink in {}", bundle_dir.display()))?;
+        std::os::unix::fs::symlink("graph", &link).with_context(|| {
+            format!(
+                "Failed to create .codegraph symlink in {}",
+                bundle_dir.display()
+            )
+        })?;
     }
 
     Ok(())
@@ -341,7 +356,9 @@ pub fn read_manifest_from_tar(bytes: &[u8]) -> Result<BundleManifest> {
         // Looking for `<name>-<version>/manifest.json`
         if parts.len() == 2 && parts[1].as_os_str() == "manifest.json" {
             let mut buf = String::new();
-            entry.read_to_string(&mut buf).context("Failed to read manifest.json")?;
+            entry
+                .read_to_string(&mut buf)
+                .context("Failed to read manifest.json")?;
             return serde_json::from_str(&buf).context("Failed to parse manifest.json");
         }
     }
@@ -356,7 +373,10 @@ fn validate_checksums(bytes: &[u8], manifest: &BundleManifest) -> Result<()> {
     let gz = flate2::read::GzDecoder::new(cursor);
     let mut archive = tar::Archive::new(gz);
 
-    for entry in archive.entries().context("Failed to read archive for checksum validation")? {
+    for entry in archive
+        .entries()
+        .context("Failed to read archive for checksum validation")?
+    {
         let mut entry = entry.context("Bad archive entry")?;
         let path = entry.path().context("Bad entry path")?.to_path_buf();
         let parts: Vec<_> = path.components().collect();
@@ -377,7 +397,9 @@ fn validate_checksums(bytes: &[u8], manifest: &BundleManifest) -> Result<()> {
                 continue;
             }
             let mut data = Vec::new();
-            entry.read_to_end(&mut data).context("Failed to read file for checksum")?;
+            entry
+                .read_to_end(&mut data)
+                .context("Failed to read file for checksum")?;
             let actual = hex::encode(Sha256::digest(&data));
             if &actual != expected {
                 return Err(SempkgError::ChecksumMismatch {

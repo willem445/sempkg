@@ -99,9 +99,7 @@ pub fn search(
 
         let batches: Vec<RecordBatch> = tbl
             .query()
-            .full_text_search(
-                FullTextSearchQuery::new(query.to_string()),
-            )
+            .full_text_search(FullTextSearchQuery::new(query.to_string()))
             .limit(limit)
             .execute()
             .await
@@ -144,9 +142,9 @@ pub fn search(
                         path,
                         snippet: c.value(i).chars().take(400).collect(),
                         start_line: start_lines.map_or(0, |a| a.value(i)),
-                        end_line:   end_lines  .map_or(0, |a| a.value(i)),
+                        end_line: end_lines.map_or(0, |a| a.value(i)),
                         start_byte: start_bytes.map_or(0, |a| a.value(i)),
-                        end_byte:   end_bytes  .map_or(0, |a| a.value(i)),
+                        end_byte: end_bytes.map_or(0, |a| a.value(i)),
                     });
                 }
             }
@@ -195,18 +193,30 @@ fn expand_patterns(spec: &str) -> Vec<String> {
     let mut depth = 0usize;
     for ch in spec.chars() {
         match ch {
-            '{' => { depth += 1; current.push(ch); }
-            '}' => { depth = depth.saturating_sub(1); current.push(ch); }
+            '{' => {
+                depth += 1;
+                current.push(ch);
+            }
+            '}' => {
+                depth = depth.saturating_sub(1);
+                current.push(ch);
+            }
             ',' if depth == 0 => {
                 let t = current.trim().to_string();
-                if !t.is_empty() { tokens.push(t); }
+                if !t.is_empty() {
+                    tokens.push(t);
+                }
                 current.clear();
             }
-            _ => { current.push(ch); }
+            _ => {
+                current.push(ch);
+            }
         }
     }
     let t = current.trim().to_string();
-    if !t.is_empty() { tokens.push(t); }
+    if !t.is_empty() {
+        tokens.push(t);
+    }
 
     // Expand brace groups in each token.
     tokens.into_iter().flat_map(|p| expand_braces(&p)).collect()
@@ -305,12 +315,12 @@ pub fn cli_update(
 
     rt.block_on(async {
         let schema = Arc::new(Schema::new(vec![
-            Field::new("path",       DataType::Utf8,   false),
-            Field::new("content",    DataType::Utf8,   false),
+            Field::new("path", DataType::Utf8, false),
+            Field::new("content", DataType::Utf8, false),
             Field::new("start_line", DataType::UInt32, false),
-            Field::new("end_line",   DataType::UInt32, false),
+            Field::new("end_line", DataType::UInt32, false),
             Field::new("start_byte", DataType::UInt32, false),
-            Field::new("end_byte",   DataType::UInt32, false),
+            Field::new("end_byte", DataType::UInt32, false),
         ]));
         let batch = RecordBatch::try_new(
             schema.clone(),
@@ -325,7 +335,10 @@ pub fn cli_update(
         )
         .map_err(|e| SempkgError::LanceError(e.to_string()))?;
 
-        let reader = RecordBatchIterator::new(vec![Ok::<RecordBatch, arrow_schema::ArrowError>(batch)], schema);
+        let reader = RecordBatchIterator::new(
+            vec![Ok::<RecordBatch, arrow_schema::ArrowError>(batch)],
+            schema,
+        );
 
         let db = lancedb::connect(lance_out.to_str().unwrap_or("."))
             .execute()
@@ -344,9 +357,7 @@ pub fn cli_update(
         let _ = tbl
             .create_index(
                 &["content"],
-                lancedb::index::Index::FTS(
-                    lancedb::index::scalar::FtsIndexBuilder::default(),
-                ),
+                lancedb::index::Index::FTS(lancedb::index::scalar::FtsIndexBuilder::default()),
             )
             .execute()
             .await;
@@ -365,13 +376,10 @@ pub fn cli_update(
     });
     std::fs::write(
         lance_out.join("metadata.json"),
-        serde_json::to_vec_pretty(&meta)
-            .map_err(SempkgError::Json)?,
+        serde_json::to_vec_pretty(&meta).map_err(SempkgError::Json)?,
     )?;
 
-    eprintln!(
-        "[sempkg] lance: indexed {doc_count} documents, {chunk_count} chunks."
-    );
+    eprintln!("[sempkg] lance: indexed {doc_count} documents, {chunk_count} chunks.");
 
     Ok(lance_out)
 }
@@ -401,11 +409,7 @@ fn byte_to_line(text: &str, byte_offset: usize) -> u32 {
     while boundary > 0 && !text.is_char_boundary(boundary) {
         boundary -= 1;
     }
-    text[..boundary]
-        .bytes()
-        .filter(|&b| b == b'\n')
-        .count() as u32
-        + 1
+    text[..boundary].bytes().filter(|&b| b == b'\n').count() as u32 + 1
 }
 
 fn chunk_text(text: &str, max_chars: usize) -> Vec<ChunkInfo> {
@@ -450,9 +454,9 @@ fn chunk_text(text: &str, max_chars: usize) -> Vec<ChunkInfo> {
             if !cur_text.is_empty() {
                 chunks.push(ChunkInfo {
                     start_line: byte_to_line(text, cur_start),
-                    end_line:   byte_to_line(text, cur_end.saturating_sub(1)),
+                    end_line: byte_to_line(text, cur_end.saturating_sub(1)),
                     start_byte: cur_start as u32,
-                    end_byte:   cur_end as u32,
+                    end_byte: cur_end as u32,
                     text: std::mem::take(&mut cur_text),
                 });
             }
@@ -469,9 +473,9 @@ fn chunk_text(text: &str, max_chars: usize) -> Vec<ChunkInfo> {
                     chunks.push(ChunkInfo {
                         text: String::from_utf8_lossy(window).into_owned(),
                         start_line: byte_to_line(text, w_start),
-                        end_line:   byte_to_line(text, w_end.saturating_sub(1)),
+                        end_line: byte_to_line(text, w_end.saturating_sub(1)),
                         start_byte: w_start as u32,
-                        end_byte:   w_end as u32,
+                        end_byte: w_end as u32,
                     });
                     off += window.len();
                 }
@@ -481,9 +485,9 @@ fn chunk_text(text: &str, max_chars: usize) -> Vec<ChunkInfo> {
     if !cur_text.is_empty() {
         chunks.push(ChunkInfo {
             start_line: byte_to_line(text, cur_start),
-            end_line:   byte_to_line(text, cur_end.saturating_sub(1)),
+            end_line: byte_to_line(text, cur_end.saturating_sub(1)),
             start_byte: cur_start as u32,
-            end_byte:   cur_end as u32,
+            end_byte: cur_end as u32,
             text: cur_text,
         });
     }
@@ -492,9 +496,9 @@ fn chunk_text(text: &str, max_chars: usize) -> Vec<ChunkInfo> {
         chunks.push(ChunkInfo {
             text: text.chars().take(max_chars).collect(),
             start_line: 1,
-            end_line:   byte_to_line(text, end),
+            end_line: byte_to_line(text, end),
             start_byte: 0,
-            end_byte:   end as u32,
+            end_byte: end as u32,
         });
     }
     chunks

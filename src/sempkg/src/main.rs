@@ -2,10 +2,10 @@ mod cli;
 mod codegraph;
 mod error;
 mod github;
+mod lance;
 mod manifest;
 mod mcp;
 mod packages;
-mod lance;
 mod registry;
 mod reranker;
 mod store;
@@ -21,8 +21,10 @@ use sha2::{Digest, Sha256};
 use crate::cli::{Cli, Commands, PkgCommands, RerankerCommands};
 use crate::manifest::{DependencyEntry, RegistryEntry};
 use crate::packages::PackageRegistry;
-use crate::registry::{RegistryClient, download_from_url};
-use crate::store::{BundleScope, BundleStore, list_all_bundles, repair_codegraph_view, resolve_bundle};
+use crate::registry::{download_from_url, RegistryClient};
+use crate::store::{
+    list_all_bundles, repair_codegraph_view, resolve_bundle, BundleScope, BundleStore,
+};
 
 fn main() {
     let cli = Cli::parse();
@@ -61,9 +63,22 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
         // -----------------------------------------------------------------------
         // Index — one-shot workspace indexing
         // -----------------------------------------------------------------------
-        Commands::Index { path, name, docs_pattern, no_docs, no_code, global } => {
-            run_index(path.as_deref(), name.as_deref(), &docs_pattern, no_docs, no_code, global, workspace)
-        }
+        Commands::Index {
+            path,
+            name,
+            docs_pattern,
+            no_docs,
+            no_code,
+            global,
+        } => run_index(
+            path.as_deref(),
+            name.as_deref(),
+            &docs_pattern,
+            no_docs,
+            no_code,
+            global,
+            workspace,
+        ),
 
         // -----------------------------------------------------------------------
         // List
@@ -83,7 +98,11 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
             if !local_pkgs.is_empty() {
                 println!("Local packages:");
                 for pkg in &local_pkgs {
-                    let idx = if pkg.is_indexed() { "indexed" } else { "NOT indexed" };
+                    let idx = if pkg.is_indexed() {
+                        "indexed"
+                    } else {
+                        "NOT indexed"
+                    };
                     let desc = if pkg.description.is_empty() {
                         String::new()
                     } else {
@@ -94,14 +113,20 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
             }
 
             if !bundles.is_empty() {
-                if !local_pkgs.is_empty() { println!(); }
+                if !local_pkgs.is_empty() {
+                    println!();
+                }
                 println!("Installed bundles:");
                 for b in &bundles {
-                    let idx = if b.is_indexed() { "indexed" } else { "no graph" };
+                    let idx = if b.is_indexed() {
+                        "indexed"
+                    } else {
+                        "no graph"
+                    };
                     let lance_flag = if b.has_lance() { "  +lance" } else { "" };
                     let scope = match b.scope {
                         BundleScope::Workspace => "workspace",
-                        BundleScope::Global    => "global",
+                        BundleScope::Global => "global",
                     };
                     println!(
                         "  {:<20} @ {:<12} [{idx}]  [{scope}]{lance_flag}",
@@ -116,7 +141,18 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
         // -----------------------------------------------------------------------
         // Add dependency to manifest
         // -----------------------------------------------------------------------
-        Commands::Add { spec, registry_url, registry, group, url, build, reinstall, full, name: name_override, version: version_override } => {
+        Commands::Add {
+            spec,
+            registry_url,
+            registry,
+            group,
+            url,
+            build,
+            reinstall,
+            full,
+            name: name_override,
+            version: version_override,
+        } => {
             let dir = require_workspace(workspace)?;
 
             // Check if this is a GitHub source first
@@ -161,7 +197,15 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
                         url: url.to_string(),
                     });
                 }
-                let dep = DependencyEntry { version: version.to_string(), registry: Some(reg_name), url: None, git: None, git_ref: None, subdir: None, full: false };
+                let dep = DependencyEntry {
+                    version: version.to_string(),
+                    registry: Some(reg_name),
+                    url: None,
+                    git: None,
+                    git_ref: None,
+                    subdir: None,
+                    full: false,
+                };
                 insert_dep(&mut mf, name, dep, group.as_deref());
             } else {
                 if mf.registries.is_empty() {
@@ -172,9 +216,17 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
                          Or install directly from GitHub: sempkg add owner/repo@ref"
                     );
                 }
-                let resolved_registry = registry
-                    .or_else(|| mf.default_registry().map(|r| r.name.clone()));
-                let dep = DependencyEntry { version: version.to_string(), registry: resolved_registry, url: None, git: None, git_ref: None, subdir: None, full: false };
+                let resolved_registry =
+                    registry.or_else(|| mf.default_registry().map(|r| r.name.clone()));
+                let dep = DependencyEntry {
+                    version: version.to_string(),
+                    registry: resolved_registry,
+                    url: None,
+                    git: None,
+                    git_ref: None,
+                    subdir: None,
+                    full: false,
+                };
                 insert_dep(&mut mf, name, dep, group.as_deref());
             }
 
@@ -224,7 +276,11 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
         // -----------------------------------------------------------------------
         // Sync — install all workspace manifest dependencies
         // -----------------------------------------------------------------------
-        Commands::Sync { reinstall, group, all_groups } => {
+        Commands::Sync {
+            reinstall,
+            group,
+            all_groups,
+        } => {
             let dir = require_workspace(workspace)?;
             let mf = manifest::load_manifest(dir)?;
             let mut lock = manifest::load_lock(dir)?;
@@ -259,23 +315,36 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
 
                 // GitHub-sourced dependency — re-run the build flow
                 if dep.git.is_some() {
+                    let git_src = dep.git.as_deref().unwrap_or_default();
+                    let (host, owner, repo) = parse_manifest_git_source(git_src)
+                        .ok_or_else(|| anyhow::anyhow!(
+                            "Invalid git source '{git_src}' for dependency '{dep_name}'. \
+                             Expected github:owner/repo or github:host/owner/repo"
+                        ))?;
+
                     let gh_src = github::GitHubSource {
-                        owner: dep.git
-                            .as_deref()
-                            .and_then(|g| g.strip_prefix("github:"))
-                            .and_then(|s| s.split_once('/').map(|(o, _)| o.to_owned()))
-                            .unwrap_or_default(),
-                        repo: dep.git
-                            .as_deref()
-                            .and_then(|g| g.strip_prefix("github:"))
-                            .and_then(|s| s.split_once('/').map(|(_, r)| r.to_owned()))
-                            .unwrap_or_default(),
+                        host,
+                        owner,
+                        repo,
                         git_ref: dep.git_ref.clone().or_else(|| Some(dep.version.clone())),
                         subdir: dep.subdir.clone(),
                     };
                     let full = dep.full;
-                    println!("  Syncing {dep_name} from {} ...", dep.git.as_deref().unwrap_or("github"));
-                    add_from_github(gh_src, dir, None, false, reinstall, full, Some(dep_name), None, workspace)?;
+                    println!(
+                        "  Syncing {dep_name} from {} ...",
+                        dep.git.as_deref().unwrap_or("github")
+                    );
+                    add_from_github(
+                        gh_src,
+                        dir,
+                        None,
+                        false,
+                        reinstall,
+                        full,
+                        Some(dep_name),
+                        None,
+                        workspace,
+                    )?;
                     continue;
                 }
 
@@ -293,7 +362,10 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
                         format!("No registry found for dependency '{dep_name}'")
                     })?;
 
-                    print!("  Installing {dep_name}@{} from {} ... ", dep.version, reg.name);
+                    print!(
+                        "  Installing {dep_name}@{} from {} ... ",
+                        dep.version, reg.name
+                    );
                     std::io::Write::flush(&mut std::io::stdout())?;
 
                     let client = RegistryClient::new(&reg.url);
@@ -305,8 +377,12 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
                     // Signature verification
                     if let Some(key) = &verify_key {
                         let sig = client.download_signature(dep_name, &dep.version)?;
-                        verify::verify_bundle_signature(&bytes, &sig, key)
-                            .with_context(|| format!("Signature verification failed for {dep_name}@{}", dep.version))?;
+                        verify::verify_bundle_signature(&bytes, &sig, key).with_context(|| {
+                            format!(
+                                "Signature verification failed for {dep_name}@{}",
+                                dep.version
+                            )
+                        })?;
                     }
                 }
 
@@ -339,7 +415,13 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
         // -----------------------------------------------------------------------
         // Install — direct download without manifest
         // -----------------------------------------------------------------------
-        Commands::Install { spec, global, registry: reg_url, verify_key, url } => {
+        Commands::Install {
+            spec,
+            global,
+            registry: reg_url,
+            verify_key,
+            url,
+        } => {
             let (name, version) = parse_spec(&spec)?;
 
             let store = if global {
@@ -357,7 +439,9 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
                 println!("done.");
                 b
             } else {
-                let reg_url = reg_url.as_deref().expect("--registry required when --url is not provided");
+                let reg_url = reg_url
+                    .as_deref()
+                    .expect("--registry required when --url is not provided");
                 let client = RegistryClient::new(reg_url);
 
                 let index_entry = client.lookup(name, version).ok();
@@ -373,7 +457,9 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
             // Signature verification (registry-sourced only, URLs don't carry .sig)
             if let Some(key_path) = &verify_key {
                 if url.is_some() {
-                    eprintln!("Warning: signature verification is not supported for direct URL installs.");
+                    eprintln!(
+                        "Warning: signature verification is not supported for direct URL installs."
+                    );
                 } else {
                     let reg_url = reg_url.as_deref().unwrap();
                     let client = RegistryClient::new(reg_url);
@@ -388,7 +474,8 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
             let info = store.install_bytes(&bytes)?;
             println!(
                 "Installed {}@{} [{scope_label}]{}",
-                info.name, info.version,
+                info.name,
+                info.version,
                 if info.has_lance() { "  +lance" } else { "" }
             );
             Ok(())
@@ -417,13 +504,18 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
                 println!("  Path:       {}", bundle.bundle_dir.display());
                 println!("  Scope:      {:?}", bundle.scope);
                 println!("  Graph:      {}", bundle.bundle_dir.join("graph").exists());
-                println!("  .codegraph: {}", bundle.bundle_dir.join(".codegraph").exists());
+                println!(
+                    "  .codegraph: {}",
+                    bundle.bundle_dir.join(".codegraph").exists()
+                );
                 println!("  Queryable:  {}", bundle.is_indexed());
                 println!("  Lance:      {}", bundle.has_lance());
                 println!("  Source:     {}", bundle.manifest.source_repo);
                 println!("  Commit:     {}", bundle.manifest.commit_hash);
                 println!("  Created:    {}", bundle.manifest.created_at);
-                if bundle.bundle_dir.join("graph").exists() && !bundle.bundle_dir.join(".codegraph").exists() {
+                if bundle.bundle_dir.join("graph").exists()
+                    && !bundle.bundle_dir.join(".codegraph").exists()
+                {
                     println!("\n  ! .codegraph view missing — run 'sempkg repair' to fix.");
                 }
                 return Ok(());
@@ -446,7 +538,9 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
                         println!("  Repaired: {}@{}", bundle.name, bundle.version);
                         repaired += 1;
                     }
-                    Ok(false) => { already_ok += 1; }
+                    Ok(false) => {
+                        already_ok += 1;
+                    }
                     Err(e) => eprintln!("  Failed {}@{}: {e}", bundle.name, bundle.version),
                 }
             }
@@ -462,19 +556,35 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
         // -----------------------------------------------------------------------
         // CodeGraph queries (scoped)
         // -----------------------------------------------------------------------
-        Commands::Search { package, query, kind, limit } => {
+        Commands::Search {
+            package,
+            query,
+            kind,
+            limit,
+        } => {
             let path = resolve_codegraph_path(&package, workspace)?;
-            println!("{}", codegraph::query(&path, &query, kind.as_deref(), limit)?);
+            println!(
+                "{}",
+                codegraph::query(&path, &query, kind.as_deref(), limit)?
+            );
             Ok(())
         }
 
-        Commands::Callers { package, symbol, limit } => {
+        Commands::Callers {
+            package,
+            symbol,
+            limit,
+        } => {
             let path = resolve_codegraph_path(&package, workspace)?;
             println!("{}", codegraph::callers(&path, &symbol, limit)?);
             Ok(())
         }
 
-        Commands::Callees { package, symbol, limit } => {
+        Commands::Callees {
+            package,
+            symbol,
+            limit,
+        } => {
             let path = resolve_codegraph_path(&package, workspace)?;
             println!("{}", codegraph::callees(&path, &symbol, limit)?);
             Ok(())
@@ -486,7 +596,11 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
             Ok(())
         }
 
-        Commands::Impact { package, symbol, depth } => {
+        Commands::Impact {
+            package,
+            symbol,
+            depth,
+        } => {
             let path = resolve_codegraph_path(&package, workspace)?;
             println!("{}", codegraph::impact(&path, &symbol, depth)?);
             Ok(())
@@ -501,7 +615,11 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
         // -----------------------------------------------------------------------
         // LanceDB doc search
         // -----------------------------------------------------------------------
-        Commands::Docs { package, query, limit } => {
+        Commands::Docs {
+            package,
+            query,
+            limit,
+        } => {
             let bundle_dir = resolve_lance_path(&package, workspace)?;
             let results = lance::search(&bundle_dir, &query, limit)?;
             println!("{}", lance::format_results(&results, &query));
@@ -511,19 +629,40 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
         // -----------------------------------------------------------------------
         // Hybrid search with reranking
         // -----------------------------------------------------------------------
-        Commands::Query { package, query, docs, code, kind, limit, top_k } => {
-            run_query(&package, &query, docs, code, kind.as_deref(), limit, top_k, workspace)
-        }
+        Commands::Query {
+            package,
+            query,
+            docs,
+            code,
+            kind,
+            limit,
+            top_k,
+        } => run_query(
+            &package,
+            &query,
+            docs,
+            code,
+            kind.as_deref(),
+            limit,
+            top_k,
+            workspace,
+        ),
 
         Commands::DocsMeta { package } => {
             let bundle_dir = resolve_lance_path(&package, workspace)?;
             if let Some(meta) = lance::load_metadata(&bundle_dir) {
                 println!("LanceDB metadata for '{package}':");
-                println!("  Table:       {}", meta.table_name.as_deref().unwrap_or("docs"));
+                println!(
+                    "  Table:       {}",
+                    meta.table_name.as_deref().unwrap_or("docs")
+                );
                 println!("  Documents:   {}", meta.document_count.unwrap_or(0));
                 println!("  Chunks:      {}", meta.chunk_count.unwrap_or(0));
                 println!("  FTS enabled: {}", meta.fts_enabled.unwrap_or(false));
-                println!("  Indexed at:  {}", meta.created_at.as_deref().unwrap_or("unknown"));
+                println!(
+                    "  Indexed at:  {}",
+                    meta.created_at.as_deref().unwrap_or("unknown")
+                );
             } else {
                 anyhow::bail!("No LanceDB metadata found for '{package}'.");
             }
@@ -577,9 +716,7 @@ fn run_query(
         cfg.output_n = limit;
 
         if !reranker::model_is_present(&cfg) {
-            anyhow::bail!(
-                "Reranker model not found. Run `sempkg reranker pull` to download it."
-            );
+            anyhow::bail!("Reranker model not found. Run `sempkg reranker pull` to download it.");
         }
 
         let mut code_candidates: Vec<reranker::RerankCandidate> = Vec::new();
@@ -600,7 +737,9 @@ fn run_query(
             }
             match resolve_lance_path(package, workspace) {
                 Ok(lance_dir) => match lance::search(&lance_dir, query, cfg.top_k) {
-                    Ok(results) => doc_candidates.extend(reranker::lance_results_to_candidates(&results)),
+                    Ok(results) => {
+                        doc_candidates.extend(reranker::lance_results_to_candidates(&results))
+                    }
                     Err(e) => eprintln!("Warning: doc search failed: {e}"),
                 },
                 Err(_) => {} // package may be symbols-only; not fatal
@@ -625,8 +764,12 @@ fn run_query(
         // selection and final truncation below.
         cfg.output_n = candidates.len();
 
-        let has_codegraph = candidates.iter().any(|c| c.origin == reranker::RerankOrigin::Codegraph);
-        let has_docs = candidates.iter().any(|c| c.origin == reranker::RerankOrigin::Docs);
+        let has_codegraph = candidates
+            .iter()
+            .any(|c| c.origin == reranker::RerankOrigin::Codegraph);
+        let has_docs = candidates
+            .iter()
+            .any(|c| c.origin == reranker::RerankOrigin::Docs);
 
         eprintln!("Scoring {} candidates...", candidates.len());
         let mut ranker = reranker::Reranker::load(&cfg)?;
@@ -642,7 +785,16 @@ fn run_query(
     }
     #[cfg(not(feature = "reranker"))]
     {
-        let _ = (package, query, docs_only, code_only, kind, limit, top_k_override, workspace);
+        let _ = (
+            package,
+            query,
+            docs_only,
+            code_only,
+            kind,
+            limit,
+            top_k_override,
+            workspace,
+        );
         anyhow::bail!(
             "The `query` command requires reranker support. \
              Rebuild with `cargo build --features reranker`."
@@ -736,7 +888,10 @@ fn diversify_query_results(
         final_results.push(code);
     }
     if let Some(doc) = best_doc {
-        if !final_results.iter().any(|r| r.source == doc.source && r.text == doc.text) {
+        if !final_results
+            .iter()
+            .any(|r| r.source == doc.source && r.text == doc.text)
+        {
             final_results.push(doc);
         }
     }
@@ -745,7 +900,10 @@ fn diversify_query_results(
         if final_results.len() >= limit {
             break;
         }
-        if final_results.iter().any(|r| r.source == result.source && r.text == result.text) {
+        if final_results
+            .iter()
+            .any(|r| r.source == result.source && r.text == result.text)
+        {
             continue;
         }
         final_results.push(result);
@@ -798,9 +956,7 @@ fn run_reranker(cmd: RerankerCommands, workspace: Option<&Path>) -> Result<()> {
             #[cfg(feature = "reranker")]
             {
                 if !reranker::model_is_present(&cfg) {
-                    anyhow::bail!(
-                        "Model not found. Run `sempkg reranker pull` first."
-                    );
+                    anyhow::bail!("Model not found. Run `sempkg reranker pull` first.");
                 }
                 println!("Loading Qwen3-Reranker...");
                 let mut ranker = reranker::Reranker::load(&cfg)?;
@@ -811,7 +967,10 @@ fn run_reranker(cmd: RerankerCommands, workspace: Option<&Path>) -> Result<()> {
                 }];
                 let results = ranker.rerank(&query, candidates)?;
                 if let Some(r) = results.first() {
-                    println!("Score: {:.4}  (1.0 = highly relevant, 0.0 = not relevant)", r.score);
+                    println!(
+                        "Score: {:.4}  (1.0 = highly relevant, 0.0 = not relevant)",
+                        r.score
+                    );
                 } else {
                     println!("No results.");
                 }
@@ -912,7 +1071,9 @@ fn run_index(
             match codegraph::sync(&target_dir) {
                 Ok(out) => {
                     println!("done.");
-                    if !out.is_empty() { println!("{out}"); }
+                    if !out.is_empty() {
+                        println!("{out}");
+                    }
                 }
                 Err(e) => {
                     println!("failed.");
@@ -926,7 +1087,9 @@ fn run_index(
             match codegraph::init_and_index(&target_dir) {
                 Ok(out) => {
                     println!("done.");
-                    if !out.is_empty() { println!("{out}"); }
+                    if !out.is_empty() {
+                        println!("{out}");
+                    }
                 }
                 Err(e) => {
                     println!("failed.");
@@ -958,10 +1121,13 @@ fn run_index(
     // --- 4. Persist into sempkg.toml (workspace-scoped, primary path) -----
     if let Ok(mut mf) = manifest::load_manifest(toml_dir) {
         if !mf.packages.contains_key(&name) {
-            mf.packages.insert(name.clone(), manifest::PackageEntry {
-                path: target_dir.to_string_lossy().into_owned(),
-                description: String::new(),
-            });
+            mf.packages.insert(
+                name.clone(),
+                manifest::PackageEntry {
+                    path: target_dir.to_string_lossy().into_owned(),
+                    description: String::new(),
+                },
+            );
             manifest::save_manifest(&mf, toml_dir)?;
             println!("  Added [packages.{name}] to sempkg.toml.");
         } else {
@@ -995,7 +1161,11 @@ fn run_pkg(cmd: PkgCommands) -> Result<()> {
             } else {
                 println!("Local packages:");
                 for pkg in pkgs {
-                    let idx = if pkg.is_indexed() { "indexed" } else { "NOT indexed" };
+                    let idx = if pkg.is_indexed() {
+                        "indexed"
+                    } else {
+                        "NOT indexed"
+                    };
                     let desc = if pkg.description.is_empty() {
                         String::new()
                     } else {
@@ -1007,7 +1177,11 @@ fn run_pkg(cmd: PkgCommands) -> Result<()> {
             Ok(())
         }
 
-        PkgCommands::Add { name, path, description } => {
+        PkgCommands::Add {
+            name,
+            path,
+            description,
+        } => {
             let mut reg = PackageRegistry::load()?;
             reg.add(&name, &path, &description)?;
             let pkg = reg.get(&name).unwrap();
@@ -1020,7 +1194,9 @@ fn run_pkg(cmd: PkgCommands) -> Result<()> {
                 match codegraph::init_and_index(&pkg.abs_path()) {
                     Ok(out) => {
                         println!("done.");
-                        if !out.is_empty() { println!("{out}"); }
+                        if !out.is_empty() {
+                            println!("{out}");
+                        }
                     }
                     Err(e) => {
                         println!("failed.");
@@ -1044,7 +1220,9 @@ fn run_pkg(cmd: PkgCommands) -> Result<()> {
 
         PkgCommands::Reindex { name } => {
             let reg = PackageRegistry::load()?;
-            let pkg = reg.get(&name).with_context(|| format!("Package '{name}' not found."))?;
+            let pkg = reg
+                .get(&name)
+                .with_context(|| format!("Package '{name}' not found."))?;
             print!("Reindexing '{}' ... ", pkg.path);
             std::io::Write::flush(&mut std::io::stdout())?;
             let out = if pkg.is_indexed() {
@@ -1053,20 +1231,26 @@ fn run_pkg(cmd: PkgCommands) -> Result<()> {
                 codegraph::init_and_index(&pkg.abs_path())?
             };
             println!("done.");
-            if !out.is_empty() { println!("{out}"); }
+            if !out.is_empty() {
+                println!("{out}");
+            }
             Ok(())
         }
 
         PkgCommands::Status { name } => {
             let reg = PackageRegistry::load()?;
-            let pkg = reg.get(&name).with_context(|| format!("Package '{name}' not found."))?;
+            let pkg = reg
+                .get(&name)
+                .with_context(|| format!("Package '{name}' not found."))?;
             println!("{}", codegraph::status(&pkg.abs_path())?);
             Ok(())
         }
 
         PkgCommands::LanceIndex { name, pattern } => {
             let reg = PackageRegistry::load()?;
-            let pkg = reg.get(&name).with_context(|| format!("Package '{name}' not found."))?;
+            let pkg = reg
+                .get(&name)
+                .with_context(|| format!("Package '{name}' not found."))?;
             println!(
                 "Building LanceDB index for '{name}' (pattern: {pattern})\n\
                  Index stored at: {}/.sempkg/lance/",
@@ -1133,7 +1317,7 @@ fn add_from_github(
             resolved.package_name, resolved.version
         );
         // Still write to manifest/lock if not already there
-        record_github_dep(workspace_dir, &resolved, &src, group, None, full_clone)?;;
+        record_github_dep(workspace_dir, &resolved, &src, group, None, full_clone)?;
         return Ok(());
     }
 
@@ -1181,10 +1365,7 @@ fn add_from_github(
         Some(sub) => {
             let sub_path = root.join(sub);
             if !sub_path.is_dir() {
-                anyhow::bail!(
-                    "Subdir '{}' not found in the repository archive.",
-                    sub
-                );
+                anyhow::bail!("Subdir '{}' not found in the repository archive.", sub);
             }
             sub_path
         }
@@ -1211,7 +1392,11 @@ fn add_from_github(
         version: resolved.version.clone(),
         source_repo: resolved.source_repo_url.clone(),
         commit_hash: resolved.commit_sha.clone(),
-        tag: if resolved.is_tag { Some(resolved.git_ref.clone()) } else { None },
+        tag: if resolved.is_tag {
+            Some(resolved.git_ref.clone())
+        } else {
+            None
+        },
         language,
         codegraph_version: cg_version,
         output_path: Some(bundle_output.clone()),
@@ -1231,8 +1416,8 @@ fn add_from_github(
     bytes = std::fs::read(&bundle_output)
         .with_context(|| format!("Cannot read built bundle at {}", bundle_output.display()))?;
     source_label = format!(
-        "github:{}/{}@{}",
-        resolved.owner, resolved.repo, resolved.git_ref
+        "github:{}/{}/{}@{}",
+        resolved.host, resolved.owner, resolved.repo, resolved.git_ref
     );
 
     install_github_bundle(
@@ -1282,7 +1467,14 @@ fn install_github_bundle(
         if info.has_lance() { "  +lance" } else { "" }
     );
 
-    record_github_dep(workspace_dir, resolved, src, group, Some(&sha256), full_clone)
+    record_github_dep(
+        workspace_dir,
+        resolved,
+        src,
+        group,
+        Some(&sha256),
+        full_clone,
+    )
 }
 
 fn record_github_dep(
@@ -1299,7 +1491,11 @@ fn record_github_dep(
         version: resolved.version.clone(),
         registry: None,
         url: None,
-        git: Some(format!("github:{}/{}", resolved.owner, resolved.repo)),
+        git: Some(format_manifest_git_source(
+            &resolved.host,
+            &resolved.owner,
+            &resolved.repo,
+        )),
         git_ref: src.git_ref.clone(),
         subdir: src.subdir.clone(),
         full: full_clone,
@@ -1313,7 +1509,11 @@ fn record_github_dep(
         lock.upsert(manifest::LockEntry {
             name: resolved.package_name.clone(),
             version: resolved.version.clone(),
-            registry_url: format!("github:{}/{}", resolved.owner, resolved.repo),
+            registry_url: format_manifest_git_source(
+                &resolved.host,
+                &resolved.owner,
+                &resolved.repo,
+            ),
             sha256: sha.to_owned(),
             signed: false,
             manifest_checksums: Default::default(),
@@ -1360,6 +1560,33 @@ fn parse_spec(spec: &str) -> Result<(&str, &str)> {
         .ok_or_else(|| anyhow::anyhow!("Invalid spec '{spec}'. Expected format: name@version"))
 }
 
+/// Parse persisted git source notation from sempkg.toml.
+///
+/// Supported forms:
+/// - `github:owner/repo` (legacy, implies github.com)
+/// - `github:host/owner/repo` (enterprise-capable)
+fn parse_manifest_git_source(git: &str) -> Option<(String, String, String)> {
+    let raw = git.strip_prefix("github:")?;
+    let parts: Vec<&str> = raw.split('/').collect();
+    match parts.as_slice() {
+        [owner, repo] => Some((
+            "github.com".to_owned(),
+            (*owner).to_owned(),
+            (*repo).to_owned(),
+        )),
+        [host, owner, repo] => Some(((*host).to_owned(), (*owner).to_owned(), (*repo).to_owned())),
+        _ => None,
+    }
+}
+
+fn format_manifest_git_source(host: &str, owner: &str, repo: &str) -> String {
+    if host.eq_ignore_ascii_case("github.com") {
+        format!("github:{owner}/{repo}")
+    } else {
+        format!("github:{host}/{owner}/{repo}")
+    }
+}
+
 /// Resolve a package name to its codegraph project path.
 fn resolve_codegraph_path(name: &str, workspace: Option<&Path>) -> Result<PathBuf> {
     let reg = PackageRegistry::load()?;
@@ -1375,10 +1602,7 @@ fn resolve_codegraph_path(name: &str, workspace: Option<&Path>) -> Result<PathBu
 
     if let Some(bundle) = resolve_bundle(name, workspace) {
         if !bundle.is_indexed() {
-            anyhow::bail!(
-                "Bundle '{name}@{}' has no codegraph index.",
-                bundle.version
-            );
+            anyhow::bail!("Bundle '{name}@{}' has no codegraph index.", bundle.version);
         }
         return Ok(bundle.bundle_dir);
     }

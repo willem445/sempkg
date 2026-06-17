@@ -66,14 +66,22 @@ struct RpcError {
 
 impl RpcResponse {
     fn ok(id: Value, result: Value) -> Self {
-        Self { jsonrpc: "2.0", id, result: Some(result), error: None }
+        Self {
+            jsonrpc: "2.0",
+            id,
+            result: Some(result),
+            error: None,
+        }
     }
     fn err(id: Value, code: i32, message: impl Into<String>) -> Self {
         Self {
             jsonrpc: "2.0",
             id,
             result: None,
-            error: Some(RpcError { code, message: message.into() }),
+            error: Some(RpcError {
+                code,
+                message: message.into(),
+            }),
         }
     }
 }
@@ -82,12 +90,7 @@ impl RpcResponse {
 // Tool definitions
 // ---------------------------------------------------------------------------
 
-fn tool_schema(
-    name: &str,
-    description: &str,
-    properties: Value,
-    required: &[&str],
-) -> Value {
+fn tool_schema(name: &str, description: &str, properties: Value, required: &[&str]) -> Value {
     json!({
         "name": name,
         "description": description,
@@ -217,8 +220,10 @@ impl McpContext {
             if cfg.enabled && reranker::model_is_present(cfg) {
                 match Reranker::load(cfg) {
                     Ok(r) => {
-                        eprintln!("sempkg: reranker loaded ({} top_k, {} output_n)",
-                            cfg.top_k, cfg.output_n);
+                        eprintln!(
+                            "sempkg: reranker loaded ({} top_k, {} output_n)",
+                            cfg.top_k, cfg.output_n
+                        );
                         Some(r)
                     }
                     Err(e) => {
@@ -302,11 +307,18 @@ impl McpContext {
             return Ok(bundle.bundle_dir.join("lance"));
         }
 
-        Err(format!("'{name}' not found. Use 'sempkg list' to see available packages and bundles."))
+        Err(format!(
+            "'{name}' not found. Use 'sempkg list' to see available packages and bundles."
+        ))
     }
 
     fn available_names(&self) -> Vec<String> {
-        let mut names: Vec<String> = self.registry.list().iter().map(|p| p.name.clone()).collect();
+        let mut names: Vec<String> = self
+            .registry
+            .list()
+            .iter()
+            .map(|p| p.name.clone())
+            .collect();
         names.extend(
             list_all_bundles(self.workspace().map(|p| p.as_path()))
                 .into_iter()
@@ -331,17 +343,34 @@ impl McpContext {
         if !local_pkgs.is_empty() {
             lines.push("**Local packages:**".to_string());
             for pkg in &local_pkgs {
-                let idx = if pkg.is_indexed() { "indexed" } else { "NOT indexed" };
-                let desc = if pkg.description.is_empty() { String::new() } else { format!("  — {}", pkg.description) };
-                lines.push(format!("  • **{}** [{}]  {}{}", pkg.name, idx, pkg.path, desc));
+                let idx = if pkg.is_indexed() {
+                    "indexed"
+                } else {
+                    "NOT indexed"
+                };
+                let desc = if pkg.description.is_empty() {
+                    String::new()
+                } else {
+                    format!("  — {}", pkg.description)
+                };
+                lines.push(format!(
+                    "  • **{}** [{}]  {}{}",
+                    pkg.name, idx, pkg.path, desc
+                ));
             }
         }
 
         if !bundles.is_empty() {
-            if !local_pkgs.is_empty() { lines.push(String::new()); }
+            if !local_pkgs.is_empty() {
+                lines.push(String::new());
+            }
             lines.push("**Installed bundles:**".to_string());
             for b in &bundles {
-                let idx = if b.is_indexed() { "indexed" } else { "no graph" };
+                let idx = if b.is_indexed() {
+                    "indexed"
+                } else {
+                    "no graph"
+                };
                 let lance = if b.has_lance() { "  +lance" } else { "" };
                 let scope = match b.scope {
                     crate::store::BundleScope::Workspace => "workspace",
@@ -381,40 +410,41 @@ impl McpContext {
     fn tool_get_context(&self, package: &str, task: &str) -> String {
         match self.resolve_codegraph_path(package) {
             Err(e) => e,
-            Ok(path) => codegraph::context(&path, task)
-                .unwrap_or_else(|e| format!("Error: {e}")),
+            Ok(path) => codegraph::context(&path, task).unwrap_or_else(|e| format!("Error: {e}")),
         }
     }
 
     fn tool_get_callers(&self, package: &str, symbol: &str, limit: usize) -> String {
         match self.resolve_codegraph_path(package) {
             Err(e) => e,
-            Ok(path) => codegraph::callers(&path, symbol, limit)
-                .unwrap_or_else(|e| format!("Error: {e}")),
+            Ok(path) => {
+                codegraph::callers(&path, symbol, limit).unwrap_or_else(|e| format!("Error: {e}"))
+            }
         }
     }
 
     fn tool_get_callees(&self, package: &str, symbol: &str, limit: usize) -> String {
         match self.resolve_codegraph_path(package) {
             Err(e) => e,
-            Ok(path) => codegraph::callees(&path, symbol, limit)
-                .unwrap_or_else(|e| format!("Error: {e}")),
+            Ok(path) => {
+                codegraph::callees(&path, symbol, limit).unwrap_or_else(|e| format!("Error: {e}"))
+            }
         }
     }
 
     fn tool_get_impact(&self, package: &str, symbol: &str, depth: usize) -> String {
         match self.resolve_codegraph_path(package) {
             Err(e) => e,
-            Ok(path) => codegraph::impact(&path, symbol, depth)
-                .unwrap_or_else(|e| format!("Error: {e}")),
+            Ok(path) => {
+                codegraph::impact(&path, symbol, depth).unwrap_or_else(|e| format!("Error: {e}"))
+            }
         }
     }
 
     fn tool_list_files(&self, package: &str, filter: Option<&str>) -> String {
         match self.resolve_codegraph_path(package) {
             Err(e) => e,
-            Ok(path) => codegraph::files(&path, filter)
-                .unwrap_or_else(|e| format!("Error: {e}")),
+            Ok(path) => codegraph::files(&path, filter).unwrap_or_else(|e| format!("Error: {e}")),
         }
     }
 
@@ -544,7 +574,9 @@ impl McpContext {
     fn dispatch_tool(&self, name: &str, args: &Value) -> String {
         let str_arg = |key: &str| args.get(key).and_then(|v| v.as_str()).unwrap_or_default();
         let int_arg = |key: &str, default: usize| {
-            args.get(key).and_then(|v| v.as_u64()).unwrap_or(default as u64) as usize
+            args.get(key)
+                .and_then(|v| v.as_u64())
+                .unwrap_or(default as u64) as usize
         };
         let opt_str = |key: &str| args.get(key).and_then(|v| v.as_str());
 
@@ -557,27 +589,19 @@ impl McpContext {
                 int_arg("limit", 20),
             ),
             "get_context" => self.tool_get_context(str_arg("package"), str_arg("task")),
-            "get_callers" => self.tool_get_callers(
-                str_arg("package"),
-                str_arg("symbol"),
-                int_arg("limit", 20),
-            ),
-            "get_callees" => self.tool_get_callees(
-                str_arg("package"),
-                str_arg("symbol"),
-                int_arg("limit", 20),
-            ),
-            "get_impact" => self.tool_get_impact(
-                str_arg("package"),
-                str_arg("symbol"),
-                int_arg("depth", 3),
-            ),
+            "get_callers" => {
+                self.tool_get_callers(str_arg("package"), str_arg("symbol"), int_arg("limit", 20))
+            }
+            "get_callees" => {
+                self.tool_get_callees(str_arg("package"), str_arg("symbol"), int_arg("limit", 20))
+            }
+            "get_impact" => {
+                self.tool_get_impact(str_arg("package"), str_arg("symbol"), int_arg("depth", 3))
+            }
             "list_files" => self.tool_list_files(str_arg("package"), opt_str("filter")),
-            "search_docs" => self.tool_search_docs(
-                str_arg("package"),
-                str_arg("query"),
-                int_arg("limit", 10),
-            ),
+            "search_docs" => {
+                self.tool_search_docs(str_arg("package"), str_arg("query"), int_arg("limit", 10))
+            }
             "docs_metadata" => self.tool_docs_metadata(str_arg("package")),
             _ => format!("Unknown tool: {name}"),
         }
@@ -633,34 +657,34 @@ fn handle_message(ctx: &McpContext, line: &str) -> Option<RpcResponse> {
     };
 
     match req.method.as_str() {
-        "initialize" => {
-            Some(RpcResponse::ok(
-                id,
-                json!({
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": {
-                        "tools": {}
-                    },
-                    "serverInfo": {
-                        "name": "sempkg",
-                        "version": env!("CARGO_PKG_VERSION")
-                    },
-                    "instructions": "sempkg exposes CodeGraph and QMD intelligence for registered packages and installed bundles. All queries are package-scoped. Start with list_packages to discover available packages and bundles."
-                }),
-            ))
-        }
+        "initialize" => Some(RpcResponse::ok(
+            id,
+            json!({
+                "protocolVersion": "2024-11-05",
+                "capabilities": {
+                    "tools": {}
+                },
+                "serverInfo": {
+                    "name": "sempkg",
+                    "version": env!("CARGO_PKG_VERSION")
+                },
+                "instructions": "sempkg exposes CodeGraph and QMD intelligence for registered packages and installed bundles. All queries are package-scoped. Start with list_packages to discover available packages and bundles."
+            }),
+        )),
 
         "notifications/initialized" => {
             // No response required for notifications
             None
         }
 
-        "tools/list" => {
-            Some(RpcResponse::ok(id, json!({ "tools": all_tools() })))
-        }
+        "tools/list" => Some(RpcResponse::ok(id, json!({ "tools": all_tools() }))),
 
         "tools/call" => {
-            let tool_name = req.params.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let tool_name = req
+                .params
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let args = req.params.get("arguments").cloned().unwrap_or(json!({}));
 
             let text = ctx.dispatch_tool(tool_name, &args);
@@ -675,6 +699,10 @@ fn handle_message(ctx: &McpContext, line: &str) -> Option<RpcResponse> {
 
         "ping" => Some(RpcResponse::ok(id, json!({}))),
 
-        _ => Some(RpcResponse::err(id, -32601, format!("Method not found: {}", req.method))),
+        _ => Some(RpcResponse::err(
+            id,
+            -32601,
+            format!("Method not found: {}", req.method),
+        )),
     }
 }

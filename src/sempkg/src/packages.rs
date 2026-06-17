@@ -68,10 +68,9 @@ impl PackageRegistry {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("Cannot create directory: {}", parent.display()))?;
         }
-        let text = serde_json::to_string_pretty(&self.packages)
-            .context("Failed to serialize packages")?;
-        std::fs::write(&path, text)
-            .with_context(|| format!("Failed to write {}", path.display()))
+        let text =
+            serde_json::to_string_pretty(&self.packages).context("Failed to serialize packages")?;
+        std::fs::write(&path, text).with_context(|| format!("Failed to write {}", path.display()))
     }
 
     pub fn add(&mut self, name: &str, path: &Path, description: &str) -> Result<&LocalPackage> {

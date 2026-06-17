@@ -25,7 +25,6 @@ pub enum Commands {
     // -----------------------------------------------------------------------
     // Workspace / bundle management
     // -----------------------------------------------------------------------
-
     /// Initialise a new sempkg.toml in the current (or specified) directory.
     Init {
         /// Registry URL to add to the manifest.
@@ -195,7 +194,6 @@ pub enum Commands {
     // -----------------------------------------------------------------------
     // Local package management (for codegraph indexing of local repos)
     // -----------------------------------------------------------------------
-
     /// Manage locally registered source packages.
     #[command(subcommand)]
     Pkg(PkgCommands),
@@ -203,7 +201,6 @@ pub enum Commands {
     // -----------------------------------------------------------------------
     // CodeGraph queries (scoped to one package)
     // -----------------------------------------------------------------------
-
     /// Search for symbols in a package.
     Search {
         /// Package or bundle name.
@@ -269,7 +266,6 @@ pub enum Commands {
     // -----------------------------------------------------------------------
     // LanceDB documentation search
     // -----------------------------------------------------------------------
-
     /// Search the LanceDB documentation index of a bundle.
     Docs {
         /// Bundle name.
@@ -284,7 +280,6 @@ pub enum Commands {
     // -----------------------------------------------------------------------
     // Hybrid search  (BM25 + reranking)
     // -----------------------------------------------------------------------
-
     /// Hybrid search: CodeGraph symbols + LanceDB docs + Qwen3-Reranker.
     ///
     /// Fetches candidates from both backends, merges the pool, and scores every
@@ -333,14 +328,12 @@ pub enum Commands {
     // -----------------------------------------------------------------------
     // MCP server
     // -----------------------------------------------------------------------
-
     /// Start the MCP server (JSON-RPC 2.0 over stdio).
     Mcp,
 
     // -----------------------------------------------------------------------
     // Local LLM reranker management
     // -----------------------------------------------------------------------
-
     /// Manage the optional Qwen3-Reranker-1.7B GGUF model.
     #[command(subcommand)]
     Reranker(RerankerCommands),
@@ -360,19 +353,13 @@ pub enum PkgCommands {
     },
 
     /// Remove a registered local package (does not delete files or index).
-    Remove {
-        name: String,
-    },
+    Remove { name: String },
 
     /// Reindex a registered package to pick up new commits.
-    Reindex {
-        name: String,
-    },
+    Reindex { name: String },
 
     /// Show codegraph index status for a registered package.
-    Status {
-        name: String,
-    },
+    Status { name: String },
 
     /// List all registered local packages.
     List,

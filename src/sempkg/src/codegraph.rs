@@ -25,17 +25,17 @@ fn run(args: &[&str], cwd: Option<&Path>) -> Result<String> {
         cmd.current_dir(dir);
     }
 
-    let out = cmd.output()
+    let out = cmd
+        .output()
         .with_context(|| format!("Failed to run codegraph with args: {args:?}"))?;
 
     let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
     let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
 
     if !out.status.success() {
-        return Err(SempkgError::CodegraphError(
-            if !stderr.is_empty() { stderr } else { stdout },
-        )
-        .into());
+        return Err(
+            SempkgError::CodegraphError(if !stderr.is_empty() { stderr } else { stdout }).into(),
+        );
     }
 
     Ok(if !stdout.is_empty() { stdout } else { stderr })
@@ -47,20 +47,17 @@ fn run(args: &[&str], cwd: Option<&Path>) -> Result<String> {
 
 /// Run `codegraph init --index <path>` to initialise and index a project.
 pub fn init_and_index(path: &Path) -> Result<String> {
-    run(&["init", "--index", &path.to_string_lossy()], None)
-        .context("codegraph init failed")
+    run(&["init", "--index", &path.to_string_lossy()], None).context("codegraph init failed")
 }
 
 /// Run `codegraph sync <path>` to incrementally update an existing index.
 pub fn sync(path: &Path) -> Result<String> {
-    run(&["sync", &path.to_string_lossy()], None)
-        .context("codegraph sync failed")
+    run(&["sync", &path.to_string_lossy()], None).context("codegraph sync failed")
 }
 
 /// Run `codegraph status <path>`.
 pub fn status(path: &Path) -> Result<String> {
-    run(&["status", &path.to_string_lossy()], None)
-        .context("codegraph status failed")
+    run(&["status", &path.to_string_lossy()], None).context("codegraph status failed")
 }
 
 // ---------------------------------------------------------------------------

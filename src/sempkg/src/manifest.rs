@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use toml_edit::{DocumentMut, InlineTable, Item, Table, Value, value};
+use toml_edit::{value, DocumentMut, InlineTable, Item, Table, Value};
 
 pub const MANIFEST_FILE: &str = "sempkg.toml";
 pub const LOCK_FILE: &str = "sempkg.lock";
@@ -330,8 +330,8 @@ pub fn load_lock(workspace_dir: &Path) -> Result<LockFile> {
     if !path.exists() {
         return Ok(LockFile::default());
     }
-    let text = std::fs::read_to_string(&path)
-        .with_context(|| format!("Failed to read {LOCK_FILE}"))?;
+    let text =
+        std::fs::read_to_string(&path).with_context(|| format!("Failed to read {LOCK_FILE}"))?;
     toml::from_str(&text).with_context(|| format!("Failed to parse {LOCK_FILE}"))
 }
 
@@ -346,7 +346,10 @@ pub fn save_lock(lock: &LockFile, workspace_dir: &Path) -> Result<()> {
 pub fn init_manifest(workspace_dir: &Path, registry_url: Option<&str>) -> Result<()> {
     let manifest_path = workspace_dir.join(MANIFEST_FILE);
     if manifest_path.exists() {
-        anyhow::bail!("{MANIFEST_FILE} already exists at {}", workspace_dir.display());
+        anyhow::bail!(
+            "{MANIFEST_FILE} already exists at {}",
+            workspace_dir.display()
+        );
     }
 
     let mut manifest = WorkspaceManifest::default();
@@ -367,7 +370,7 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::{DependencyEntry, WorkspaceManifest, load_manifest, save_manifest};
+    use super::{load_manifest, save_manifest, DependencyEntry, WorkspaceManifest};
 
     #[test]
     fn save_manifest_preserves_reranker_table() {
@@ -395,8 +398,8 @@ mod tests {
 
         save_manifest(&manifest, dir.path()).expect("save manifest");
 
-        let saved = fs::read_to_string(dir.path().join(super::MANIFEST_FILE))
-            .expect("read manifest");
+        let saved =
+            fs::read_to_string(dir.path().join(super::MANIFEST_FILE)).expect("read manifest");
         assert!(saved.contains("[reranker]"));
         assert!(saved.contains("top_k = 42"));
         assert!(saved.contains("output_n = 7"));
@@ -404,7 +407,10 @@ mod tests {
         let loaded = load_manifest(dir.path()).expect("load manifest");
         let reranker = loaded.reranker.expect("reranker section present");
         assert!(reranker.enabled);
-        assert_eq!(reranker.model.as_deref(), Some("~/.sempkg/models/custom.gguf"));
+        assert_eq!(
+            reranker.model.as_deref(),
+            Some("~/.sempkg/models/custom.gguf")
+        );
         assert_eq!(reranker.top_k, 42);
         assert_eq!(reranker.output_n, 7);
     }

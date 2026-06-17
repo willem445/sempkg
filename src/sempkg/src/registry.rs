@@ -52,12 +52,14 @@ impl RegistryClient {
     /// Fetch and parse `<base>/index.json`.
     pub fn fetch_index(&self) -> Result<RegistryIndex> {
         let url = format!("{}/index.json", self.base_url);
-        let resp = self.client.get(&url).send().with_context(|| {
-            SempkgError::RegistryError {
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .with_context(|| SempkgError::RegistryError {
                 url: url.clone(),
                 message: "Failed to connect".to_string(),
-            }
-        })?;
+            })?;
 
         if !resp.status().is_success() {
             return Err(SempkgError::RegistryError {
@@ -67,7 +69,8 @@ impl RegistryClient {
             .into());
         }
 
-        resp.json::<RegistryIndex>().context("Failed to parse registry index")
+        resp.json::<RegistryIndex>()
+            .context("Failed to parse registry index")
     }
 
     /// Download a bundle archive, verify SHA-256, and return raw bytes.
@@ -96,7 +99,9 @@ impl RegistryClient {
             .into());
         }
 
-        let bytes = resp.bytes().context("Failed to read bundle response body")?;
+        let bytes = resp
+            .bytes()
+            .context("Failed to read bundle response body")?;
         let bytes = bytes.to_vec();
 
         if let Some(expected) = expected_sha256 {
@@ -205,7 +210,10 @@ pub fn download_from_url(url: &str, expected_sha256: Option<&str>) -> Result<Vec
         .into());
     }
 
-    let bytes = resp.bytes().context("Failed to read response body")?.to_vec();
+    let bytes = resp
+        .bytes()
+        .context("Failed to read response body")?
+        .to_vec();
 
     if let Some(expected) = expected_sha256 {
         let actual = hex::encode(Sha256::digest(&bytes));
