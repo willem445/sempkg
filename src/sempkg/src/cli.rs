@@ -81,8 +81,14 @@ pub enum Commands {
     ///
     /// Example: sempkg add aws-sdk@1.11.210 --registry https://reg.example.com
     /// Example: sempkg add mylib@2.0.0 --url https://github.com/owner/repo/releases/download/v2.0.0/mylib-2.0.0.sembundle
+    /// Example: sempkg add pandas-dev/pandas@v2.2.2
+    /// Example: sempkg add https://github.com/pandas-dev/pandas/tree/v2.2.2
+    ///
+    /// When a GitHub source is provided, sempkg immediately fetches, builds,
+    /// and installs the bundle into the workspace (no separate `sync` needed).
     Add {
-        /// Package spec in `name@version` format.
+        /// Package spec in `name@version` format, GitHub shorthand `owner/repo@ref`,
+        /// or a full GitHub URL.
         spec: String,
 
         /// Override the registry URL for this dependency.
@@ -101,6 +107,30 @@ pub enum Commands {
         /// Add to a named dependency group instead of [dependencies].
         #[arg(long, short = 'g')]
         group: Option<String>,
+
+        /// Force the full build path even when a release `.sembundle` asset exists.
+        #[arg(long)]
+        build: bool,
+
+        /// Re-build and reinstall even if this bundle version is already installed.
+        #[arg(long)]
+        reinstall: bool,
+
+        /// Perform a shallow git clone instead of downloading a tar.gz archive.
+        ///
+        /// Use this when the repo's GitHub archive is export-filtered and omits docs
+        /// (like pandas, CPython, etc.). Requires `git` on PATH. The clone is
+        /// single-branch and shallow (--depth 1) so it is still fast.
+        #[arg(long)]
+        full: bool,
+
+        /// Override the package name derived from the repo name.
+        #[arg(long)]
+        name: Option<String>,
+
+        /// Override the version derived from the git ref.
+        #[arg(long, short = 'v')]
+        version: Option<String>,
     },
 
     /// Remove a bundle dependency from sempkg.toml (from [dependencies] or a group).

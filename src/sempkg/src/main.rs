@@ -1,6 +1,7 @@
 mod cli;
 mod codegraph;
 mod error;
+mod github;
 mod manifest;
 mod mcp;
 mod packages;
@@ -115,8 +116,25 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
         // -----------------------------------------------------------------------
         // Add dependency to manifest
         // -----------------------------------------------------------------------
-        Commands::Add { spec, registry_url, registry, group, url } => {
+        Commands::Add { spec, registry_url, registry, group, url, build, reinstall, full, name: name_override, version: version_override } => {
             let dir = require_workspace(workspace)?;
+
+            // Check if this is a GitHub source first
+            if let Some(gh_src) = github::parse_source(&spec) {
+                return add_from_github(
+                    gh_src,
+                    dir,
+                    group.as_deref(),
+                    build,
+                    reinstall,
+                    full,
+                    name_override.as_deref(),
+                    version_override.as_deref(),
+                    workspace,
+                );
+            }
+
+            // --- Existing registry / URL path (unchanged) ---
             let (name, version) = parse_spec(&spec)?;
 
             let mut mf = manifest::load_manifest(dir)?;
@@ -127,6 +145,10 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
                     version: version.to_string(),
                     registry: None,
                     url: Some(direct_url),
+                    git: None,
+                    git_ref: None,
+                    subdir: None,
+                    full: false,
                 };
                 insert_dep(&mut mf, name, dep, group.as_deref());
             } else if let Some(url) = &registry_url {
@@ -139,21 +161,20 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
                         url: url.to_string(),
                     });
                 }
-                let dep = DependencyEntry { version: version.to_string(), registry: Some(reg_name), url: None };
+                let dep = DependencyEntry { version: version.to_string(), registry: Some(reg_name), url: None, git: None, git_ref: None, subdir: None, full: false };
                 insert_dep(&mut mf, name, dep, group.as_deref());
             } else {
                 if mf.registries.is_empty() {
                     anyhow::bail!(
                         "No registries defined in sempkg.toml. \
                          Use --registry-url to add one: sempkg add --registry-url <url> {spec}\n\
-                         Or use --url to add a direct download URL: sempkg add --url <url> {spec}"
+                         Or use --url to add a direct download URL: sempkg add --url <url> {spec}\n\
+                         Or install directly from GitHub: sempkg add owner/repo@ref"
                     );
                 }
-                // Resolve the registry name: use --registry if given, otherwise
-                // default to the first defined registry so the saved TOML is explicit.
                 let resolved_registry = registry
                     .or_else(|| mf.default_registry().map(|r| r.name.clone()));
-                let dep = DependencyEntry { version: version.to_string(), registry: resolved_registry, url: None };
+                let dep = DependencyEntry { version: version.to_string(), registry: resolved_registry, url: None, git: None, git_ref: None, subdir: None, full: false };
                 insert_dep(&mut mf, name, dep, group.as_deref());
             }
 
@@ -236,6 +257,28 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
                     continue;
                 }
 
+                // GitHub-sourced dependency — re-run the build flow
+                if dep.git.is_some() {
+                    let gh_src = github::GitHubSource {
+                        owner: dep.git
+                            .as_deref()
+                            .and_then(|g| g.strip_prefix("github:"))
+                            .and_then(|s| s.split_once('/').map(|(o, _)| o.to_owned()))
+                            .unwrap_or_default(),
+                        repo: dep.git
+                            .as_deref()
+                            .and_then(|g| g.strip_prefix("github:"))
+                            .and_then(|s| s.split_once('/').map(|(_, r)| r.to_owned()))
+                            .unwrap_or_default(),
+                        git_ref: dep.git_ref.clone().or_else(|| Some(dep.version.clone())),
+                        subdir: dep.subdir.clone(),
+                    };
+                    let full = dep.full;
+                    println!("  Syncing {dep_name} from {} ...", dep.git.as_deref().unwrap_or("github"));
+                    add_from_github(gh_src, dir, None, false, reinstall, full, Some(dep_name), None, workspace)?;
+                    continue;
+                }
+
                 let bytes: Vec<u8>;
                 let source_label: String;
 
@@ -277,6 +320,7 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
                     sha256: hex::encode(Sha256::digest(&bytes)),
                     signed: verify_key.is_some() && dep.url.is_none(),
                     manifest_checksums: info.manifest.checksums.clone(),
+                    commit_sha: None,
                 });
                 installed.push(format!("{dep_name}@{}", dep.version));
             }
@@ -1046,6 +1090,252 @@ fn run_pkg(cmd: PkgCommands) -> Result<()> {
 
 fn require_workspace(workspace: Option<&Path>) -> Result<&Path> {
     workspace.ok_or_else(|| anyhow::anyhow!("Could not determine workspace directory."))
+}
+
+// ---------------------------------------------------------------------------
+// GitHub add-from-source orchestration
+// ---------------------------------------------------------------------------
+
+/// Fetch, build (or download a release asset), and install a bundle from a
+/// GitHub source. Records the dependency in `sempkg.toml` and `sempkg.lock`.
+#[allow(clippy::too_many_arguments)]
+fn add_from_github(
+    src: github::GitHubSource,
+    workspace_dir: &Path,
+    group: Option<&str>,
+    force_build: bool,
+    reinstall: bool,
+    full_clone: bool,
+    name_override: Option<&str>,
+    version_override: Option<&str>,
+    workspace: Option<&Path>,
+) -> Result<()> {
+    let token = github::github_token();
+    let token_ref = token.as_deref();
+
+    // 1. Resolve the ref to a full commit SHA
+    eprintln!("[sempkg] Resolving {}/{} ...", src.owner, src.repo);
+    let mut resolved = github::resolve(&src, token_ref)?;
+
+    // Allow name/version overrides
+    if let Some(n) = name_override {
+        resolved.package_name = n.to_owned();
+    }
+    if let Some(v) = version_override {
+        resolved.version = v.to_owned();
+    }
+
+    let store = BundleStore::workspace(workspace_dir);
+
+    // Check if already installed
+    if !reinstall && store.is_installed(&resolved.package_name, &resolved.version) {
+        println!(
+            "{}@{} is already installed. Use --reinstall to rebuild.",
+            resolved.package_name, resolved.version
+        );
+        // Still write to manifest/lock if not already there
+        record_github_dep(workspace_dir, &resolved, &src, group, None, full_clone)?;;
+        return Ok(());
+    }
+
+    // 2. Fast path: check for a release asset
+    let bytes: Vec<u8>;
+    let source_label: String;
+    let sig_url: Option<String>;
+
+    if !force_build {
+        if let Some(asset) = github::find_release_bundle_asset(&resolved, token_ref)? {
+            eprintln!(
+                "[sempkg] Found .sembundle release asset for {}@{} — downloading ...",
+                resolved.package_name, resolved.version
+            );
+            bytes = registry::download_from_url(&asset.bundle_url, None)?;
+            source_label = asset.bundle_url.clone();
+            sig_url = asset.sig_url;
+            // Install fast path
+            return install_github_bundle(
+                bytes,
+                sig_url.as_deref(),
+                source_label,
+                &resolved,
+                &src,
+                workspace_dir,
+                group,
+                store,
+                false, // release asset — full_clone does not apply
+            );
+        }
+    }
+
+    // 3. Build path: download tarball or full clone, extract, build
+    let tmp = tempfile::TempDir::new().context("Failed to create temp directory")?;
+
+    let root = if full_clone {
+        github::git_clone_at_ref(&resolved, tmp.path())?
+    } else {
+        let archive_url = github::archive_tarball_url(&resolved);
+        github::download_and_extract_tarball(&archive_url, token_ref, tmp.path())?
+    };
+
+    // Apply subdir scoping if requested
+    let source_root = match &src.subdir {
+        Some(sub) => {
+            let sub_path = root.join(sub);
+            if !sub_path.is_dir() {
+                anyhow::bail!(
+                    "Subdir '{}' not found in the repository archive.",
+                    sub
+                );
+            }
+            sub_path
+        }
+        None => root.clone(),
+    };
+
+    // Detect language
+    let language = github::detect_language(&source_root);
+    let cg_version = codegraph::version();
+
+    eprintln!(
+        "[sempkg] Building bundle for {}@{} (language: {language}, codegraph: {cg_version}) ...",
+        resolved.package_name, resolved.version
+    );
+
+    // Build the bundle
+    let bundle_output = tmp.path().join(format!(
+        "{}-{}.sembundle",
+        resolved.package_name, resolved.version
+    ));
+
+    let build_opts = sembundle::BuildOptions {
+        name: resolved.package_name.clone(),
+        version: resolved.version.clone(),
+        source_repo: resolved.source_repo_url.clone(),
+        commit_hash: resolved.commit_sha.clone(),
+        tag: if resolved.is_tag { Some(resolved.git_ref.clone()) } else { None },
+        language,
+        codegraph_version: cg_version,
+        output_path: Some(bundle_output.clone()),
+        source_dirs: vec![source_root.clone()],
+        docs_dirs: vec![source_root.clone()],
+        docs_glob: None,
+    };
+
+    sembundle::build(build_opts).with_context(|| {
+        format!(
+            "Failed to build bundle for {}@{}. \
+             Ensure `codegraph` is on your PATH.",
+            resolved.package_name, resolved.version
+        )
+    })?;
+
+    bytes = std::fs::read(&bundle_output)
+        .with_context(|| format!("Cannot read built bundle at {}", bundle_output.display()))?;
+    source_label = format!(
+        "github:{}/{}@{}",
+        resolved.owner, resolved.repo, resolved.git_ref
+    );
+
+    install_github_bundle(
+        bytes,
+        None,
+        source_label,
+        &resolved,
+        &src,
+        workspace_dir,
+        group,
+        store,
+        full_clone,
+    )
+}
+
+fn install_github_bundle(
+    bytes: Vec<u8>,
+    _sig_url: Option<&str>,
+    source_label: String,
+    resolved: &github::ResolvedSource,
+    src: &github::GitHubSource,
+    workspace_dir: &Path,
+    group: Option<&str>,
+    store: BundleStore,
+    full_clone: bool,
+) -> Result<()> {
+    // Handle already-installed gracefully
+    let info = match store.install_bytes(&bytes) {
+        Ok(i) => i,
+        Err(e) if e.to_string().contains("already installed") => {
+            eprintln!("[sempkg] Bundle already installed, skipping extraction.");
+            // Load existing info
+            store
+                .get_version(&resolved.package_name, &resolved.version)
+                .ok_or_else(|| anyhow::anyhow!("Bundle installed but not found in store"))?
+        }
+        Err(e) => return Err(e),
+    };
+
+    let sha256 = hex::encode(sha2::Sha256::digest(&bytes));
+
+    println!(
+        "Installed {}@{} from {}{}",
+        info.name,
+        info.version,
+        source_label,
+        if info.has_lance() { "  +lance" } else { "" }
+    );
+
+    record_github_dep(workspace_dir, resolved, src, group, Some(&sha256), full_clone)
+}
+
+fn record_github_dep(
+    workspace_dir: &Path,
+    resolved: &github::ResolvedSource,
+    src: &github::GitHubSource,
+    group: Option<&str>,
+    sha256: Option<&str>,
+    full_clone: bool,
+) -> Result<()> {
+    let mut mf = manifest::load_manifest(workspace_dir)?;
+
+    let dep = manifest::DependencyEntry {
+        version: resolved.version.clone(),
+        registry: None,
+        url: None,
+        git: Some(format!("github:{}/{}", resolved.owner, resolved.repo)),
+        git_ref: src.git_ref.clone(),
+        subdir: src.subdir.clone(),
+        full: full_clone,
+    };
+    insert_dep(&mut mf, &resolved.package_name, dep, group);
+    manifest::save_manifest(&mf, workspace_dir)?;
+
+    // Update lock file
+    if let Some(sha) = sha256 {
+        let mut lock = manifest::load_lock(workspace_dir)?;
+        lock.upsert(manifest::LockEntry {
+            name: resolved.package_name.clone(),
+            version: resolved.version.clone(),
+            registry_url: format!("github:{}/{}", resolved.owner, resolved.repo),
+            sha256: sha.to_owned(),
+            signed: false,
+            manifest_checksums: Default::default(),
+            commit_sha: Some(resolved.commit_sha.clone()),
+        });
+        manifest::save_lock(&lock, workspace_dir)?;
+    }
+
+    if let Some(g) = group {
+        println!(
+            "Recorded {}@{} in group '{}' in sempkg.toml.",
+            resolved.package_name, resolved.version, g
+        );
+    } else {
+        println!(
+            "Recorded {}@{} in sempkg.toml.",
+            resolved.package_name, resolved.version
+        );
+    }
+
+    Ok(())
 }
 
 /// Insert a dependency into the manifest, either into [dependencies] or a named group.

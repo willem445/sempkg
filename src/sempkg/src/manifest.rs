@@ -57,6 +57,21 @@ pub struct DependencyEntry {
     /// Direct download URL for the bundle asset (e.g. a GitHub release URL).
     /// When set, `registry` is ignored and the bundle is fetched from this URL.
     pub url: Option<String>,
+    /// GitHub source shorthand, e.g. `"github:pandas-dev/pandas"`.
+    /// Set when this dependency was added via `sempkg add <github-url>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git: Option<String>,
+    /// The git ref originally requested (tag / branch / SHA).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_ref: Option<String>,
+    /// Optional repo-relative subdirectory (monorepo scoping).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subdir: Option<String>,
+    /// When true, `sempkg sync` will perform a full `git clone` instead of
+    /// downloading the GitHub-generated tar.gz archive.  Use for repos that
+    /// strip documentation from their archive via `.gitattributes export-ignore`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub full: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -161,6 +176,9 @@ pub struct LockEntry {
     pub signed: bool,
     #[serde(default)]
     pub manifest_checksums: BTreeMap<String, String>,
+    /// Resolved commit SHA for GitHub-sourced dependencies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_sha: Option<String>,
 }
 
 impl LockFile {
@@ -279,6 +297,18 @@ fn dep_inline(dep: &DependencyEntry) -> InlineTable {
     }
     if let Some(url) = &dep.url {
         it.insert("url", Value::from(url.as_str()));
+    }
+    if let Some(git) = &dep.git {
+        it.insert("git", Value::from(git.as_str()));
+    }
+    if let Some(git_ref) = &dep.git_ref {
+        it.insert("git_ref", Value::from(git_ref.as_str()));
+    }
+    if let Some(subdir) = &dep.subdir {
+        it.insert("subdir", Value::from(subdir.as_str()));
+    }
+    if dep.full {
+        it.insert("full", Value::from(true));
     }
     it
 }

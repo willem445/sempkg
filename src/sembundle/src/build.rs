@@ -42,7 +42,8 @@ pub struct BuildOptions {
     // --- Lance inputs (optional) ---
     /// Documentation directories to index with LanceDB. Empty = no lance extension.
     pub docs_dirs: Vec<PathBuf>,
-    /// Glob mask for document discovery. Default: `**/*.{md,txt,rst}`.
+    /// Glob mask for document discovery.
+    /// Default: `**/*.md,**/*.txt,**/*.rst`.
     pub docs_glob: Option<String>,
 }
 
@@ -66,13 +67,27 @@ pub fn build(opts: BuildOptions) -> Result<PathBuf, PackError> {
     eprintln!("[sembundle] Running codegraph ...");
     run_codegraph(&opts.source_dirs, &cg_out)?;
 
-    // Step 2: index docs directories with LanceDB (optional).
+    // Step 2: index docs directories with LanceDB (optional, best-effort).
+    // When no documents match the glob pattern we log a warning and continue
+    // without a LanceDB extension rather than failing the whole build.
     let lance_out = if !opts.docs_dirs.is_empty() {
         let lance_dir = work.path().join("lance-out");
-        let glob = opts.docs_glob.as_deref().unwrap_or("**/*.{md,txt,rst}");
+        let glob = opts
+            .docs_glob
+            .as_deref()
+            .unwrap_or("**/*.md,**/*.txt,**/*.rst");
         eprintln!("[sembundle] Building LanceDB documentation index ...");
-        run_lance(&opts.docs_dirs, &lance_dir, glob)?;
-        Some(lance_dir)
+        match run_lance(&opts.docs_dirs, &lance_dir, glob) {
+            Ok(()) => Some(lance_dir),
+            Err(PackError::InvalidField { ref field, .. }) if field == "docs_dirs" => {
+                eprintln!(
+                    "[sembundle] Warning: no documents matched the glob pattern — \
+                     skipping LanceDB documentation index."
+                );
+                None
+            }
+            Err(e) => return Err(e),
+        }
     } else {
         None
     };

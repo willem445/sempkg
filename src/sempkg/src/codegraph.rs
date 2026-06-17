@@ -128,6 +128,26 @@ pub fn files(project_path: &Path, filter: Option<&str>) -> Result<String> {
     run(&args, Some(project_path)).context("codegraph files failed")
 }
 
+/// Query the installed codegraph version string.
+///
+/// Returns `"unknown"` on failure so callers never need to abort.
+pub fn version() -> String {
+    let exe = match codegraph_exe() {
+        Ok(e) => e,
+        Err(_) => return "unknown".to_owned(),
+    };
+    std::process::Command::new(&exe)
+        .arg("--version")
+        .output()
+        .ok()
+        .and_then(|o| {
+            let s = String::from_utf8_lossy(&o.stdout);
+            // typical output: "codegraph 0.9.7" — grab the last whitespace-separated token
+            s.split_whitespace().last().map(str::to_owned)
+        })
+        .unwrap_or_else(|| "unknown".to_owned())
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------

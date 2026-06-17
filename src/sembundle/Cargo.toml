@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 description = "SemBundle CLI — pack and publish semantic index archives"
 
+[lib]
+name = "sembundle"
+path = "src/lib.rs"
+
 [[bin]]
 name = "sembundle"
 path = "src/main.rs"

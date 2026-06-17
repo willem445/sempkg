@@ -16,6 +16,7 @@ default  = []
 reranker = ["dep:llama-cpp-2"]
 
 [dependencies]
+sembundle    = { path = "../sembundle" }
 clap         = { version = "4", features = ["derive", "env"] }
 tokio        = { version = "1", features = ["full"] }
 serde        = { version = "1", features = ["derive"] }

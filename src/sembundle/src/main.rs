@@ -149,7 +149,7 @@ enum Commands {
         #[arg(long = "docs-dir", short = 'd')]
         docs_dirs: Vec<PathBuf>,
 
-        /// Glob mask for document discovery (default: **/*.{md,txt,rst})
+        /// Glob mask for document discovery (default: **/*.md,**/*.txt,**/*.rst)
         #[arg(long)]
         docs_glob: Option<String>,
     },
