@@ -1,6 +1,7 @@
 [package]
 name = "sempkg"
-version = "0.2.0"
+version = "0.3.0"
+
 
 edition = "2021"
 description = "sempkg — semantic package manager for sembundle archives with MCP server support"
