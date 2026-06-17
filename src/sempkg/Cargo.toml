@@ -8,6 +8,13 @@ description = "sempkg — semantic package manager for sembundle archives with M
 name = "sempkg"
 path = "src/main.rs"
 
+[features]
+default  = []
+# Enable in-process Qwen3-Reranker-0.6B GGUF inference via llama-cpp-2.
+# Requires cmake + MSVC (Windows) or cmake + clang (Linux/macOS) at build time.
+# Build with:  cargo build --features reranker
+reranker = ["dep:llama-cpp-2"]
+
 [dependencies]
 clap         = { version = "4", features = ["derive", "env"] }
 tokio        = { version = "1", features = ["full"] }
@@ -34,3 +41,7 @@ dirs         = "5"
 tempfile     = "3"
 walkdir      = "2"
 which        = "6"
+
+# Optional reranker dependency (enabled via --features reranker)
+# llama-cpp-2 wraps llama.cpp with native Qwen3 + RANK-pooling reranker support.
+llama-cpp-2 = { version = "0.1", optional = true }

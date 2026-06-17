@@ -9,7 +9,10 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use std::cell::RefCell;
+
 use crate::packages::PackageRegistry;
+use crate::reranker::{self, Reranker, RerankerConfig};
 use crate::store::{list_all_bundles, resolve_bundle};
 use crate::{codegraph, lance};
 
@@ -193,12 +196,47 @@ fn all_tools() -> Value {
 struct McpContext {
     workspace_dir: Option<PathBuf>,
     registry: PackageRegistry,
+    /// Optionally-loaded Qwen3 reranker. Wrapped in RefCell so tool methods
+    /// can mutably borrow it through an immutable &McpContext reference.
+    reranker: RefCell<Option<Reranker>>,
+    reranker_cfg: Option<RerankerConfig>,
 }
 
 impl McpContext {
     fn new(workspace_dir: Option<PathBuf>) -> Self {
         let registry = PackageRegistry::load().unwrap_or_default();
-        Self { workspace_dir, registry }
+
+        // Try to load reranker config from the workspace manifest.
+        let reranker_cfg: Option<RerankerConfig> = workspace_dir
+            .as_deref()
+            .and_then(|d| crate::manifest::load_manifest(d).ok())
+            .and_then(|mf| mf.reranker);
+
+        // Eagerly load the model when it's enabled and the files exist.
+        let reranker = reranker_cfg.as_ref().and_then(|cfg| {
+            if cfg.enabled && reranker::model_is_present(cfg) {
+                match Reranker::load(cfg) {
+                    Ok(r) => {
+                        eprintln!("sempkg: reranker loaded ({} top_k, {} output_n)",
+                            cfg.top_k, cfg.output_n);
+                        Some(r)
+                    }
+                    Err(e) => {
+                        eprintln!("sempkg: reranker load error (falling back to BM25): {e}");
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        });
+
+        Self {
+            workspace_dir,
+            registry,
+            reranker: RefCell::new(reranker),
+            reranker_cfg,
+        }
     }
 
     fn workspace(&self) -> Option<&PathBuf> {
@@ -328,8 +366,15 @@ impl McpContext {
     ) -> String {
         match self.resolve_codegraph_path(package) {
             Err(e) => e,
-            Ok(path) => codegraph::query(&path, query, kind, limit)
-                .unwrap_or_else(|e| format!("Error: {e}")),
+            Ok(path) => {
+                // When a reranker is present, fetch more candidates than
+                // requested so the model has a richer pool to score.
+                let fetch_limit = self.reranker_fetch_limit(limit);
+                let raw = codegraph::query(&path, query, kind, fetch_limit)
+                    .unwrap_or_else(|e| format!("Error: {e}"));
+
+                self.apply_rerank_to_codegraph(query, &raw, limit)
+            }
         }
     }
 
@@ -377,10 +422,91 @@ impl McpContext {
         match self.resolve_lance_path(package) {
             Err(e) => e,
             Ok(lance_dir) => {
-                match lance::search(&lance_dir, query, limit) {
-                    Ok(results) => lance::format_results(&results, query),
+                let fetch_limit = self.reranker_fetch_limit(limit);
+                match lance::search(&lance_dir, query, fetch_limit) {
+                    Ok(results) => self.apply_rerank_to_lance(query, results, limit),
                     Err(e) => format!("Error searching docs: {e}"),
                 }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Reranker helpers
+    // -----------------------------------------------------------------------
+
+    /// Returns the candidate fetch limit: top_k from config when a reranker
+    /// is available, otherwise the caller-supplied `limit`.
+    fn reranker_fetch_limit(&self, limit: usize) -> usize {
+        if let Some(cfg) = &self.reranker_cfg {
+            if cfg.enabled && self.reranker.borrow().is_some() {
+                return cfg.top_k.max(limit);
+            }
+        }
+        limit
+    }
+
+    /// Rerank raw codegraph JSON output (array of symbol objects).
+    /// Falls back to returning the raw string unchanged on any error.
+    fn apply_rerank_to_codegraph(&self, query: &str, raw_json: &str, output_n: usize) -> String {
+        let mut guard = self.reranker.borrow_mut();
+        let Some(ranker) = guard.as_mut() else {
+            return raw_json.to_string();
+        };
+
+        let candidates = reranker::codegraph_json_to_candidates(raw_json);
+        if candidates.is_empty() {
+            return raw_json.to_string();
+        }
+
+        match ranker.rerank(query, candidates) {
+            Ok(mut scored) => {
+                scored.truncate(output_n);
+                if scored.is_empty() {
+                    return format!("No results for '{query}'.");
+                }
+                let header = format!(
+                    "_Reranked {count} results with Qwen3-Reranker (top {output_n} shown):_\n\n",
+                    count = scored.len()
+                );
+                header + &reranker::format_reranked_docs(&scored, query)
+            }
+            Err(e) => {
+                eprintln!("sempkg: reranker error ({e}), returning BM25 results");
+                raw_json.to_string()
+            }
+        }
+    }
+
+    /// Rerank LanceDB search results.
+    fn apply_rerank_to_lance(
+        &self,
+        query: &str,
+        results: Vec<lance::SearchResult>,
+        output_n: usize,
+    ) -> String {
+        let mut guard = self.reranker.borrow_mut();
+        let Some(ranker) = guard.as_mut() else {
+            return lance::format_results(&results, query);
+        };
+
+        let candidates = reranker::lance_results_to_candidates(&results);
+        if candidates.is_empty() {
+            return lance::format_results(&results, query);
+        }
+
+        match ranker.rerank(query, candidates) {
+            Ok(mut scored) => {
+                scored.truncate(output_n);
+                let header = format!(
+                    "_Reranked {count} docs with Qwen3-Reranker (top {output_n} shown):_\n\n",
+                    count = scored.len()
+                );
+                header + &reranker::format_reranked_docs(&scored, query)
+            }
+            Err(e) => {
+                eprintln!("sempkg: reranker error ({e}), returning BM25 results");
+                lance::format_results(&results, query)
             }
         }
     }

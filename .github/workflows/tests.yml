@@ -2,9 +2,7 @@ name: Tests
 
 on:
   push:
-    branches: [main, master]
   pull_request:
-    branches: [main, master]
 
 jobs:
   test:
@@ -81,7 +79,46 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y cmake clang
+          sudo apt-get install -y cmake clang libclang-dev llvm-dev
+
+      # llvm-config + libclang are needed by bindgen (llama-cpp-sys via
+      # sempkg's optional reranker feature).
+      - name: Install LLVM and libclang (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew update
+          brew install llvm
+
+      - name: Install LLVM (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install llvm --no-progress -y
+
+      - name: Resolve LIBCLANG_PATH (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          if command -v llvm-config >/dev/null 2>&1; then
+            echo "LIBCLANG_PATH=$(llvm-config --libdir)" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          for p in /opt/homebrew/opt/llvm/bin /usr/local/opt/llvm/bin; do
+            if [ -x "$p/llvm-config" ]; then
+              echo "LIBCLANG_PATH=$($p/llvm-config --libdir)" >> "$GITHUB_ENV"
+              exit 0
+            fi
+          done
+
+          echo "llvm-config not found; cannot resolve LIBCLANG_PATH" >&2
+          exit 1
+
+      - name: Resolve LIBCLANG_PATH (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          "LIBCLANG_PATH=C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       # NASM improves aws-lc-rs assembly on Windows
       - name: Install NASM (Windows)
@@ -98,4 +135,4 @@ jobs:
         run: cargo test --manifest-path src/sembundle/Cargo.toml
 
       - name: Test sempkg
-        run: cargo test --manifest-path src/sempkg/Cargo.toml
+        run: cargo test --manifest-path src/sempkg/Cargo.toml --features reranker

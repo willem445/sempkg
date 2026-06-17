@@ -6,6 +6,7 @@ mod mcp;
 mod packages;
 mod lance;
 mod registry;
+mod reranker;
 mod store;
 mod verify;
 
@@ -16,7 +17,7 @@ use clap::Parser;
 
 use sha2::{Digest, Sha256};
 
-use crate::cli::{Cli, Commands, PkgCommands};
+use crate::cli::{Cli, Commands, PkgCommands, RerankerCommands};
 use crate::manifest::{DependencyEntry, RegistryEntry};
 use crate::packages::PackageRegistry;
 use crate::registry::{RegistryClient, download_from_url};
@@ -54,6 +55,13 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
                 println!("Add a registry with: sempkg add --registry-url <url> <name>@<version>");
             }
             Ok(())
+        }
+
+        // -----------------------------------------------------------------------
+        // Index — one-shot workspace indexing
+        // -----------------------------------------------------------------------
+        Commands::Index { path, name, docs_pattern, no_docs, no_code, global } => {
+            run_index(path.as_deref(), name.as_deref(), &docs_pattern, no_docs, no_code, global, workspace)
         }
 
         // -----------------------------------------------------------------------
@@ -456,6 +464,13 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
             Ok(())
         }
 
+        // -----------------------------------------------------------------------
+        // Hybrid search with reranking
+        // -----------------------------------------------------------------------
+        Commands::Query { package, query, docs, code, kind, limit, top_k } => {
+            run_query(&package, &query, docs, code, kind.as_deref(), limit, top_k, workspace)
+        }
+
         Commands::DocsMeta { package } => {
             let bundle_dir = resolve_lance_path(&package, workspace)?;
             if let Some(meta) = lance::load_metadata(&bundle_dir) {
@@ -479,7 +494,447 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
             mcp::run(ws)?;
             Ok(())
         }
+
+        // -----------------------------------------------------------------------
+        // Reranker management
+        // -----------------------------------------------------------------------
+        Commands::Reranker(sub) => run_reranker(sub, workspace),
     }
+}
+
+// ---------------------------------------------------------------------------
+// query — hybrid symbol + doc search with reranking
+// ---------------------------------------------------------------------------
+
+/// Run `sempkg query`: fetch from both CodeGraph and LanceDB, then rerank.
+///
+/// Corresponds to QMD's "query" level (BM25 + re-ranking); the existing
+/// `search` and `docs` commands remain the fast BM25-only paths.
+fn run_query(
+    package: &str,
+    query: &str,
+    docs_only: bool,
+    code_only: bool,
+    kind: Option<&str>,
+    limit: usize,
+    top_k_override: Option<usize>,
+    workspace: Option<&Path>,
+) -> Result<()> {
+    #[cfg(feature = "reranker")]
+    {
+        let mut cfg: reranker::RerankerConfig = workspace
+            .and_then(|d| manifest::load_manifest(d).ok())
+            .and_then(|mf| mf.reranker)
+            .unwrap_or_default();
+
+        if let Some(k) = top_k_override {
+            cfg.top_k = k;
+        }
+        cfg.output_n = limit;
+
+        if !reranker::model_is_present(&cfg) {
+            anyhow::bail!(
+                "Reranker model not found. Run `sempkg reranker pull` to download it."
+            );
+        }
+
+        let mut code_candidates: Vec<reranker::RerankCandidate> = Vec::new();
+        if !docs_only {
+            match resolve_codegraph_path(package, workspace) {
+                Ok(path) => match codegraph::query(&path, query, kind, cfg.top_k) {
+                    Ok(raw) => code_candidates.extend(reranker::codegraph_json_to_candidates(&raw)),
+                    Err(e) => eprintln!("Warning: symbol search failed: {e}"),
+                },
+                Err(_) => {} // package may be docs-only; not fatal
+            }
+        }
+
+        let mut doc_candidates: Vec<reranker::RerankCandidate> = Vec::new();
+        if !code_only {
+            if docs_only && kind.is_some() {
+                eprintln!("Note: --kind is ignored when --docs is set.");
+            }
+            match resolve_lance_path(package, workspace) {
+                Ok(lance_dir) => match lance::search(&lance_dir, query, cfg.top_k) {
+                    Ok(results) => doc_candidates.extend(reranker::lance_results_to_candidates(&results)),
+                    Err(e) => eprintln!("Warning: doc search failed: {e}"),
+                },
+                Err(_) => {} // package may be symbols-only; not fatal
+            }
+        }
+
+        // `top_k` is the total reranker budget across the merged hybrid pool,
+        // not per backend. Interleave sources so one side can't monopolize the
+        // pool when both are available.
+        let candidates = merge_query_candidates(code_candidates, doc_candidates, cfg.top_k);
+
+        if candidates.is_empty() {
+            println!("No results for '{query}'.");
+            return Ok(());
+        }
+
+        // `top_k` applies to the fetch size per backend. Once symbol and doc
+        // candidates are merged for hybrid query, score the full combined pool.
+        cfg.top_k = candidates.len();
+
+        // Score the full gathered pool first, then apply source-diversity
+        // selection and final truncation below.
+        cfg.output_n = candidates.len();
+
+        let has_codegraph = candidates.iter().any(|c| c.origin == reranker::RerankOrigin::Codegraph);
+        let has_docs = candidates.iter().any(|c| c.origin == reranker::RerankOrigin::Docs);
+
+        eprintln!("Scoring {} candidates...", candidates.len());
+        let mut ranker = reranker::Reranker::load(&cfg)?;
+        let scored = ranker.rerank(query, candidates)?;
+        let scored = diversify_query_results(scored, limit, has_codegraph, has_docs);
+
+        if scored.is_empty() {
+            println!("No results for '{query}'.");
+        } else {
+            println!("{}", reranker::format_reranked_docs(&scored, query));
+        }
+        Ok(())
+    }
+    #[cfg(not(feature = "reranker"))]
+    {
+        let _ = (package, query, docs_only, code_only, kind, limit, top_k_override, workspace);
+        anyhow::bail!(
+            "The `query` command requires reranker support. \
+             Rebuild with `cargo build --features reranker`."
+        )
+    }
+}
+
+/// Merge code and doc candidates into a single pool with a strict total budget.
+///
+/// Uses simple alternating interleave (code, doc, code, doc, ...) to keep both
+/// sources represented when both exist. Preserves per-source ranking order.
+fn merge_query_candidates(
+    mut code: Vec<reranker::RerankCandidate>,
+    mut docs: Vec<reranker::RerankCandidate>,
+    total_k: usize,
+) -> Vec<reranker::RerankCandidate> {
+    if total_k == 0 {
+        return Vec::new();
+    }
+
+    if code.is_empty() {
+        docs.truncate(total_k);
+        return docs;
+    }
+    if docs.is_empty() {
+        code.truncate(total_k);
+        return code;
+    }
+
+    let mut merged = Vec::with_capacity(total_k);
+    let mut code_iter = code.into_iter();
+    let mut docs_iter = docs.into_iter();
+
+    loop {
+        if merged.len() >= total_k {
+            break;
+        }
+
+        if let Some(c) = code_iter.next() {
+            merged.push(c);
+        }
+        if merged.len() >= total_k {
+            break;
+        }
+
+        if let Some(d) = docs_iter.next() {
+            merged.push(d);
+        }
+
+        // Stop when both sides are exhausted.
+        if code_iter.len() == 0 && docs_iter.len() == 0 {
+            break;
+        }
+    }
+
+    merged
+}
+
+/// Keep hybrid query results source-diverse so docs do not disappear when the
+/// reranker strongly prefers short symbol signatures for terse queries.
+fn diversify_query_results(
+    scored: Vec<reranker::RerankResult>,
+    limit: usize,
+    has_codegraph: bool,
+    has_docs: bool,
+) -> Vec<reranker::RerankResult> {
+    if !has_codegraph || !has_docs || limit <= 1 {
+        return scored.into_iter().take(limit).collect();
+    }
+
+    let mut final_results = Vec::new();
+    let mut best_doc: Option<reranker::RerankResult> = None;
+    let mut best_code: Option<reranker::RerankResult> = None;
+
+    for result in &scored {
+        match result.origin {
+            reranker::RerankOrigin::Docs if best_doc.is_none() => {
+                best_doc = Some(result.clone());
+            }
+            reranker::RerankOrigin::Codegraph if best_code.is_none() => {
+                best_code = Some(result.clone());
+            }
+            _ => {}
+        }
+        if best_doc.is_some() && best_code.is_some() {
+            break;
+        }
+    }
+
+    if let Some(code) = best_code {
+        final_results.push(code);
+    }
+    if let Some(doc) = best_doc {
+        if !final_results.iter().any(|r| r.source == doc.source && r.text == doc.text) {
+            final_results.push(doc);
+        }
+    }
+
+    for result in scored {
+        if final_results.len() >= limit {
+            break;
+        }
+        if final_results.iter().any(|r| r.source == result.source && r.text == result.text) {
+            continue;
+        }
+        final_results.push(result);
+    }
+
+    final_results.truncate(limit);
+    final_results
+}
+
+// ---------------------------------------------------------------------------
+// reranker sub-commands
+// ---------------------------------------------------------------------------
+
+fn run_reranker(cmd: RerankerCommands, workspace: Option<&Path>) -> Result<()> {
+    // Load config from workspace manifest (or use defaults).
+    let cfg: reranker::RerankerConfig = workspace
+        .and_then(|d| manifest::load_manifest(d).ok())
+        .and_then(|mf| mf.reranker)
+        .unwrap_or_default();
+
+    match cmd {
+        RerankerCommands::Pull { gguf_url, hf_token } => {
+            // Allow URL overrides via CLI flags for custom quants / mirrors.
+            let mut pull_cfg = cfg.clone();
+            if let Some(url) = &gguf_url {
+                pull_cfg.model = Some(url.clone());
+            }
+
+            let token = hf_token.as_deref();
+
+            println!("Pulling Qwen3-Reranker-0.6B GGUF model...");
+            reranker::pull_model(&pull_cfg, token)?;
+
+            println!();
+            println!(
+                "Model ready. Add the following to your sempkg.toml to activate reranking:\n\n\
+                 [reranker]\n\
+                 enabled  = true\n\
+                 top_k    = 20\n\
+                 output_n = 5\n"
+            );
+            Ok(())
+        }
+
+        RerankerCommands::Status => {
+            reranker::print_status(&cfg);
+            Ok(())
+        }
+
+        RerankerCommands::Test { query, document } => {
+            #[cfg(feature = "reranker")]
+            {
+                if !reranker::model_is_present(&cfg) {
+                    anyhow::bail!(
+                        "Model not found. Run `sempkg reranker pull` first."
+                    );
+                }
+                println!("Loading Qwen3-Reranker...");
+                let mut ranker = reranker::Reranker::load(&cfg)?;
+                let candidates = vec![reranker::RerankCandidate {
+                    source: "test-document".to_string(),
+                    text: document.clone(),
+                    origin: reranker::RerankOrigin::Docs,
+                }];
+                let results = ranker.rerank(&query, candidates)?;
+                if let Some(r) = results.first() {
+                    println!("Score: {:.4}  (1.0 = highly relevant, 0.0 = not relevant)", r.score);
+                } else {
+                    println!("No results.");
+                }
+                Ok(())
+            }
+            #[cfg(not(feature = "reranker"))]
+            {
+                let _ = (query, document);
+                anyhow::bail!(
+                    "Reranker support is not compiled into this binary. \
+                     Rebuild with `cargo build --features reranker`."
+                )
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// index — one-shot workspace indexing
+// ---------------------------------------------------------------------------
+
+/// Index the current (or specified) directory so it can be searched without
+/// any separate QMD / codegraph setup steps.
+///
+/// Steps performed (any can be skipped with --no-code / --no-docs):
+///  1. Resolve the target directory and derive a package name from its basename.
+///  2. Register the package in `~/.sempkg/packages.json` (global registry).
+///  3. Run `codegraph init --index` (or `sync` if already indexed).
+///  4. Build / update the LanceDB full-text documentation index.
+///  5. If a `sempkg.toml` exists in the target dir, record the package there.
+fn run_index(
+    path_override: Option<&std::path::Path>,
+    name_override: Option<&str>,
+    docs_pattern: &str,
+    no_docs: bool,
+    no_code: bool,
+    global: bool,
+    workspace: Option<&Path>,
+) -> Result<()> {
+    // Resolve target directory.
+    let target_dir: PathBuf = if let Some(p) = path_override {
+        p.canonicalize()
+            .with_context(|| format!("Path does not exist: {}", p.display()))?
+    } else {
+        std::env::current_dir().context("Cannot determine current directory")?
+    };
+
+    // Derive package name.
+    let name: String = if let Some(n) = name_override {
+        n.to_string()
+    } else {
+        target_dir
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "workspace".to_string())
+    };
+
+    println!("Indexing '{}' at {}", name, target_dir.display());
+
+    // --- 1. Register the package ------------------------------------------
+    // Default: workspace-scoped (sempkg.toml [packages] entry).
+    // With --global: also upsert into ~/.sempkg/packages.json.
+    let toml_dir = path_override.unwrap_or_else(|| workspace.unwrap_or(&target_dir));
+    let has_manifest = manifest::load_manifest(toml_dir).is_ok();
+
+    if !has_manifest && !global {
+        // No manifest present and --global not requested — fall back to global
+        // so the package is still queryable, but warn the user.
+        eprintln!(
+            "  Warning: no sempkg.toml found in {}.  \
+             Registering globally in ~/.sempkg/packages.json instead.\n  \
+             Run `sempkg init` first if you want workspace-scoped registration.",
+            toml_dir.display()
+        );
+        let mut reg = packages::PackageRegistry::load()?;
+        if reg.get(&name).is_none() {
+            reg.add(&name, &target_dir, "")?;
+            println!("  Registered '{}' in global sempkg registry.", name);
+        } else {
+            println!("  '{}' already in global registry (skipping).", name);
+        }
+    } else if global {
+        let mut reg = packages::PackageRegistry::load()?;
+        if reg.get(&name).is_none() {
+            reg.add(&name, &target_dir, "")?;
+            println!("  Registered '{}' in global sempkg registry.", name);
+        } else {
+            println!("  '{}' already in global registry (skipping).", name);
+        }
+    }
+
+    // --- 2. CodeGraph symbol index ----------------------------------------
+    if !no_code {
+        let already_indexed = codegraph::is_indexed(&target_dir);
+        if already_indexed {
+            print!("  Updating CodeGraph symbol index ... ");
+            std::io::Write::flush(&mut std::io::stdout())?;
+            match codegraph::sync(&target_dir) {
+                Ok(out) => {
+                    println!("done.");
+                    if !out.is_empty() { println!("{out}"); }
+                }
+                Err(e) => {
+                    println!("failed.");
+                    eprintln!("  Warning: codegraph sync error: {e}");
+                    eprintln!("  Run `sempkg pkg reindex {name}` to retry.");
+                }
+            }
+        } else {
+            print!("  Building CodeGraph symbol index ... ");
+            std::io::Write::flush(&mut std::io::stdout())?;
+            match codegraph::init_and_index(&target_dir) {
+                Ok(out) => {
+                    println!("done.");
+                    if !out.is_empty() { println!("{out}"); }
+                }
+                Err(e) => {
+                    println!("failed.");
+                    eprintln!("  Warning: codegraph init error: {e}");
+                    eprintln!("  Ensure `codegraph` is on PATH, then retry.");
+                }
+            }
+        }
+    } else {
+        println!("  Skipping CodeGraph symbol index (--no-code).");
+    }
+
+    // --- 3. LanceDB documentation index -----------------------------------
+    if !no_docs {
+        println!("  Building LanceDB documentation index (pattern: {docs_pattern}) ...");
+        match lance::cli_update(&target_dir, &name, docs_pattern) {
+            Ok(lance_dir) => {
+                println!("  LanceDB index ready at {}.", lance_dir.display());
+            }
+            Err(e) => {
+                eprintln!("  Warning: LanceDB index failed: {e}");
+                eprintln!("  Re-run with --docs-pattern to adjust the glob, or --no-docs to skip.");
+            }
+        }
+    } else {
+        println!("  Skipping LanceDB documentation index (--no-docs).");
+    }
+
+    // --- 4. Persist into sempkg.toml (workspace-scoped, primary path) -----
+    if let Ok(mut mf) = manifest::load_manifest(toml_dir) {
+        if !mf.packages.contains_key(&name) {
+            mf.packages.insert(name.clone(), manifest::PackageEntry {
+                path: target_dir.to_string_lossy().into_owned(),
+                description: String::new(),
+            });
+            manifest::save_manifest(&mf, toml_dir)?;
+            println!("  Added [packages.{name}] to sempkg.toml.");
+        } else {
+            println!("  [packages.{name}] already in sempkg.toml (skipping).");
+        }
+    }
+
+    println!();
+    println!(
+        "Done. Use these commands to query '{name}':\n\
+         \n  sempkg search {name} <query>      # fast symbol search\
+         \n  sempkg docs   {name} <query>      # fast documentation search\
+         \n  sempkg query  {name} <query>      # reranked hybrid search (requires --features reranker)"
+    );
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

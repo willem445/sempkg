@@ -56,6 +56,12 @@ pub enum SempkgError {
 
     #[error("Database error: {0}")]
     Db(String),
+
+    #[error("Reranker error: {0}")]
+    Reranker(String),
+
+    #[error("Reranker model not found at {path}. Run `sempkg reranker pull`.")]
+    RerankerModelNotFound { path: String },
 }
 
 pub type Result<T> = std::result::Result<T, SempkgError>;

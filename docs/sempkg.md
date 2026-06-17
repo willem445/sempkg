@@ -1,10 +1,12 @@
 # sempkg — User Guide
 
 `sempkg` is a native Rust CLI and MCP server for managing
-[SemBundle](SemBundle-spec.md) semantic index packages.
+[SemBundle](sembundle-spec.md) semantic index packages.
 
-It exposes the same intelligence as the Python `sempkg` server but compiles
-to a single self-contained binary with no Python runtime dependency.
+It combines [CodeGraph](https://github.com/colbymchenry/codegraph) symbol
+intelligence with [QMD](https://github.com/colbymchenry/codegraph)-style
+LanceDB documentation search into a single self-contained binary — with an
+optional local LLM reranker for high-quality hybrid queries.
 
 ---
 
@@ -14,12 +16,14 @@ to a single self-contained binary with no Python runtime dependency.
 2. [Installation](#installation)
 3. [Workspace Setup](#workspace-setup)
 4. [Installing Bundles](#installing-bundles)
-5. [CodeGraph Queries](#codegraph-queries)
-6. [Documentation Search](#documentation-search-lancedb)
-7. [Local Package Management](#local-package-management)
-8. [MCP Server](#mcp-server)
-9. [Bundle Verification](#bundle-verification)
-10. [Full CLI Reference](#full-cli-reference)
+5. [Indexing a Local Repository](#indexing-a-local-repository)
+6. [CodeGraph Queries](#codegraph-queries)
+7. [Documentation Search](#documentation-search-lancedb)
+8. [Hybrid Query with Reranking](#hybrid-query-with-reranking)
+9. [Local Package Management](#local-package-management)
+10. [MCP Server](#mcp-server)
+11. [Bundle Verification](#bundle-verification)
+12. [Full CLI Reference](#full-cli-reference)
 
 ---
 
@@ -27,46 +31,54 @@ to a single self-contained binary with no Python runtime dependency.
 
 | Requirement | Notes |
 |-------------|-------|
-| [CodeGraph](https://github.com/colbymchenry/codegraph) | Must be on `PATH`. Provides the underlying semantic index. Install with `npm install -g @colbymchenry/codegraph` or the platform installer. |
-| Rust toolchain | Only required if building from source. Not required if using a pre-built binary. |
+| [CodeGraph](https://github.com/colbymchenry/codegraph) | Must be on `PATH`. Install with `npm install -g @colbymchenry/codegraph`. |
+| Rust toolchain | Required only when building from source. |
 
 ---
 
 ## Installation
 
-### From source (recommended while in development)
+### Pre-built binaries (recommended)
 
-```powershell
-# From the repository root
-cargo install --path src/sempkg
+**Linux / macOS:**
+```sh
+curl -fsSL https://raw.githubusercontent.com/willem445/codegraph-hub/main/install.sh | sh
 ```
 
-This installs the `sempkg` binary to `~/.cargo/bin/`.
+**Windows (PowerShell):**
+```powershell
+irm https://raw.githubusercontent.com/willem445/codegraph-hub/main/install.ps1 | iex
+```
 
-### Build only (no install)
+### Build from source
 
 ```powershell
-cd src/sempkg
-cargo build --release
-# Binary at: target/release/sempkg (or target/release/sempkg.exe on Windows)
+# Standard build
+cargo install --path src/sempkg
+
+# With local LLM reranker support (requires a C/C++ compiler for llama.cpp)
+cargo install --path src/sempkg --features reranker
 ```
 
 ---
 
 ## Workspace Setup
 
-`sempkg` uses a `sempkg.toml` manifest in the project root to declare bundle dependencies, similar to `Cargo.toml` for Rust crates.
+`sempkg` uses a `sempkg.toml` manifest in the project root to declare bundle
+dependencies, similar to `Cargo.toml` for Rust crates.
 
 ```powershell
 cd C:\Projects\my-project
 sempkg init
+# With a registry pre-configured:
+sempkg init --registry https://my-registry.example.com
 ```
 
 This creates a minimal `sempkg.toml`:
 
 ```toml
 [workspace]
-# verify_key = "keys/publisher.pem"   # optional Ed25519 public key for bundle verification
+# verify_key = "keys/publisher.pem"   # optional Ed25519 public key
 
 [[registry]]
 name = "default"
@@ -75,41 +87,75 @@ url  = "https://registry.example.com"
 [dependencies]
 ```
 
-### Adding a registry at init time
+### Optional reranker configuration
 
-```powershell
-sempkg init --registry https://my-registry.example.com
+Add a `[reranker]` section to enable hybrid search with the local LLM reranker:
+
+```toml
+[reranker]
+enabled  = true
+# model  = "~/.sempkg/models/Qwen3-Reranker-0.6B-Q8_0.gguf"  # default path
+top_k    = 20   # BM25 candidates fed into the reranker
+output_n = 5    # final results returned after reranking
 ```
 
 ---
 
 ## Installing Bundles
 
-### Via manifest (reproducible)
+Bundles are prebuilt semantic indexes for external libraries, pinned to an
+exact version. Add them to `sempkg.toml` and run `sempkg sync` so every team
+member installs the same index from the same source.
 
-Add a bundle to `sempkg.toml` and install all dependencies:
+### From a registry
 
 ```powershell
-sempkg add my-sdk@1.2.0 --registry-url https://my-registry.example.com
+sempkg add aws-sdk@1.11.210
+sempkg add requests@2.32.3 --registry my-registry
 sempkg sync
 ```
 
-After the first `sync`, a `sempkg.lock` file is written. Commit it for reproducible installs across machines.
+### From a GitHub release asset (direct URL)
+
+Use `--url` to point directly at a `.sembundle` asset attached to a GitHub
+release tag. No registry is needed.
 
 ```powershell
-sempkg sync --reinstall        # force reinstall even if already present
-sempkg sync --group extras     # install an optional dependency group
-sempkg sync --all-groups       # install all dependency groups
+# Add to sempkg.toml and install on next sync
+sempkg add my-sdk@2.0.0 --url https://github.com/owner/repo/releases/download/v2.0.0/my-sdk-2.0.0.sembundle
+
+# Or install immediately without touching the manifest
+sempkg install my-sdk@2.0.0 --url https://github.com/owner/repo/releases/download/v2.0.0/my-sdk-2.0.0.sembundle
 ```
+
+The URL format for GitHub release assets is always:
+```
+https://github.com/<owner>/<repo>/releases/download/<tag>/<asset-filename>
+```
+
+### Sync options
+
+```powershell
+sempkg sync                    # install all [dependencies]
+sempkg sync --reinstall        # force reinstall even if already present
+sempkg sync --group dev        # also install the "dev" dependency group
+sempkg sync --all-groups       # install every dependency group
+```
+
+After the first `sync` a `sempkg.lock` file is written. Commit it for
+reproducible installs across machines.
 
 ### Ad-hoc install (without manifest)
 
 ```powershell
-# Workspace-local
-sempkg install my-sdk@1.2.0 --registry https://my-registry.example.com
+# From a registry
+sempkg install requests@2.32.3 --registry https://my-registry.example.com
 
-# Global (~/.sempkg/bundles/)
-sempkg install my-sdk@1.2.0 --registry https://my-registry.example.com --global
+# From a GitHub release URL
+sempkg install my-sdk@2.0.0 --url https://github.com/owner/repo/releases/download/v2.0.0/my-sdk-2.0.0.sembundle
+
+# Install globally (~/.sempkg/bundles/)
+sempkg install my-sdk@2.0.0 --url <url> --global
 ```
 
 ### Listing installed bundles
@@ -118,15 +164,50 @@ sempkg install my-sdk@1.2.0 --registry https://my-registry.example.com --global
 sempkg list
 ```
 
-Output:
-
 ```
 Installed bundles:
-  my-sdk               @ 1.2.0       [indexed]  [workspace]  +lance
-  internal-lib         @ 0.9.1       [indexed]  [global]
+  aws-sdk   @ 1.11.210  [indexed]  [workspace]  +lance
+  requests  @ 2.32.3    [indexed]  [workspace]
+  mylib                 [indexed]  [global]     (local pkg)
 ```
 
 The `+lance` flag indicates the bundle includes a LanceDB documentation index.
+
+### Bundle and package status
+
+```powershell
+sempkg status aws-sdk
+```
+
+---
+
+## Indexing a Local Repository
+
+`sempkg index` is a one-shot command that registers a local source repository
+with CodeGraph **and** builds its LanceDB documentation index in a single step.
+
+```powershell
+# Index the current directory (name defaults to the folder's basename)
+sempkg index
+
+# Index a specific path with a custom name
+sempkg index C:\Projects\mylib --name mylib
+
+# Skip the docs index
+sempkg index C:\Projects\mylib --name mylib --no-docs
+
+# Skip the code index (update docs only)
+sempkg index C:\Projects\mylib --name mylib --no-code
+
+# Register globally (~/.sempkg/packages.json) in addition to sempkg.toml
+sempkg index C:\Projects\mylib --name mylib --global
+
+# Custom docs glob
+sempkg index . --docs-pattern "docs/**/*.md,CHANGELOG.md"
+```
+
+The command is **idempotent** — re-running it updates the existing index
+without duplicating entries.
 
 ---
 
@@ -157,24 +238,19 @@ sempkg files my-sdk -f "*.rs"
 
 ## Documentation Search (LanceDB)
 
-Bundles packed with `SemBundle build --docs-dir` (or `SemBundle pack --lance-dir`) contain a
-LanceDB documentation index. `sempkg` searches it with BM25 full-text search — no external
-tools or model downloads required.
-
-### Searching a bundle
+Bundles packed with a `--docs-dir` or `--lance-dir` flag contain a LanceDB
+full-text index. `sempkg` searches it with BM25 — no model downloads needed.
 
 ```powershell
 sempkg docs my-sdk "retry policy"
 sempkg docs my-sdk "timeout configuration" -n 5
 ```
 
-### Viewing index metadata
+### View index metadata
 
 ```powershell
 sempkg docs-meta my-sdk
 ```
-
-Output:
 
 ```
 LanceDB metadata for 'my-sdk':
@@ -185,27 +261,83 @@ LanceDB metadata for 'my-sdk':
   Indexed at:  2026-06-15T10:30:00Z
 ```
 
-### Indexing docs for a local package
+---
 
-If you have a locally registered package (not a bundle), you can build a LanceDB index
-over its documentation directory:
+## Hybrid Query with Reranking
+
+`sempkg query` is the high-quality search path. It fetches BM25 candidates
+from **both** CodeGraph (symbols) and LanceDB (docs), merges the pool, and
+scores every candidate against the query using a local
+**Qwen3-Reranker-0.6B** cross-encoder running entirely on-device via
+llama.cpp. No API calls, no data leaving your machine.
+
+> **Requires:** binary built with `--features reranker` and the model
+> downloaded with `sempkg reranker pull`.
+
+### Setup
 
 ```powershell
-sempkg pkg lance-index mylib
-sempkg pkg lance-index mylib --pattern "**/*.md,**/*.rst"
+# Build with reranker support
+cargo install --path src/sempkg --features reranker
+
+# Download the Qwen3-Reranker-0.6B GGUF (~600 MB, no auth required)
+sempkg reranker pull
+
+# Verify it works
+sempkg reranker status
+sempkg reranker test "how to read a CSV" "read_csv opens a file and returns a DataFrame"
 ```
 
-The index is stored at `<package-path>/.sempkg/lance/` and is isolated to that package.
-It is then searchable with `sempkg docs mylib <query>`.
+### Usage
+
+```powershell
+# Hybrid search across both code and docs (default)
+sempkg query my-sdk "how to configure retry backoff"
+
+# Docs-only hybrid search
+sempkg query my-sdk "retry backoff" --docs
+
+# Code-only hybrid search
+sempkg query my-sdk "retry backoff" --code
+
+# Tune result count and candidate pool size
+sempkg query my-sdk "retry backoff" -n 10 --top-k 40
+
+# Filter code candidates by symbol kind
+sempkg query my-sdk "retry backoff" --code -k function
+```
+
+### How it works
+
+| Step | What happens |
+|------|-------------|
+| 1 | BM25 symbol search across CodeGraph (skipped with `--docs`) |
+| 2 | BM25 full-text search across LanceDB (skipped with `--code`) |
+| 3 | Candidate pools merged (capped at `top_k`, default 20) |
+| 4 | Each `(query, candidate)` pair scored by Qwen3-Reranker in a single forward pass |
+| 5 | Candidates re-sorted by score; top `output_n` returned |
+
+When the reranker is unavailable (model missing or not built in), `sempkg query`
+falls back to plain BM25 results.
+
+### Compare: search modes
+
+| Command | Backend | Reranker | Best for |
+|---------|---------|----------|----------|
+| `sempkg search` | CodeGraph BM25 | No | Fast symbol lookup |
+| `sempkg docs` | LanceDB BM25 | No | Fast doc search |
+| `sempkg query` | Both, merged | Yes | Highest quality, broad queries |
 
 ---
 
 ## Local Package Management
 
-Local packages are source repositories indexed with CodeGraph directly (no bundle required).
+Local packages are source repositories indexed with CodeGraph directly — no
+bundle required. Prefer `sempkg index` for a single-step setup; use `sempkg pkg`
+for finer control.
 
 ```powershell
-# Register and index
+# Register and index separately
 sempkg pkg add mylib C:\Projects\mylib
 sempkg pkg add mylib C:\Projects\mylib -d "My internal library"
 
@@ -214,6 +346,10 @@ sempkg pkg list
 
 # Reindex after commits
 sempkg pkg reindex mylib
+
+# Build or update the LanceDB docs index
+sempkg pkg lance-index mylib
+sempkg pkg lance-index mylib --pattern "**/*.md,**/*.rst"
 
 # Status
 sempkg pkg status mylib
@@ -229,9 +365,13 @@ sempkg pkg remove mylib
 `sempkg mcp` starts the MCP server on stdio. VS Code / GitHub Copilot connect to it and
 can call any of the tools listed below.
 
+When a `[reranker]` section is present in `sempkg.toml` and the model is
+available, the MCP server loads the reranker at startup and uses it
+automatically for relevant tool calls.
+
 ### Configuring VS Code
 
-**Workspace-scoped** (`.vscode/mcp.json` — committed to the repo, shared with team):
+**Workspace-scoped** (`.vscode/mcp.json` — commit this to share with your team):
 
 ```json
 {
@@ -265,21 +405,21 @@ falling back to global bundles. Omit `-C` to use only the global bundle store.
 
 ### Available MCP tools
 
-| Tool | Required params | Description |
-|------|-----------------|-------------|
-| `list_packages` | — | List all local packages and installed bundles with index and docs status |
-| `search_symbols` | `package`, `query` | FTS symbol search in a package. Optional: `kind`, `limit` |
-| `get_context` | `package`, `task` | AI-optimised code context for a natural-language task description |
-| `get_callers` | `package`, `symbol` | Find all callers of a symbol. Optional: `limit` |
-| `get_callees` | `package`, `symbol` | Find all callees of a symbol. Optional: `limit` |
-| `get_impact` | `package`, `symbol` | Downstream impact of changing a symbol. Optional: `depth` |
-| `list_files` | `package` | List source files tracked by CodeGraph. Optional: `filter` |
-| `search_docs` | `package`, `query` | BM25 full-text search over LanceDB documentation index. Optional: `limit` |
-| `docs_metadata` | `package` | LanceDB index stats: table name, document count, chunk count, FTS status |
+| Tool | Required params | Optional params | Description |
+|------|-----------------|-----------------|-------------|
+| `list_packages` | — | — | List all local packages and installed bundles with index and docs status |
+| `search_symbols` | `package`, `query` | `kind`, `limit` | FTS symbol search via CodeGraph |
+| `get_context` | `package`, `task` | — | AI-optimised code context for a natural-language task |
+| `get_callers` | `package`, `symbol` | `limit` | Find all callers of a symbol |
+| `get_callees` | `package`, `symbol` | `limit` | Find all callees of a symbol |
+| `get_impact` | `package`, `symbol` | `depth` | Downstream impact of changing a symbol |
+| `list_files` | `package` | `filter` | List source files tracked by CodeGraph |
+| `search_docs` | `package`, `query` | `limit` | BM25 full-text search over LanceDB docs index |
+| `docs_metadata` | `package` | — | LanceDB index stats: document count, chunk count, FTS status |
 
-All tools accept a `package` name that can be either:
+All tools accept a `package` name that can be:
 - A registered local package name (e.g. `"mylib"`)
-- An installed bundle name or `name@version` spec (e.g. `"my-sdk"` or `"my-sdk@1.2.0"`)
+- An installed bundle name or `name@version` spec (e.g. `"my-sdk"` or `"my-sdk@1.11.210"`)
 
 ---
 
@@ -287,23 +427,23 @@ All tools accept a `package` name that can be either:
 
 `sempkg` supports Ed25519 signature verification for bundles downloaded from a registry.
 
-Generate a key pair with `SemBundle`:
+Generate a key pair with `sembundle`:
 
 ```powershell
-SemBundle keygen --output-dir keys/
+sembundle keygen --output-dir keys/
 # Writes: keys/private.pem  keys/public.pem
 ```
 
 Sign a bundle before publishing:
 
 ```powershell
-SemBundle sign my-sdk-1.2.0.SemBundle --key keys/private.pem
+sembundle sign my-sdk-1.11.210.sembundle --key keys/private.pem
 ```
 
 Verify at install time:
 
 ```powershell
-sempkg install my-sdk@1.2.0 --registry https://reg.example.com --verify-key keys/public.pem
+sempkg install my-sdk@1.11.210 --registry https://reg.example.com --verify-key keys/public.pem
 ```
 
 Or add the key to `sempkg.toml` so all `sempkg sync` calls verify automatically:
@@ -324,36 +464,60 @@ Global options:
   -C, --workspace <DIR>    Workspace directory (default: current directory)
                            Env: SEMPKG_WORKSPACE
 
-Commands:
-  init [--registry <url>]                    Initialise sempkg.toml
-  list                                       List packages and bundles
-  add <name>@<ver> [--registry-url <url>]   Add dependency to sempkg.toml
-  remove <name>                              Remove dependency from sempkg.toml
-  sync [--reinstall] [--group <g>] [--all-groups]
-                                             Install all declared dependencies
-  install <name>@<ver> --registry <url>     Install a bundle directly
-    [--global] [--verify-key <pem>]
-  status <name>                              Show bundle/package status
-  repair                                     Recreate missing .codegraph views
+Workspace / bundle management:
+  init [--registry <url>]                     Initialise sempkg.toml
+  list                                        List packages and bundles
+  add <name>@<ver> [--registry-url <url>]     Add dependency to sempkg.toml
+                  [--url <url>]               (direct GitHub release URL)
+                  [--registry <name>]
+                  [--group <g>]
+  remove <name> [--group <g>]                 Remove dependency from sempkg.toml
+  sync [--reinstall] [--group <g>]            Install all declared dependencies
+       [--all-groups]
+  install <name>@<ver> --registry <url>       Install a bundle directly
+                       --url <url>            (direct GitHub release URL)
+                       [--global]
+                       [--verify-key <pem>]
+  status <name>                               Show bundle/package status
+  repair                                      Recreate missing .codegraph views
 
-  search <pkg> <query> [-k <kind>] [-n <n>] Search symbols (CodeGraph)
-  callers <pkg> <symbol> [-n <n>]           Find callers
-  callees <pkg> <symbol> [-n <n>]           Find callees
-  context <pkg> <task>                       AI-optimised context
-  impact  <pkg> <symbol> [-d <depth>]       Impact analysis
-  files   <pkg> [-f <filter>]               List files
+Indexing:
+  index [<path>] [--name <n>] [--docs-pattern <glob>]
+                 [--no-docs] [--no-code] [--global]
+                                              Register + index a local repo (idempotent)
 
-  docs      <pkg> <query> [-n <n>]          LanceDB documentation search
-  docs-meta <pkg>                            LanceDB metadata
+CodeGraph queries (scoped to one package):
+  search  <pkg> <query> [-k <kind>] [-n <n>]  Symbol search
+  callers <pkg> <symbol> [-n <n>]             Find callers
+  callees <pkg> <symbol> [-n <n>]             Find callees
+  context <pkg> <task>                         AI-optimised context
+  impact  <pkg> <symbol> [-d <depth>]          Impact analysis
+  files   <pkg> [-f <filter>]                  List files
 
-  mcp [-C <workspace>]                       Start MCP server (stdio)
+Documentation search:
+  docs      <pkg> <query> [-n <n>]            LanceDB BM25 doc search
+  docs-meta <pkg>                             LanceDB index metadata
 
-  pkg list                                   List local packages
-  pkg add <name> <path> [-d <desc>]         Register + index local repo
-  pkg remove <name>                          Unregister local package
-  pkg reindex <name>                         Reindex local package
-  pkg status <name>                          CodeGraph index status
-  pkg lance-index <name> [--pattern <glob>]  Build/update LanceDB doc index
+Hybrid search (requires --features reranker):
+  query <pkg> <query> [--docs | --code]       BM25 + Qwen3 reranker
+              [-k <kind>] [-n <n>] [--top-k <n>]
+
+MCP server:
+  mcp [-C <workspace>]                        Start MCP server (stdio)
+
+Local package management:
+  pkg list                                    List local packages
+  pkg add    <name> <path> [-d <desc>]        Register local repo
+  pkg remove <name>                           Unregister local package
+  pkg reindex <name>                          Reindex after commits
+  pkg status  <name>                          CodeGraph index status
+  pkg lance-index <name> [--pattern <glob>]   Build/update LanceDB doc index
+
+Reranker model management:
+  reranker pull   [--gguf-url <url>] [--hf-token <tok>]
+                                              Download Qwen3-Reranker GGUF
+  reranker status                             Show model path and status
+  reranker test   <query> <document>          Score a test (query, doc) pair
 ```
 
 ---
@@ -362,22 +526,24 @@ Commands:
 
 ```
 <project>/
-├── sempkg.toml          Project manifest (dependencies, registries)
+├── sempkg.toml          Project manifest (dependencies, registries, reranker)
 ├── sempkg.lock          Locked hashes (auto-generated — commit this)
 └── .sempkg/
     └── bundles/
         └── <name>/
-            └── <version>/   Extracted bundle contents
+            └── <version>/
                 ├── manifest.json
                 ├── metadata.json
                 ├── config.json
                 ├── graph/
                 ├── embeddings/
-                └── lance/       (if bundle has docs index)
+                └── lance/          (present only if bundle includes docs)
                     ├── metadata.json
                     └── docs.lance/
 
 ~/.sempkg/
 ├── bundles/             Global bundle store (same layout as above)
+├── models/              Reranker GGUF models
+│   └── Qwen3-Reranker-0.6B-Q8_0.gguf
 └── packages.json        Registered local packages
 ```
