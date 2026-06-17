@@ -135,6 +135,7 @@ jobs:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build
+        shell: bash
         run: |
           if [ "${{ matrix.binary }}" = "sempkg" ]; then
             cargo build --release --manifest-path ${{ matrix.manifest }} --target ${{ matrix.target }} --features reranker
