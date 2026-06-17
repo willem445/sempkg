@@ -58,6 +58,13 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
         }
 
         // -----------------------------------------------------------------------
+        // Index — one-shot workspace indexing
+        // -----------------------------------------------------------------------
+        Commands::Index { path, name, docs_pattern, no_docs, no_code, global } => {
+            run_index(path.as_deref(), name.as_deref(), &docs_pattern, no_docs, no_code, global, workspace)
+        }
+
+        // -----------------------------------------------------------------------
         // List
         // -----------------------------------------------------------------------
         Commands::List => {
@@ -777,6 +784,157 @@ fn run_reranker(cmd: RerankerCommands, workspace: Option<&Path>) -> Result<()> {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// index — one-shot workspace indexing
+// ---------------------------------------------------------------------------
+
+/// Index the current (or specified) directory so it can be searched without
+/// any separate QMD / codegraph setup steps.
+///
+/// Steps performed (any can be skipped with --no-code / --no-docs):
+///  1. Resolve the target directory and derive a package name from its basename.
+///  2. Register the package in `~/.sempkg/packages.json` (global registry).
+///  3. Run `codegraph init --index` (or `sync` if already indexed).
+///  4. Build / update the LanceDB full-text documentation index.
+///  5. If a `sempkg.toml` exists in the target dir, record the package there.
+fn run_index(
+    path_override: Option<&std::path::Path>,
+    name_override: Option<&str>,
+    docs_pattern: &str,
+    no_docs: bool,
+    no_code: bool,
+    global: bool,
+    workspace: Option<&Path>,
+) -> Result<()> {
+    // Resolve target directory.
+    let target_dir: PathBuf = if let Some(p) = path_override {
+        p.canonicalize()
+            .with_context(|| format!("Path does not exist: {}", p.display()))?
+    } else {
+        std::env::current_dir().context("Cannot determine current directory")?
+    };
+
+    // Derive package name.
+    let name: String = if let Some(n) = name_override {
+        n.to_string()
+    } else {
+        target_dir
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "workspace".to_string())
+    };
+
+    println!("Indexing '{}' at {}", name, target_dir.display());
+
+    // --- 1. Register the package ------------------------------------------
+    // Default: workspace-scoped (sempkg.toml [packages] entry).
+    // With --global: also upsert into ~/.sempkg/packages.json.
+    let toml_dir = path_override.unwrap_or_else(|| workspace.unwrap_or(&target_dir));
+    let has_manifest = manifest::load_manifest(toml_dir).is_ok();
+
+    if !has_manifest && !global {
+        // No manifest present and --global not requested — fall back to global
+        // so the package is still queryable, but warn the user.
+        eprintln!(
+            "  Warning: no sempkg.toml found in {}.  \
+             Registering globally in ~/.sempkg/packages.json instead.\n  \
+             Run `sempkg init` first if you want workspace-scoped registration.",
+            toml_dir.display()
+        );
+        let mut reg = packages::PackageRegistry::load()?;
+        if reg.get(&name).is_none() {
+            reg.add(&name, &target_dir, "")?;
+            println!("  Registered '{}' in global sempkg registry.", name);
+        } else {
+            println!("  '{}' already in global registry (skipping).", name);
+        }
+    } else if global {
+        let mut reg = packages::PackageRegistry::load()?;
+        if reg.get(&name).is_none() {
+            reg.add(&name, &target_dir, "")?;
+            println!("  Registered '{}' in global sempkg registry.", name);
+        } else {
+            println!("  '{}' already in global registry (skipping).", name);
+        }
+    }
+
+    // --- 2. CodeGraph symbol index ----------------------------------------
+    if !no_code {
+        let already_indexed = codegraph::is_indexed(&target_dir);
+        if already_indexed {
+            print!("  Updating CodeGraph symbol index ... ");
+            std::io::Write::flush(&mut std::io::stdout())?;
+            match codegraph::sync(&target_dir) {
+                Ok(out) => {
+                    println!("done.");
+                    if !out.is_empty() { println!("{out}"); }
+                }
+                Err(e) => {
+                    println!("failed.");
+                    eprintln!("  Warning: codegraph sync error: {e}");
+                    eprintln!("  Run `sempkg pkg reindex {name}` to retry.");
+                }
+            }
+        } else {
+            print!("  Building CodeGraph symbol index ... ");
+            std::io::Write::flush(&mut std::io::stdout())?;
+            match codegraph::init_and_index(&target_dir) {
+                Ok(out) => {
+                    println!("done.");
+                    if !out.is_empty() { println!("{out}"); }
+                }
+                Err(e) => {
+                    println!("failed.");
+                    eprintln!("  Warning: codegraph init error: {e}");
+                    eprintln!("  Ensure `codegraph` is on PATH, then retry.");
+                }
+            }
+        }
+    } else {
+        println!("  Skipping CodeGraph symbol index (--no-code).");
+    }
+
+    // --- 3. LanceDB documentation index -----------------------------------
+    if !no_docs {
+        println!("  Building LanceDB documentation index (pattern: {docs_pattern}) ...");
+        match lance::cli_update(&target_dir, &name, docs_pattern) {
+            Ok(lance_dir) => {
+                println!("  LanceDB index ready at {}.", lance_dir.display());
+            }
+            Err(e) => {
+                eprintln!("  Warning: LanceDB index failed: {e}");
+                eprintln!("  Re-run with --docs-pattern to adjust the glob, or --no-docs to skip.");
+            }
+        }
+    } else {
+        println!("  Skipping LanceDB documentation index (--no-docs).");
+    }
+
+    // --- 4. Persist into sempkg.toml (workspace-scoped, primary path) -----
+    if let Ok(mut mf) = manifest::load_manifest(toml_dir) {
+        if !mf.packages.contains_key(&name) {
+            mf.packages.insert(name.clone(), manifest::PackageEntry {
+                path: target_dir.to_string_lossy().into_owned(),
+                description: String::new(),
+            });
+            manifest::save_manifest(&mf, toml_dir)?;
+            println!("  Added [packages.{name}] to sempkg.toml.");
+        } else {
+            println!("  [packages.{name}] already in sempkg.toml (skipping).");
+        }
+    }
+
+    println!();
+    println!(
+        "Done. Use these commands to query '{name}':\n\
+         \n  sempkg search {name} <query>      # fast symbol search\
+         \n  sempkg docs   {name} <query>      # fast documentation search\
+         \n  sempkg query  {name} <query>      # reranked hybrid search (requires --features reranker)"
+    );
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

@@ -142,6 +142,55 @@ pub fn format_results(results: &[SearchResult], query: &str) -> String {
 // CLI update: pure-Rust local indexing (no external tool required)
 // ---------------------------------------------------------------------------
 
+/// Split a glob spec on **top-level** commas (commas inside `{...}` are not
+/// treated as separators), then expand any `{a,b,c}` brace groups in each
+/// resulting token.
+///
+/// Examples:
+/// - `"**/*.{md,rst,txt}"`       → `["**/*.md", "**/*.rst", "**/*.txt"]`
+/// - `"**/*.md, **/*.rs"`        → `["**/*.md", "**/*.rs"]`
+/// - `"**/*.{md,rst}, **/*.rs"`  → `["**/*.md", "**/*.rst", "**/*.rs"]`
+fn expand_patterns(spec: &str) -> Vec<String> {
+    // Split on top-level commas (depth tracks open braces).
+    let mut tokens: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut depth = 0usize;
+    for ch in spec.chars() {
+        match ch {
+            '{' => { depth += 1; current.push(ch); }
+            '}' => { depth = depth.saturating_sub(1); current.push(ch); }
+            ',' if depth == 0 => {
+                let t = current.trim().to_string();
+                if !t.is_empty() { tokens.push(t); }
+                current.clear();
+            }
+            _ => { current.push(ch); }
+        }
+    }
+    let t = current.trim().to_string();
+    if !t.is_empty() { tokens.push(t); }
+
+    // Expand brace groups in each token.
+    tokens.into_iter().flat_map(|p| expand_braces(&p)).collect()
+}
+
+/// Expand a single `{a,b,c}` brace group inside a glob pattern.
+/// Only the first brace group is expanded (sufficient for common patterns).
+/// Returns the pattern unchanged as a single-element vec if no braces found.
+fn expand_braces(pattern: &str) -> Vec<String> {
+    if let Some(open) = pattern.find('{') {
+        if let Some(close) = pattern[open..].find('}').map(|i| open + i) {
+            let prefix = &pattern[..open];
+            let suffix = &pattern[close + 1..];
+            return pattern[open + 1..close]
+                .split(',')
+                .map(|alt| format!("{}{}{}", prefix, alt.trim(), suffix))
+                .collect();
+        }
+    }
+    vec![pattern.to_string()]
+}
+
 /// Walk `project_dir` with `glob_pattern`, chunk text, write a LanceDB table
 /// at `<project_dir>/.sempkg/lance/`, and build a tantivy FTS index.
 ///
@@ -158,7 +207,7 @@ pub fn cli_update(
     let mut row_contents: Vec<String> = Vec::new();
     let mut doc_count: u64 = 0;
 
-    let patterns: Vec<&str> = glob_pattern.split(',').map(str::trim).collect();
+    let patterns: Vec<String> = expand_patterns(glob_pattern);
 
     for entry in walkdir::WalkDir::new(project_dir)
         .min_depth(1)

@@ -33,6 +33,47 @@ pub enum Commands {
         registry: Option<String>,
     },
 
+    /// Index the current repository (or a specified path) so it can be
+    /// searched with `sempkg search`, `sempkg docs`, and `sempkg query`.
+    ///
+    /// This is a one-shot alternative to running:
+    ///   1. `sempkg pkg add <name> <path>`  — register with codegraph
+    ///   2. `sempkg pkg lance-index <name>` — build the LanceDB docs index
+    ///
+    /// The command is **idempotent**: re-running it updates the index without
+    /// duplicating entries.  If a `sempkg.toml` exists in the target directory
+    /// the package is also recorded in its `[packages]` table.
+    Index {
+        /// Directory to index.  Defaults to the current working directory.
+        path: Option<PathBuf>,
+
+        /// Short name used to identify this package in sempkg commands.
+        /// Defaults to the directory's basename.
+        #[arg(long, short = 'n')]
+        name: Option<String>,
+
+        /// Glob pattern of documentation files to include in the LanceDB
+        /// full-text index.  May be comma-separated for multiple patterns.
+        /// Defaults to all Markdown, RST, and plain-text files.
+        #[arg(long, default_value = "**/*.{md,rst,txt}")]
+        docs_pattern: String,
+
+        /// Skip building / updating the LanceDB documentation index.
+        #[arg(long)]
+        no_docs: bool,
+
+        /// Skip building / updating the CodeGraph symbol index.
+        #[arg(long)]
+        no_code: bool,
+
+        /// Also register the package in the global sempkg registry
+        /// (`~/.sempkg/packages.json`) in addition to the workspace
+        /// `sempkg.toml`.  By default the registration is workspace-scoped
+        /// only (matching the behaviour of `sempkg pkg add`).
+        #[arg(long)]
+        global: bool,
+    },
+
     /// List all registered packages and installed bundles.
     List,
 
