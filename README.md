@@ -6,15 +6,15 @@
 
 ![readme-img](README.png)
 
-## The version-drift problem — solved
+## Code + docs indexing, scoped to your workspace
 
-AI agents routinely hallucinate APIs, reference removed methods, or cite docs for the wrong library version. `sempkg` fixes this at the source: dependencies are declared in a `sempkg.toml` manifest pinned to the **exact version you ship**, and the corresponding `.sembundle` index is fetched from a registry and served directly to your agent. Your agent reads the right symbols, the right signatures, and the right docs — for your versions, not someone else's.
+Your agent needs two things to reason about a dependency: its **code structure** (symbols, signatures, call graphs) and its **documentation**. Today those live in separate tools, or nowhere at all. `sempkg` indexes both into a single `.sembundle`, scopes it to your workspace, and serves it straight to your agent over MCP.
 
-## Scoped context, not global context pollution
+Most agent tooling instead dumps broad, global indexes into one shared pool — which, over time, pollutes retrieval with symbols and docs from unrelated projects, versions, and stacks. `sempkg` flips that: each project pins and exposes only the bundles it actually depends on. Pull in the context you need daily, leave the rest out.
 
-Most agent tooling dumps broad, global indexes into one shared context pool. Over time, that pollutes retrieval with symbols and docs from unrelated projects, versions, and stacks.
+Version pinning is the icing: because every bundle is tied to the **exact version you ship**, your agent reads the right symbols and the right docs for *your* code — not whatever it scraped off the internet.
 
-`sempkg` keeps context clean by letting you scope indexes to a workspace. Each project can pin and expose only the semantic bundles it actually depends on, so agents retrieve relevant APIs for the current codebase instead of noisy global matches.
+Bundles meet you wherever your dependencies live. Eventually you'll be able to pull them from a public registry, but you can already self-host your own registry, or skip a registry entirely and pack and install bundles straight from a GitHub release tag URL or a local folder.
 
 ## What you get
 
