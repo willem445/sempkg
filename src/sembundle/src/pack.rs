@@ -8,8 +8,10 @@ use walkdir::WalkDir;
 
 use crate::checksum::sha256_bytes;
 use crate::error::PackError;
-use crate::manifest::{LanceMetadata, Manifest, Metadata};
-use crate::validate::{validate_commit_hash, validate_input_dir, validate_lance_dir, validate_name};
+use crate::manifest::{CodeMetadata, LanceMetadata, Manifest, Metadata};
+use crate::validate::{
+    validate_code_dir, validate_commit_hash, validate_input_dir, validate_lance_dir, validate_name,
+};
 
 /// Options for the `pack` operation.
 pub struct PackOptions {
@@ -29,12 +31,18 @@ pub struct PackOptions {
     pub indexed_paths: Vec<String>,
     /// Version of CodeGraph used to produce the index.
     pub codegraph_version: String,
-    /// Optional path to a pre-built LanceDB index directory.
+    /// Optional path to a pre-built LanceDB documentation index directory.
     ///
     /// When supplied the directory must contain:
     /// `metadata.json` and at least one `*.lance/` table directory.
     /// Spec: sembundle-spec.md §9.
     pub lance_dir: Option<PathBuf>,
+
+    /// Optional path to a pre-built LanceDB source-code index directory.
+    ///
+    /// When supplied the directory must contain:
+    /// `metadata.json` and at least one `*.lance/` table directory.
+    pub code_dir: Option<PathBuf>,
 }
 
 /// In-memory bundle entry: bundle-relative key + raw bytes.
@@ -57,6 +65,9 @@ pub fn pack(opts: PackOptions) -> Result<PathBuf, PackError> {
     validate_input_dir(&opts.input_dir)?;
     if let Some(ref lance) = opts.lance_dir {
         validate_lance_dir(lance)?;
+    }
+    if let Some(ref code) = opts.code_dir {
+        validate_code_dir(code)?;
     }
 
     let created_at = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
@@ -107,6 +118,12 @@ pub fn pack(opts: PackOptions) -> Result<PathBuf, PackError> {
         extensions.push("lance".to_string());
     }
 
+    // --- Optional source-code index extension ---
+    if let Some(ref code_dir) = opts.code_dir {
+        collect_code_entries(code_dir, &created_at, &mut entries)?;
+        extensions.push("code".to_string());
+    }
+
     // --- Compute checksums for all non-manifest files ---
     let mut checksums: HashMap<String, String> = HashMap::new();
     for e in &entries {
@@ -114,8 +131,13 @@ pub fn pack(opts: PackOptions) -> Result<PathBuf, PackError> {
     }
 
     // --- Generate manifest.json (checksums are now final) ---
+    let spec_version = if opts.code_dir.is_some() {
+        "1.3.0"
+    } else {
+        "1.2.0"
+    };
     let manifest = Manifest {
-        spec_version: "1.2.0".to_string(),
+        spec_version: spec_version.to_string(),
         name: opts.name.clone(),
         version: opts.version.clone(),
         source_repo: opts.source_repo.clone(),
@@ -238,8 +260,50 @@ fn collect_lance_entries(
     Ok(())
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Tests
+/// Collect all source-code index files into `code/`-prefixed bundle entries.
+///
+/// - `code/metadata.json`   — parsed, `created_at` stamped, re-serialised
+/// - `code/<table>.lance/**` — all Arrow/Lance data files copied verbatim
+fn collect_code_entries(
+    code_dir: &Path,
+    created_at: &str,
+    entries: &mut Vec<Entry>,
+) -> Result<(), PackError> {
+    let meta_path = code_dir.join("metadata.json");
+    if meta_path.is_file() {
+        let raw = std::fs::read(&meta_path)?;
+        let mut meta: CodeMetadata = serde_json::from_slice(&raw)?;
+        meta.created_at = created_at.to_string();
+        entries.push(Entry {
+            key: "code/metadata.json".to_string(),
+            content: serde_json::to_vec_pretty(&meta)?,
+        });
+    }
+
+    for result in WalkDir::new(code_dir).min_depth(1).sort_by_file_name() {
+        let entry = result?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let rel = entry.path().strip_prefix(code_dir).unwrap();
+        let rel_key: String = rel
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("/");
+
+        if rel_key == "metadata.json" {
+            continue;
+        }
+
+        entries.push(Entry {
+            key: format!("code/{rel_key}"),
+            content: std::fs::read(entry.path())?,
+        });
+    }
+
+    Ok(())
+}
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -282,6 +346,7 @@ mod tests {
             indexed_paths: vec!["src".to_string()],
             codegraph_version: "0.3.1".to_string(),
             lance_dir: None,
+            code_dir: None,
         }
     }
 

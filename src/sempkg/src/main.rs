@@ -124,12 +124,13 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
                         "no graph"
                     };
                     let lance_flag = if b.has_lance() { "  +lance" } else { "" };
+                    let code_flag = if b.has_code() { "  +code" } else { "" };
                     let scope = match b.scope {
                         BundleScope::Workspace => "workspace",
                         BundleScope::Global => "global",
                     };
                     println!(
-                        "  {:<20} @ {:<12} [{idx}]  [{scope}]{lance_flag}",
+                        "  {:<20} @ {:<12} [{idx}]  [{scope}]{lance_flag}{code_flag}",
                         b.name, b.version
                     );
                 }
@@ -507,10 +508,11 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
 
             let info = store.install_bytes(&bytes)?;
             println!(
-                "Installed {}@{} [{scope_label}]{}",
+                "Installed {}@{} [{scope_label}]{}{}",
                 info.name,
                 info.version,
-                if info.has_lance() { "  +lance" } else { "" }
+                if info.has_lance() { "  +lance" } else { "" },
+                if info.has_code() { "  +code" } else { "" },
             );
             Ok(())
         }
@@ -544,6 +546,7 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
                 );
                 println!("  Queryable:  {}", bundle.is_indexed());
                 println!("  Lance:      {}", bundle.has_lance());
+                println!("  Code index: {}", bundle.has_code());
                 println!("  Source:     {}", bundle.manifest.source_repo);
                 println!("  Commit:     {}", bundle.manifest.commit_hash);
                 println!("  Created:    {}", bundle.manifest.created_at);
@@ -1437,6 +1440,8 @@ fn add_from_github(
         source_dirs: vec![source_root.clone()],
         docs_dirs: vec![source_root.clone()],
         docs_glob: None,
+        include_source: false,
+        source_glob: None,
     };
 
     sembundle::build(build_opts).with_context(|| {
@@ -1494,11 +1499,12 @@ fn install_github_bundle(
     let sha256 = hex::encode(sha2::Sha256::digest(&bytes));
 
     println!(
-        "Installed {}@{} from {}{}",
+        "Installed {}@{} from {}{}{}",
         info.name,
         info.version,
         source_label,
-        if info.has_lance() { "  +lance" } else { "" }
+        if info.has_lance() { "  +lance" } else { "" },
+        if info.has_code() { "  +code" } else { "" }
     );
 
     record_github_dep(
@@ -1842,6 +1848,8 @@ fn add_from_local(
         source_dirs: vec![canonical.clone()],
         docs_dirs: vec![canonical.clone()],
         docs_glob: None,
+        include_source: false,
+        source_glob: None,
     };
 
     sembundle::build(build_opts).with_context(|| {
@@ -1868,11 +1876,12 @@ fn add_from_local(
     };
 
     println!(
-        "Installed {}@{} from {}{}",
+        "Installed {}@{} from {}{}{}",
         info.name,
         info.version,
         canonical.display(),
-        if info.has_lance() { "  +lance" } else { "" }
+        if info.has_lance() { "  +lance" } else { "" },
+        if info.has_code() { "  +code" } else { "" }
     );
 
     // --- 7. Record in manifest ----------------------------------------------

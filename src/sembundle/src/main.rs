@@ -84,6 +84,15 @@ enum Commands {
         /// When supplied, sets extensions=["lance"] in manifest.json.
         #[arg(long)]
         lance_dir: Option<PathBuf>,
+
+        /// Path to a pre-built LanceDB source-code index directory to include as
+        /// the `code/` extension.
+        ///
+        /// The directory must contain:
+        ///   metadata.json  — code index metadata
+        ///   code.lance/    — LanceDB Arrow table directory
+        #[arg(long)]
+        code_dir: Option<PathBuf>,
     },
 
     /// Publish a .sembundle to a registry server
@@ -152,6 +161,17 @@ enum Commands {
         /// Glob mask for document discovery (default: **/*.md,**/*.txt,**/*.rst)
         #[arg(long)]
         docs_glob: Option<String>,
+
+        // --- Source-code index (optional) ---
+        /// Build a LanceDB source-code index chunked by top-level symbols and
+        /// embed it in the bundle as the `code/` extension.
+        #[arg(long, default_value_t = false)]
+        include_source: bool,
+
+        /// Glob mask restricting which files are included in the source-code index.
+        /// Default covers common compiled and scripted languages.
+        #[arg(long)]
+        source_glob: Option<String>,
     },
 
     /// Generate an Ed25519 keypair for bundle signing
@@ -232,6 +252,8 @@ fn main() {
             source_dirs,
             docs_dirs,
             docs_glob,
+            include_source,
+            source_glob,
         } => build::build(BuildOptions {
             name,
             version,
@@ -244,6 +266,8 @@ fn main() {
             source_dirs,
             docs_dirs,
             docs_glob,
+            include_source,
+            source_glob,
         })
         .map(|path| {
             println!("Bundle created: {}", path.display());
@@ -262,6 +286,7 @@ fn main() {
             indexed_paths,
             output,
             lance_dir,
+            code_dir,
         } => pack::pack(PackOptions {
             input_dir,
             output_path: output,
@@ -274,6 +299,7 @@ fn main() {
             indexed_paths,
             codegraph_version,
             lance_dir,
+            code_dir,
         })
         .map(|path| {
             println!("Bundle created: {}", path.display());

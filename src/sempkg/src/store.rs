@@ -48,6 +48,10 @@ impl BundleManifest {
     pub fn has_lance(&self) -> bool {
         self.extensions.iter().any(|e| e == "lance")
     }
+
+    pub fn has_code(&self) -> bool {
+        self.extensions.iter().any(|e| e == "code")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -73,6 +77,10 @@ pub enum BundleScope {
 impl BundleInfo {
     pub fn has_lance(&self) -> bool {
         self.manifest.has_lance() && self.bundle_dir.join("lance").is_dir()
+    }
+
+    pub fn has_code(&self) -> bool {
+        self.manifest.has_code() && self.bundle_dir.join("code").is_dir()
     }
 
     pub fn is_indexed(&self) -> bool {

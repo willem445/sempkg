@@ -105,6 +105,30 @@ pub fn validate_name(name: &str) -> Result<(), PackError> {
     Ok(())
 }
 
+/// Validate that an optional source-code index directory has the required structure.
+///
+/// When `code/` is included in a bundle the following must be present:
+/// - `metadata.json`     — index metadata
+/// - at least one `*.lance/` subdirectory  — the LanceDB table directory
+pub fn validate_code_dir(dir: &Path) -> Result<(), PackError> {
+    if !dir.join("metadata.json").is_file() {
+        return Err(PackError::MissingFile("code/metadata.json".to_string()));
+    }
+
+    let has_table = std::fs::read_dir(dir)
+        .map_err(PackError::Io)?
+        .filter_map(|e| e.ok())
+        .any(|e| {
+            e.file_name().to_string_lossy().ends_with(".lance") && e.path().is_dir()
+        });
+
+    if !has_table {
+        return Err(PackError::MissingDirectory("code/*.lance".to_string()));
+    }
+
+    Ok(())
+}
+
 /// Validate a Git commit hash.
 ///
 /// Must be exactly 40 lowercase hexadecimal characters (spec §4.2).

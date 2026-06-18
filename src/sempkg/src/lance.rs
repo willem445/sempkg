@@ -66,17 +66,62 @@ pub struct SearchResult {
     pub start_byte: u32,
     /// Byte offset of the chunk end within the source file (0 = unknown).
     pub end_byte: u32,
+    // Code-index fields (absent for docs results).
+    pub symbol: Option<String>,
+    pub kind: Option<String>,
+    pub signature: Option<String>,
 }
 
-/// Full-text (BM25) search against the bundle's LanceDB table.
+/// Full source body for a single symbol, returned by `fetch_symbol_source`.
+#[derive(Debug)]
+pub struct SymbolSource {
+    pub path: String,
+    pub symbol: String,
+    pub kind: String,
+    pub signature: String,
+    pub content: String,
+    pub start_line: u32,
+    pub end_line: u32,
+}
+
+pub fn code_dir_path(bundle_dir: &Path) -> PathBuf {
+    bundle_dir.join("code")
+}
+
+pub fn has_code(bundle_dir: &Path) -> bool {
+    code_dir_path(bundle_dir).is_dir()
+}
+
+/// Full-text (BM25) search against the docs LanceDB table.
 pub fn search(
     lance_dir: &Path,
     query: &str,
     limit: usize,
 ) -> crate::error::Result<Vec<SearchResult>> {
-    if !lance_dir.is_dir() {
+    search_table(lance_dir, "docs", query, limit, false)
+}
+
+/// Full-text (BM25) search against the code LanceDB table.
+pub fn search_code(
+    code_dir: &Path,
+    query: &str,
+    limit: usize,
+) -> crate::error::Result<Vec<SearchResult>> {
+    search_table(code_dir, "code", query, limit, true)
+}
+
+/// Internal: BM25 search against a named LanceDB table.  When `is_code` is
+/// true the reader also extracts symbol/kind/signature columns.
+fn search_table(
+    dir: &Path,
+    table_name: &str,
+    query: &str,
+    limit: usize,
+    is_code: bool,
+) -> crate::error::Result<Vec<SearchResult>> {
+    if !dir.is_dir() {
         return Err(SempkgError::NoLanceIndex(
-            lance_dir.to_string_lossy().to_string(),
+            dir.to_string_lossy().to_string(),
         ));
     }
 
@@ -86,13 +131,13 @@ pub fn search(
         .map_err(|e| SempkgError::Io(e))?;
 
     let results = rt.block_on(async {
-        let db = lancedb::connect(lance_dir.to_str().unwrap_or("."))
+        let db = lancedb::connect(dir.to_str().unwrap_or("."))
             .execute()
             .await
             .map_err(|e| SempkgError::LanceError(e.to_string()))?;
 
         let tbl = db
-            .open_table("docs")
+            .open_table(table_name)
             .execute()
             .await
             .map_err(|e| SempkgError::LanceError(e.to_string()))?;
@@ -130,21 +175,46 @@ pub fn search(
                 .column_by_name("end_byte")
                 .and_then(|col| col.as_any().downcast_ref::<UInt32Array>());
 
+            let symbols = if is_code {
+                batch
+                    .column_by_name("symbol")
+                    .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            } else {
+                None
+            };
+            let kinds = if is_code {
+                batch
+                    .column_by_name("kind")
+                    .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            } else {
+                None
+            };
+            let signatures = if is_code {
+                batch
+                    .column_by_name("signature")
+                    .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            } else {
+                None
+            };
+
             if let (Some(p), Some(c)) = (paths, contents) {
                 for i in 0..batch.num_rows() {
-                    // Strip legacy "#chunk_index" suffix written by older index versions.
                     let raw_path = p.value(i);
                     let path = match raw_path.split_once('#') {
                         Some((f, _)) => f.to_string(),
                         None => raw_path.to_string(),
                     };
+                    let snippet_len = if is_code { 600 } else { 400 };
                     out.push(SearchResult {
                         path,
-                        snippet: c.value(i).chars().take(400).collect(),
+                        snippet: c.value(i).chars().take(snippet_len).collect(),
                         start_line: start_lines.map_or(0, |a| a.value(i)),
                         end_line: end_lines.map_or(0, |a| a.value(i)),
                         start_byte: start_bytes.map_or(0, |a| a.value(i)),
                         end_byte: end_bytes.map_or(0, |a| a.value(i)),
+                        symbol: symbols.map(|a| a.value(i).to_string()),
+                        kind: kinds.map(|a| a.value(i).to_string()),
+                        signature: signatures.map(|a| a.value(i).to_string()),
                     });
                 }
             }
@@ -153,6 +223,91 @@ pub fn search(
     })?;
 
     Ok(results)
+}
+
+/// Fetch the full source body for a symbol from the `code` table.
+/// Returns the first exact match on the `symbol` column.
+pub fn fetch_symbol_source(
+    code_dir: &Path,
+    symbol: &str,
+) -> crate::error::Result<Option<SymbolSource>> {
+    if !code_dir.is_dir() {
+        return Ok(None);
+    }
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| SempkgError::Io(e))?;
+
+    let result = rt.block_on(async {
+        let db = lancedb::connect(code_dir.to_str().unwrap_or("."))
+            .execute()
+            .await
+            .map_err(|e| SempkgError::LanceError(e.to_string()))?;
+
+        let tbl = db
+            .open_table("code")
+            .execute()
+            .await
+            .map_err(|e| SempkgError::LanceError(e.to_string()))?;
+
+        // Use a full-text search on the symbol name as a proxy for exact lookup,
+        // then filter client-side for an exact symbol match.
+        let batches: Vec<RecordBatch> = tbl
+            .query()
+            .full_text_search(FullTextSearchQuery::new(symbol.to_string()))
+            .limit(50)
+            .execute()
+            .await
+            .map_err(|e| SempkgError::LanceError(e.to_string()))?
+            .try_collect()
+            .await
+            .map_err(|e| SempkgError::LanceError(e.to_string()))?;
+
+        for batch in &batches {
+            let syms = batch
+                .column_by_name("symbol")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+            let paths = batch
+                .column_by_name("path")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+            let kinds = batch
+                .column_by_name("kind")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+            let sigs = batch
+                .column_by_name("signature")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+            let contents = batch
+                .column_by_name("content")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+            let start_lines = batch
+                .column_by_name("start_line")
+                .and_then(|c| c.as_any().downcast_ref::<UInt32Array>());
+            let end_lines = batch
+                .column_by_name("end_line")
+                .and_then(|c| c.as_any().downcast_ref::<UInt32Array>());
+
+            if let (Some(s), Some(p), Some(c)) = (syms, paths, contents) {
+                for i in 0..batch.num_rows() {
+                    if s.value(i) == symbol {
+                        return Ok(Some(SymbolSource {
+                            path: p.value(i).to_string(),
+                            symbol: s.value(i).to_string(),
+                            kind: kinds.map_or("", |a| a.value(i)).to_string(),
+                            signature: sigs.map_or("", |a| a.value(i)).to_string(),
+                            content: c.value(i).to_string(),
+                            start_line: start_lines.map_or(0, |a| a.value(i)),
+                            end_line: end_lines.map_or(0, |a| a.value(i)),
+                        }));
+                    }
+                }
+            }
+        }
+        Ok::<Option<SymbolSource>, SempkgError>(None)
+    })?;
+
+    Ok(result)
 }
 
 /// Format search results as Markdown.
@@ -168,7 +323,14 @@ pub fn format_results(results: &[SearchResult], query: &str) -> String {
             } else {
                 r.path.clone()
             };
-            format!("**{}**\n\n{}", loc, r.snippet)
+            if let Some(sym) = &r.symbol {
+                let kind = r.kind.as_deref().unwrap_or("symbol");
+                let sig = r.signature.as_deref().unwrap_or("");
+                let sig_part = if sig.is_empty() { String::new() } else { format!("\n_{sig}_") };
+                format!("**{sym}** ({kind}) @ {loc}{sig_part}\n\n```\n{}\n```", r.snippet)
+            } else {
+                format!("**{}**\n\n{}", loc, r.snippet)
+            }
         })
         .collect::<Vec<_>>()
         .join("\n\n---\n\n")
