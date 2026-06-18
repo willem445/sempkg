@@ -76,8 +76,6 @@ cargo install --path src/sempkg
 
 ### Configure VS Code (workspace)
 
-### Configure VS Code (workspace)
-
 Add to `.vscode/mcp.json`:
 
 ```json
@@ -106,6 +104,33 @@ sempkg sync
 # Add & index a dependency directly from Github (bypass index)
 sempkg add https://github.com/pandas-dev/pandas/releases/tag/v3.0.3 --full
 ```
+
+After `sempkg sync`, the installed bundles live in your workspace alongside the
+rest of your project state:
+
+```text
+my-workspace/
+├── .vscode/
+│   └── mcp.json
+├── src/
+├── sempkg.toml
+├── sempkg.lock
+└── .sempkg/
+  └── bundles/
+    └── my-sdk/
+      └── 1.2.0/
+        ├── manifest.json
+        ├── metadata.json
+        ├── config.json
+        ├── graph/
+        ├── embeddings/
+        └── lance/
+          ├── metadata.json
+          └── docs.lance/
+```
+
+That keeps semantic indexes scoped to the current repository, just like other
+workspace-local tooling and dependency metadata.
 
 ### GitHub authentication (private / enterprise)
 
