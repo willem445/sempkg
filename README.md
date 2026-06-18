@@ -10,12 +10,17 @@
 
 AI agents routinely hallucinate APIs, reference removed methods, or cite docs for the wrong library version. `sempkg` fixes this at the source: dependencies are declared in a `sempkg.toml` manifest pinned to the **exact version you ship**, and the corresponding `.sembundle` index is fetched from a registry and served directly to your agent. Your agent reads the right symbols, the right signatures, and the right docs — for your versions, not someone else's.
 
+## Scoped context, not global context pollution
+
+Most agent tooling dumps broad, global indexes into one shared context pool. Over time, that pollutes retrieval with symbols and docs from unrelated projects, versions, and stacks.
+
+`sempkg` keeps context clean by letting you scope indexes to a workspace. Each project can pin and expose only the semantic bundles it actually depends on, so agents retrieve relevant APIs for the current codebase instead of noisy global matches.
+
 ## What you get
 
 - **Symbol search & call graphs** — query function definitions, callers, and callees across indexed codebases without reading source files
 - **Semantic doc search** — vector-search over embedded documentation, scoped to the pinned version
 - **Version-pinned bundles** — install prebuilt indexes for your exact dependency versions; no drift, no guessing
-- **Flexible index scoping** — indexes are globally available by default, or scoped to workspaces for maximum agent precision. Workspace-scoped indexes enable pinned semantic indexes tailored to each project's exact dependency graph, ensuring agents access the right APIs for the right context
 - **Zero runtime overhead** — single self-contained binary, no Python, no Node, no manual context management
 - **Self-hostable registry** — publish and serve your own `.sembundle` archives via `sempkg-registry`
 
