@@ -45,6 +45,7 @@ Always start with `list_packages` to see what is indexed. The output shows:
 | "How do I accomplish [task]?" | `get_context` (natural language) |
 | "What files are in this package?" | `list_files` |
 | "How does [concept] work in this library?" | `search_docs` (requires `+lance`) |
+| "Show me the implementation of a symbol I just found" | `read_code(file, line)` or `read_symbol(name)` (requires `+code`) |
 
 ### 3. Symbol search tips
 
@@ -84,6 +85,26 @@ Always start with `list_packages` to see what is indexed. The output shows:
   dependencies.
 - `get_impact`: transitive downstream impact — call this before proposing a
   change to understand the blast radius.
+
+### 6. Reading exact source code
+
+When a tool such as `search_symbols`, `get_callers`, `get_callees`, or
+`get_impact` returns a result that includes a file path and line number, use
+that information to retrieve the precise implementation **without doing a
+secondary search**:
+
+- **`read_code(package, file, line)`** — preferred. Pass the file path and any
+  line number within the symbol. Returns the tightest enclosing symbol body
+  (e.g. if the line falls inside a method, you get that method, not the whole
+  class). Requires `+code`.
+- **`read_symbol(package, symbol)`** — alternative when you have the symbol
+  name but not a file/line location. Performs an exact name lookup. Requires
+  `+code`.
+
+Prefer `read_code` over `search_code` whenever you already have a file and line
+from earlier tool results. `search_code` is a vector/BM25 search across all
+indexed symbols and should be reserved for when you are *discovering* symbols by
+keyword, not when you already know where a symbol lives.
 
 ---
 

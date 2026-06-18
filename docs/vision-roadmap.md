@@ -242,6 +242,70 @@ Future exploration:
 
 ---
 
+# **Prior Art & Differentiation**
+
+The "AI agents hallucinate APIs and cite docs for the wrong version" problem is
+well-recognized and several popular tools attack it. Crucially, **every existing
+solution operates at the documentation-text layer and uses centralized,
+best-effort version matching** — none provide a structured code graph, deterministic
+version pinning, or producer-published, portable artifacts. That combination is
+sempkg's defensible wedge.
+
+## Landscape
+
+| Tool | What it does | Model | Limitation vs. sempkg |
+|------|--------------|-------|-----------------------|
+| **Context7** (Upstash) | Injects "up-to-date, version-specific docs" into the prompt via MCP | Centralized SaaS; private crawling/parsing engine; API keys | Docs only (text snippets). Version matching is best-effort automatic, not pinned/locked. Only crawled libraries. Cloud-only. |
+| **GitMCP** | Turns any GitHub repo into a doc hub to "stop hallucinating" | Cloud; reads `llms.txt` → `README` → root | Only as good as existing docs. No call graphs. Public repos only. Tracks a branch, not a pinned version. |
+| **DeepWiki** (Cognition) | Auto-generated wiki / Q&A over a repo | Cloud | Prose/doc layer, latest-version oriented. |
+| **llms.txt** standard | Convention for shipping AI-readable docs | Static file | Doc format only; no symbols, no graph, no versioned registry. |
+| **Augment / Sourcegraph Cody / Cursor `@docs`** | Index your repo (+ some deps) for retrieval | Hosted index tied to a workspace clone | Not a portable, versioned, shippable artifact. |
+
+## Genuine gaps sempkg fills
+
+1. **Structured code graph, not just docs.** Competitors return documentation text.
+   sempkg's `get_callers` / `get_callees` / `get_impact` / `search_symbols` answer
+   code-structure questions ("does this method exist in 1.11.210, who calls it, what
+   breaks if it changes") that doc-fetchers fundamentally cannot. This is the strongest
+   moat.
+2. **Deterministic pinning vs. best-effort matching.** Incumbents auto-match "the
+   appropriate version." sempkg resolves `sempkg.toml` + `sempkg.lock` against an
+   immutable, checksummed, Ed25519-signed `.sembundle`. For *"ensure the API actually
+   exists in the version we ship,"* reproducible beats heuristic.
+3. **Works without good docs.** Doc-based tools collapse on poorly-documented or
+   internal libraries. sempkg builds indexes from source via CodeGraph, so a library
+   with zero `llms.txt` still gets full symbol intelligence.
+4. **Private / air-gapped / decentralized.** Context7 and GitMCP are hosted services.
+   A self-hostable registry plus the local Qwen3 reranker (no data leaving the machine)
+   serves internal monorepos and proprietary SDKs — exactly the dispersed-codebase case
+   no public crawler can touch.
+5. **Package-manager mental model.** Bundles shipped alongside releases, lockfiles,
+   mirrored registries — npm/cargo for code intelligence. Incumbents are centralized
+   indexes; nobody is doing federated, producer-published, versioned semantic artifacts.
+
+## Known risks
+
+- **Cold-start / chicken-and-egg.** Centralized crawlers (Context7) deliver value with
+  zero producer effort; sempkg needs a bundle built and published per version.
+  Mitigation: on-the-fly bundle builds from GitHub releases (see
+  `plan-sempkg-add-from-github.md`).
+- **Crowded framing.** "Stops hallucinations" is the literal tagline of multiple tools.
+  Lead positioning with **call-graph/impact + reproducible pinning + private/self-hosted**,
+  not generic doc lookup.
+- **Doc freshness vs. structure.** For "how do I use library X," doc snippets are often
+  enough and lower-friction. sempkg wins on reasoning over code structure across pinned,
+  private, multi-repo dependencies — positioning should target that scenario.
+
+## Verdict
+
+The combination of **(a) structured symbol/call-graph intelligence, (b) deterministic
+version pinning via signed bundles, and (c) self-hosted/private/offline operation** is
+not served by Context7, GitMCP, DeepWiki, or llms.txt — each covers at most one, and all
+at the documentation layer only. The defensible wedge is the **enterprise / multi-repo /
+private-dependency** scenario with **reproducible, code-structure-aware** indexes.
+
+---
+
 # **Long-Term Vision**
 
 sempkg becomes the **semantic infrastructure layer** for modern software development:
