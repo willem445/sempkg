@@ -403,6 +403,8 @@ mod tests {
                 subdir: None,
                 full: false,
                 local: None,
+                include_source: false,
+                source_glob: None,
             },
         );
         manifest.reranker = Some(crate::reranker::RerankerConfig {
