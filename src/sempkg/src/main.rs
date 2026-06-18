@@ -155,7 +155,20 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
         } => {
             let dir = require_workspace(workspace)?;
 
-            // Check if this is a GitHub source first
+            // Check if this is a local folder path first
+            if let Some(local_path) = parse_local_source(&spec) {
+                return add_from_local(
+                    local_path,
+                    dir,
+                    group.as_deref(),
+                    reinstall,
+                    name_override.as_deref(),
+                    version_override.as_deref(),
+                    workspace,
+                );
+            }
+
+            // Check if this is a GitHub source
             if let Some(gh_src) = github::parse_source(&spec) {
                 return add_from_github(
                     gh_src,
@@ -185,6 +198,7 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
                     git_ref: None,
                     subdir: None,
                     full: false,
+                    local: None,
                 };
                 insert_dep(&mut mf, name, dep, group.as_deref());
             } else if let Some(url) = &registry_url {
@@ -205,6 +219,7 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
                     git_ref: None,
                     subdir: None,
                     full: false,
+                    local: None,
                 };
                 insert_dep(&mut mf, name, dep, group.as_deref());
             } else {
@@ -226,6 +241,7 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
                     git_ref: None,
                     subdir: None,
                     full: false,
+                    local: None,
                 };
                 insert_dep(&mut mf, name, dep, group.as_deref());
             }
@@ -345,6 +361,22 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
                         full,
                         Some(dep_name),
                         None,
+                        workspace,
+                    )?;
+                    continue;
+                }
+
+                // Local folder dependency — re-build from the stored path
+                if let Some(local_path_str) = &dep.local {
+                    let local_path = PathBuf::from(local_path_str);
+                    println!("  Syncing {dep_name} from local path {} ...", local_path.display());
+                    add_from_local(
+                        local_path,
+                        dir,
+                        None,
+                        reinstall,
+                        Some(dep_name),
+                        Some(&dep.version),
                         workspace,
                     )?;
                     continue;
@@ -1501,6 +1533,7 @@ fn record_github_dep(
         git_ref: src.git_ref.clone(),
         subdir: src.subdir.clone(),
         full: full_clone,
+        local: None,
     };
     insert_dep(&mut mf, &resolved.package_name, dep, group);
     manifest::save_manifest(&mf, workspace_dir)?;
@@ -1649,4 +1682,285 @@ fn resolve_lance_path(name: &str, workspace: Option<&Path>) -> Result<PathBuf> {
     }
 
     anyhow::bail!("'{name}' not found. Run 'sempkg list' to see available packages and bundles.")
+}
+
+// ---------------------------------------------------------------------------
+// Local folder source detection
+// ---------------------------------------------------------------------------
+
+/// Detect whether `spec` looks like a local filesystem path.
+///
+/// Accepted forms:
+/// - Absolute Unix paths: `/usr/lib/llvm`
+/// - Absolute Windows paths: `C:\LLVM` or `C:/LLVM`
+/// - Relative paths starting with `./` or `../` (`.\` / `..\` on Windows)
+/// - Home-relative paths starting with `~/` or `~\`
+///
+/// Returns `None` if the spec does not match any of these forms, allowing the
+/// caller to fall through to the GitHub / registry resolution paths.
+fn parse_local_source(spec: &str) -> Option<PathBuf> {
+    let s = spec.trim();
+
+    // Reject anything that looks like a URL or owner/repo shorthand early.
+    if s.contains("://") || s.contains("github:") {
+        return None;
+    }
+
+    let looks_local = s.starts_with('/')
+        || s.starts_with("./")
+        || s.starts_with("../")
+        || s.starts_with(".\\")
+        || s.starts_with("..\\")
+        || s.starts_with("~/")
+        || s.starts_with("~\\")
+        // Windows absolute path: drive letter + colon + separator
+        || (s.len() >= 3
+            && s.as_bytes()[1] == b':'
+            && (s.as_bytes()[2] == b'\\' || s.as_bytes()[2] == b'/'));
+
+    if !looks_local {
+        return None;
+    }
+
+    // Expand `~` to the user home directory.
+    let expanded: PathBuf = if let Some(rest) = s.strip_prefix("~/").or_else(|| s.strip_prefix("~\\")) {
+        dirs::home_dir()?.join(rest)
+    } else {
+        PathBuf::from(s)
+    };
+
+    Some(expanded)
+}
+
+// ---------------------------------------------------------------------------
+// Local folder add-from-source orchestration
+// ---------------------------------------------------------------------------
+
+/// Build (or rebuild) and install a bundle from a local folder.
+///
+/// Steps:
+///  1. Canonicalize the path and validate it is a directory.
+///  2. Derive package name from the folder's basename (or use override).
+///  3. Derive version: try `git describe` / `git rev-parse --short HEAD`,
+///     fallback to `"local"`.
+///  4. Skip if already installed and `reinstall` is false.
+///  5. Build the `.sembundle` archive with `sembundle::build`.
+///  6. Install into the workspace bundle store.
+///  7. Record `{ local = "<path>", version = "..." }` in `sempkg.toml`.
+#[allow(clippy::too_many_arguments)]
+fn add_from_local(
+    local_path: PathBuf,
+    workspace_dir: &Path,
+    group: Option<&str>,
+    reinstall: bool,
+    name_override: Option<&str>,
+    version_override: Option<&str>,
+    _workspace: Option<&Path>,
+) -> Result<()> {
+    // --- 1. Validate path ---------------------------------------------------
+    if !local_path.exists() {
+        anyhow::bail!(
+            "Local path '{}' does not exist.",
+            local_path.display()
+        );
+    }
+    if !local_path.is_dir() {
+        anyhow::bail!(
+            "Local path '{}' is not a directory.",
+            local_path.display()
+        );
+    }
+    let canonical = local_path
+        .canonicalize()
+        .with_context(|| format!("Failed to canonicalize '{}'", local_path.display()))?;
+
+    // --- 2. Package name ----------------------------------------------------
+    let package_name: String = if let Some(n) = name_override {
+        n.to_string()
+    } else {
+        canonical
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            // Replace characters that are invalid in bundle names with `-`.
+            .map(|n| {
+                n.chars()
+                    .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '-' })
+                    .collect()
+            })
+            .unwrap_or_else(|| "local-package".to_string())
+    };
+
+    // --- 3. Version ---------------------------------------------------------
+    let version: String = if let Some(v) = version_override {
+        v.to_string()
+    } else {
+        local_git_version(&canonical).unwrap_or_else(|| "local".to_string())
+    };
+
+    eprintln!(
+        "[sempkg] Local source: {} → {}@{}",
+        canonical.display(),
+        package_name,
+        version
+    );
+
+    // --- 4. Already installed? ----------------------------------------------
+    let store = BundleStore::workspace(workspace_dir);
+    if !reinstall && store.is_installed(&package_name, &version) {
+        println!(
+            "{}@{} is already installed. Use --reinstall to rebuild.",
+            package_name, version
+        );
+        // Still write to manifest if not already present.
+        record_local_dep(workspace_dir, &canonical, &package_name, &version, group, None)?;
+        return Ok(());
+    }
+
+    // --- 5. Build -----------------------------------------------------------
+    let language = github::detect_language(&canonical);
+    let cg_version = codegraph::version();
+
+    eprintln!(
+        "[sempkg] Building bundle for {}@{} (language: {language}, codegraph: {cg_version}) ...",
+        package_name, version
+    );
+
+    let tmp = tempfile::TempDir::new().context("Failed to create temp directory")?;
+    let bundle_output = tmp
+        .path()
+        .join(format!("{}-{}.sembundle", package_name, version));
+
+    let build_opts = sembundle::BuildOptions {
+        name: package_name.clone(),
+        version: version.clone(),
+        source_repo: format!("local:{}", canonical.display()),
+        commit_hash: local_git_sha(&canonical).unwrap_or_default(),
+        tag: None,
+        language,
+        codegraph_version: cg_version,
+        output_path: Some(bundle_output.clone()),
+        source_dirs: vec![canonical.clone()],
+        docs_dirs: vec![canonical.clone()],
+        docs_glob: None,
+    };
+
+    sembundle::build(build_opts).with_context(|| {
+        format!(
+            "Failed to build bundle for {}@{} from '{}'.\n\
+             Ensure `codegraph` is on your PATH.",
+            package_name, version, canonical.display()
+        )
+    })?;
+
+    // --- 6. Install ---------------------------------------------------------
+    let bytes = std::fs::read(&bundle_output)
+        .with_context(|| format!("Cannot read built bundle at {}", bundle_output.display()))?;
+
+    let info = match store.install_bytes(&bytes) {
+        Ok(i) => i,
+        Err(e) if e.to_string().contains("already installed") => {
+            eprintln!("[sempkg] Bundle already installed, skipping extraction.");
+            store
+                .get_version(&package_name, &version)
+                .ok_or_else(|| anyhow::anyhow!("Bundle installed but not found in store"))?
+        }
+        Err(e) => return Err(e),
+    };
+
+    println!(
+        "Installed {}@{} from {}{}",
+        info.name,
+        info.version,
+        canonical.display(),
+        if info.has_lance() { "  +lance" } else { "" }
+    );
+
+    // --- 7. Record in manifest ----------------------------------------------
+    let sha256 = hex::encode(sha2::Sha256::digest(&bytes));
+    record_local_dep(workspace_dir, &canonical, &package_name, &version, group, Some(&sha256))
+}
+
+/// Try to derive a human-readable version from a git repository at `path`.
+///
+/// Tries `git describe --tags --always --abbrev=12` first (gives a tag like
+/// `v1.2.3` or `v1.2.3-42-gabcdef`), then falls back to
+/// `git rev-parse --short=12 HEAD`.  Returns `None` if neither succeeds or the
+/// directory is not a git repository.
+fn local_git_version(path: &Path) -> Option<String> {
+    let describe = std::process::Command::new("git")
+        .args(["-C", &path.to_string_lossy(), "describe", "--tags", "--always", "--abbrev=12"])
+        .output()
+        .ok()?;
+
+    if describe.status.success() {
+        let v = String::from_utf8_lossy(&describe.stdout).trim().to_string();
+        if !v.is_empty() {
+            return Some(v.trim_start_matches('v').to_string());
+        }
+    }
+
+    None
+}
+
+/// Try to get the full commit SHA for the HEAD of a git repository at `path`.
+fn local_git_sha(path: &Path) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .args(["-C", &path.to_string_lossy(), "rev-parse", "HEAD"])
+        .output()
+        .ok()?;
+    if out.status.success() {
+        let sha = String::from_utf8_lossy(&out.stdout).trim().to_lowercase();
+        if sha.len() == 40 {
+            return Some(sha);
+        }
+    }
+    None
+}
+
+/// Write the `{ local = "...", version = "..." }` entry into `sempkg.toml`
+/// and update `sempkg.lock`.
+fn record_local_dep(
+    workspace_dir: &Path,
+    canonical: &Path,
+    package_name: &str,
+    version: &str,
+    group: Option<&str>,
+    sha256: Option<&str>,
+) -> Result<()> {
+    let mut mf = manifest::load_manifest(workspace_dir)?;
+
+    let dep = manifest::DependencyEntry {
+        version: version.to_string(),
+        registry: None,
+        url: None,
+        git: None,
+        git_ref: None,
+        subdir: None,
+        full: false,
+        local: Some(canonical.to_string_lossy().into_owned()),
+    };
+    insert_dep(&mut mf, package_name, dep, group);
+    manifest::save_manifest(&mf, workspace_dir)?;
+
+    if let Some(sha) = sha256 {
+        let mut lock = manifest::load_lock(workspace_dir)?;
+        lock.upsert(manifest::LockEntry {
+            name: package_name.to_string(),
+            version: version.to_string(),
+            registry_url: format!("local:{}", canonical.display()),
+            sha256: sha.to_owned(),
+            signed: false,
+            manifest_checksums: Default::default(),
+            commit_sha: local_git_sha(canonical),
+        });
+        manifest::save_lock(&lock, workspace_dir)?;
+    }
+
+    if let Some(g) = group {
+        println!("Recorded {}@{} in group '{}' in sempkg.toml.", package_name, version, g);
+    } else {
+        println!("Recorded {}@{} in sempkg.toml.", package_name, version);
+    }
+
+    Ok(())
 }

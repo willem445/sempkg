@@ -72,6 +72,10 @@ pub struct DependencyEntry {
     /// strip documentation from their archive via `.gitattributes export-ignore`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub full: bool,
+    /// Absolute path to a local folder used as the bundle source.
+    /// Set when this dependency was added via `sempkg add <local-path>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -322,6 +326,9 @@ fn dep_inline(dep: &DependencyEntry) -> InlineTable {
     if dep.full {
         it.insert("full", Value::from(true));
     }
+    if let Some(local) = &dep.local {
+        it.insert("local", Value::from(local.as_str()));
+    }
     it
 }
 
@@ -387,6 +394,7 @@ mod tests {
                 git_ref: None,
                 subdir: None,
                 full: false,
+                local: None,
             },
         );
         manifest.reranker = Some(crate::reranker::RerankerConfig {

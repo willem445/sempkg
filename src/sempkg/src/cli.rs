@@ -82,9 +82,17 @@ pub enum Commands {
     /// Example: sempkg add mylib@2.0.0 --url https://github.com/owner/repo/releases/download/v2.0.0/mylib-2.0.0.sembundle
     /// Example: sempkg add pandas-dev/pandas@v2.2.2
     /// Example: sempkg add https://github.com/pandas-dev/pandas/tree/v2.2.2
+    /// Example: sempkg add /path/to/sdk --name my-sdk
+    /// Example: sempkg add ~/tools/llvm --name llvm --version 17.0
+    /// Example: sempkg add C:\LLVM --name llvm
     ///
     /// When a GitHub source is provided, sempkg immediately fetches, builds,
     /// and installs the bundle into the workspace (no separate `sync` needed).
+    ///
+    /// When a local filesystem path is provided (absolute or relative starting
+    /// with `./`, `../`, or `~/`), sempkg builds the bundle directly from that
+    /// directory and installs it.  The path is recorded in `sempkg.toml` so
+    /// `sempkg sync` can rebuild it later.
     Add {
         /// Package spec in `name@version` format, GitHub shorthand `owner/repo@ref`,
         /// or a full GitHub URL.
