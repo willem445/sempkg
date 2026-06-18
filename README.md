@@ -26,6 +26,58 @@ Most agent tooling dumps broad, global indexes into one shared context pool. Ove
 
 ---
 
+## The problem, in depth
+
+Agents are good at using code once the right code is in front of them. The hard
+part is getting reliable context for the dependencies your project actually
+uses.
+
+In a real workspace, an agent usually has three bad fallback options:
+
+1. Crawl GitHub repos, tags, or random URLs and hope the discovered code matches
+   the exact version your project consumes.
+2. Read whatever dependency artifacts happen to exist locally in the workspace,
+   even though most indexing pipelines intentionally skip installed packages.
+3. Fall back to brute-force grep across source trees, vendored files, generated
+   code, and partial docs.
+
+Each option breaks in a different way.
+
+If the agent crawls GitHub, it may find the default branch, the wrong release
+tag, incomplete source snapshots, or docs that drifted away from the version you
+ship. That is enough to produce subtly wrong API calls, outdated signatures, or
+references to symbols that never existed in your dependency set.
+
+If the agent tries to rely on dependencies installed into the workspace, it hits
+another problem: most code indexing tools do not index those dependencies at
+all. That is often the correct tradeoff. Dependency directories are full of
+noise: generated files, build outputs, transitive packages, duplicated vendored
+code, irrelevant symbols, and giant surfaces that would pollute retrieval for
+the project the agent is actually trying to change. So the dependency code is
+present on disk, but absent from the agent's structured search tools.
+
+At that point, the agent often degrades to inefficient grepping. It can scan raw
+files, but it loses the higher-level structure it actually needs: symbol
+definitions, call relationships, package boundaries, version identity, and the
+ability to distinguish the one relevant API from thousands of adjacent lines of
+junk.
+
+Documentation-focused tools only solve part of this. Some systems index docs,
+and some build a bridge from a code graph to a documentation index. That helps
+retrieval, but it still fails if the docs are not pinned to the exact version in
+your build, or if the docs simply do not describe the real implementation well
+enough. Agents do not just need prose about a library; they need the actual code
+surface they are calling: real symbols, real signatures, real relationships, and
+real version boundaries.
+
+That is the gap `sempkg` is built to close. Instead of making agents choose
+between wrong-version GitHub crawling, unindexed local dependencies, or
+documentation that may not reflect reality, `sempkg` installs version-pinned
+semantic bundles directly into the workspace and exposes them as clean,
+structured context.
+
+---
+
 ## Components
 
 | Component | Language | Description |
