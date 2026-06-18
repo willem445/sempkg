@@ -102,6 +102,28 @@ sempkg sync
 sempkg add https://github.com/pandas-dev/pandas/releases/tag/v3.0.3 --full
 ```
 
+### GitHub authentication (private / enterprise)
+
+When using private repositories or restricted GitHub hosts (GitHub Enterprise),
+set a token environment variable before running `sempkg add`.
+
+For host `github.company.com`, sempkg checks variables in this order:
+
+1. `GITHUB_TOKEN_GITHUB_COMPANY_COM`
+2. `GH_TOKEN_GITHUB_COMPANY_COM`
+3. `GITHUB_ENTERPRISE_TOKEN`
+4. `GH_ENTERPRISE_TOKEN`
+5. `GITHUB_TOKEN`
+6. `GH_TOKEN`
+
+Use host-specific variables when possible to avoid mixing public GitHub and
+enterprise credentials.
+
+```powershell
+$env:GITHUB_TOKEN_GITHUB_COMPANY_COM = "<your-enterprise-pat>"
+sempkg add https://github.company.com/org/repo/releases/tag/v3.0.3 --full
+```
+
 ---
 
 ## Documentation

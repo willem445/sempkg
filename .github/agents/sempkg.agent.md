@@ -38,6 +38,7 @@ Always start with `list_packages` to see what is indexed. The output shows:
 
 | User question type | Tool(s) to use |
 |--------------------|----------------|
+| "I need the best answer across code and docs" / ambiguous troubleshooting, migration, or architecture questions | `query` (hybrid: code + docs + reranker) |
 | "What does `X` do / how is it called?" | `search_symbols` → `get_callers` |
 | "What does function `X` depend on?" | `get_callees` |
 | "What breaks if I change `X`?" | `get_impact` |
@@ -60,6 +61,20 @@ Always start with `list_packages` to see what is indexed. The output shows:
 - `search_docs` searches the LanceDB full-text index — best for prose
   documentation ("what is the retry policy?"). Check `docs_metadata` first to
   confirm the docs index exists and is non-empty.
+
+### 4.5. When to use `query` (hybrid retrieval)
+
+- Use `query` when the user asks a broad or mixed question where both API-level
+  code evidence and prose documentation may be relevant.
+- `query` should be the default for open-ended troubleshooting, migration
+  planning, design comparisons, or "what is the recommended approach" prompts.
+- `query` combines CodeGraph and LanceDB retrieval and uses a reranker to bring
+  the most relevant cross-source evidence to the top.
+- Prefer symbol-first tools (`search_symbols`, `get_callers`, `get_callees`,
+  `get_impact`) when the user asks about a specific known symbol and precise
+  call graph behavior.
+- If `query` results are sparse, follow up with targeted symbol or docs tools
+  rather than guessing.
 
 ### 5. Call graph exploration
 
