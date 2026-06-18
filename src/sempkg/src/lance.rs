@@ -310,6 +310,116 @@ pub fn fetch_symbol_source(
     Ok(result)
 }
 
+/// Fetch the symbol whose source range contains `line` in `file` from the `code` table.
+/// `file` is matched as a suffix of the stored path (e.g. `src/foo.rs` matches
+/// `some/prefix/src/foo.rs`). Returns the best (tightest) match when multiple
+/// symbols overlap the requested line.
+pub fn fetch_symbol_at_location(
+    code_dir: &Path,
+    file: &str,
+    line: u32,
+) -> crate::error::Result<Option<SymbolSource>> {
+    if !code_dir.is_dir() {
+        return Ok(None);
+    }
+
+    // Sanitise the file argument so it can be embedded in a SQL filter string.
+    // Reject anything that could alter the expression syntax.
+    let safe_file = file.replace('\'', "''");
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| SempkgError::Io(e))?;
+
+    let result = rt.block_on(async {
+        let db = lancedb::connect(code_dir.to_str().unwrap_or("."))
+            .execute()
+            .await
+            .map_err(|e| SempkgError::LanceError(e.to_string()))?;
+
+        let tbl = db
+            .open_table("code")
+            .execute()
+            .await
+            .map_err(|e| SempkgError::LanceError(e.to_string()))?;
+
+        // Filter to rows whose path ends with the requested file and whose line
+        // range brackets the requested line number.
+        let filter = format!(
+            "(path = '{safe_file}' OR path LIKE '%/{safe_file}' OR path LIKE '%\\{safe_file}') \
+             AND start_line <= {line} AND end_line >= {line}"
+        );
+
+        let batches: Vec<RecordBatch> = tbl
+            .query()
+            .only_if(filter)
+            .execute()
+            .await
+            .map_err(|e| SempkgError::LanceError(e.to_string()))?
+            .try_collect()
+            .await
+            .map_err(|e| SempkgError::LanceError(e.to_string()))?;
+
+        let mut best: Option<SymbolSource> = None;
+
+        for batch in &batches {
+            let syms = batch
+                .column_by_name("symbol")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+            let paths = batch
+                .column_by_name("path")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+            let kinds = batch
+                .column_by_name("kind")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+            let sigs = batch
+                .column_by_name("signature")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+            let contents = batch
+                .column_by_name("content")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+            let start_lines = batch
+                .column_by_name("start_line")
+                .and_then(|c| c.as_any().downcast_ref::<UInt32Array>());
+            let end_lines = batch
+                .column_by_name("end_line")
+                .and_then(|c| c.as_any().downcast_ref::<UInt32Array>());
+
+            if let (Some(s), Some(p), Some(c)) = (syms, paths, contents) {
+                for i in 0..batch.num_rows() {
+                    let start = start_lines.map_or(0, |a| a.value(i));
+                    let end = end_lines.map_or(0, |a| a.value(i));
+
+                    let candidate = SymbolSource {
+                        path: p.value(i).to_string(),
+                        symbol: s.value(i).to_string(),
+                        kind: kinds.map_or("", |a| a.value(i)).to_string(),
+                        signature: sigs.map_or("", |a| a.value(i)).to_string(),
+                        content: c.value(i).to_string(),
+                        start_line: start,
+                        end_line: end,
+                    };
+
+                    // Keep the tightest enclosing range (smallest span).
+                    let span = end.saturating_sub(start);
+                    let is_better = match &best {
+                        None => true,
+                        Some(prev) => span < prev.end_line.saturating_sub(prev.start_line),
+                    };
+                    if is_better {
+                        best = Some(candidate);
+                    }
+                }
+            }
+        }
+
+        Ok::<Option<SymbolSource>, SempkgError>(best)
+    })?;
+
+    Ok(result)
+}
+
 /// Format search results as Markdown.
 pub fn format_results(results: &[SearchResult], query: &str) -> String {
     if results.is_empty() {

@@ -76,6 +76,14 @@ pub struct DependencyEntry {
     /// Set when this dependency was added via `sempkg add <local-path>`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local: Option<String>,
+    /// When true, `sempkg sync` will rebuild the LanceDB source-code index
+    /// (chunked by top-level symbols) when rebuilding this bundle.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub include_source: bool,
+    /// Custom glob mask for the source-code index (only meaningful when
+    /// `include_source` is true).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_glob: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

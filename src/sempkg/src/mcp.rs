@@ -213,6 +213,20 @@ fn all_tools() -> Value {
             }),
             &["package", "symbol"]
         ),
+        tool_schema(
+            "read_code",
+            "Read the exact source body of the symbol that contains a given file and line number. \
+             Use this after search_symbols, get_callers, get_callees, or get_impact return a \
+             file path and line number — pass those directly here to retrieve the precise \
+             implementation without doing a secondary search. \
+             Only available for bundles built with --include-source.",
+            json!({
+                "package": { "type": "string", "description": "Bundle name" },
+                "file":    { "type": "string", "description": "Source file path as returned by codegraph (e.g. src/foo.rs)" },
+                "line":    { "type": "integer", "description": "Line number within that file (1-based)" }
+            }),
+            &["package", "file", "line"]
+        ),
     ])
 }
 
@@ -511,6 +525,34 @@ impl McpContext {
         }
     }
 
+    fn tool_read_code(&self, package: &str, file: &str, line: u32) -> String {
+        match self.resolve_code_path(package) {
+            Err(e) => e,
+            Ok(code_dir) => {
+                match lance::fetch_symbol_at_location(&code_dir, file, line) {
+                    Err(e) => format!("Error reading code: {e}"),
+                    Ok(None) => format!(
+                        "No symbol found covering {file}:{line} in the code index for '{package}'. \
+                         Verify the file path and line number from the codegraph results, or use \
+                         read_symbol to look up by name."
+                    ),
+                    Ok(Some(src)) => {
+                        let loc = format!("{}:{}-{}", src.path, src.start_line, src.end_line);
+                        let sig_part = if src.signature.is_empty() {
+                            String::new()
+                        } else {
+                            format!("\n_{}_", src.signature)
+                        };
+                        format!(
+                            "**{}** ({}) @ {}{}\n\n```\n{}\n```",
+                            src.symbol, src.kind, loc, sig_part, src.content
+                        )
+                    }
+                }
+            }
+        }
+    }
+
     fn tool_read_symbol(&self, package: &str, symbol: &str) -> String {
         match self.resolve_code_path(package) {
             Err(e) => e,
@@ -762,6 +804,13 @@ impl McpContext {
                 int_arg("limit", 10),
             ),
             "read_symbol" => self.tool_read_symbol(str_arg("package"), str_arg("symbol")),
+            "read_code" => {
+                let line = args
+                    .get("line")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as u32;
+                self.tool_read_code(str_arg("package"), str_arg("file"), line)
+            }
             _ => format!("Unknown tool: {name}"),
         }
     }

@@ -153,6 +153,8 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
             full,
             name: name_override,
             version: version_override,
+            include_source,
+            source_glob,
         } => {
             let dir = require_workspace(workspace)?;
 
@@ -165,6 +167,8 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
                     reinstall,
                     name_override.as_deref(),
                     version_override.as_deref(),
+                    include_source,
+                    source_glob.clone(),
                     workspace,
                 );
             }
@@ -180,6 +184,8 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
                     full,
                     name_override.as_deref(),
                     version_override.as_deref(),
+                    include_source,
+                    source_glob.clone(),
                     workspace,
                 );
             }
@@ -200,6 +206,8 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
                     subdir: None,
                     full: false,
                     local: None,
+                    include_source: false,
+                    source_glob: None,
                 };
                 insert_dep(&mut mf, name, dep, group.as_deref());
             } else if let Some(url) = &registry_url {
@@ -221,6 +229,8 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
                     subdir: None,
                     full: false,
                     local: None,
+                    include_source: false,
+                    source_glob: None,
                 };
                 insert_dep(&mut mf, name, dep, group.as_deref());
             } else {
@@ -243,6 +253,8 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
                     subdir: None,
                     full: false,
                     local: None,
+                    include_source: false,
+                    source_glob: None,
                 };
                 insert_dep(&mut mf, name, dep, group.as_deref());
             }
@@ -362,6 +374,8 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
                         full,
                         Some(dep_name),
                         None,
+                        dep.include_source,
+                        dep.source_glob.clone(),
                         workspace,
                     )?;
                     continue;
@@ -378,6 +392,8 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
                         reinstall,
                         Some(dep_name),
                         Some(&dep.version),
+                        dep.include_source,
+                        dep.source_glob.clone(),
                         workspace,
                     )?;
                     continue;
@@ -1328,6 +1344,8 @@ fn add_from_github(
     full_clone: bool,
     name_override: Option<&str>,
     version_override: Option<&str>,
+    include_source: bool,
+    source_glob: Option<String>,
     workspace: Option<&Path>,
 ) -> Result<()> {
     let token = github::github_token_for_host(&src.host);
@@ -1354,7 +1372,7 @@ fn add_from_github(
             resolved.package_name, resolved.version
         );
         // Still write to manifest/lock if not already there
-        record_github_dep(workspace_dir, &resolved, &src, group, None, full_clone)?;
+        record_github_dep(workspace_dir, &resolved, &src, group, None, full_clone, include_source, source_glob)?;
         return Ok(());
     }
 
@@ -1383,6 +1401,8 @@ fn add_from_github(
                 group,
                 store,
                 false, // release asset — full_clone does not apply
+                false, // release asset — source index not rebuilt
+                None,
             );
         }
     }
@@ -1440,8 +1460,8 @@ fn add_from_github(
         source_dirs: vec![source_root.clone()],
         docs_dirs: vec![source_root.clone()],
         docs_glob: None,
-        include_source: false,
-        source_glob: None,
+        include_source,
+        source_glob: source_glob.clone(),
     };
 
     sembundle::build(build_opts).with_context(|| {
@@ -1469,6 +1489,8 @@ fn add_from_github(
         group,
         store,
         full_clone,
+        include_source,
+        source_glob,
     )
 }
 
@@ -1482,19 +1504,18 @@ fn install_github_bundle(
     group: Option<&str>,
     store: BundleStore,
     full_clone: bool,
+    include_source: bool,
+    source_glob: Option<String>,
 ) -> Result<()> {
-    // Handle already-installed gracefully
-    let info = match store.install_bytes(&bytes) {
-        Ok(i) => i,
-        Err(e) if e.to_string().contains("already installed") => {
-            eprintln!("[sempkg] Bundle already installed, skipping extraction.");
-            // Load existing info
-            store
-                .get_version(&resolved.package_name, &resolved.version)
-                .ok_or_else(|| anyhow::anyhow!("Bundle installed but not found in store"))?
-        }
-        Err(e) => return Err(e),
-    };
+    // Remove existing bundle dir so install_bytes can extract the freshly-built one.
+    let existing_dir = store.bundle_dir(&resolved.package_name, &resolved.version);
+    if existing_dir.exists() {
+        std::fs::remove_dir_all(&existing_dir).with_context(|| {
+            format!("Failed to remove existing bundle at {}", existing_dir.display())
+        })?;
+    }
+
+    let info = store.install_bytes(&bytes)?;
 
     let sha256 = hex::encode(sha2::Sha256::digest(&bytes));
 
@@ -1514,6 +1535,8 @@ fn install_github_bundle(
         group,
         Some(&sha256),
         full_clone,
+        include_source,
+        source_glob,
     )
 }
 
@@ -1524,6 +1547,8 @@ fn record_github_dep(
     group: Option<&str>,
     sha256: Option<&str>,
     full_clone: bool,
+    include_source: bool,
+    source_glob: Option<String>,
 ) -> Result<()> {
     let mut mf = manifest::load_manifest(workspace_dir)?;
 
@@ -1540,6 +1565,8 @@ fn record_github_dep(
         subdir: src.subdir.clone(),
         full: full_clone,
         local: None,
+        include_source,
+        source_glob,
     };
     insert_dep(&mut mf, &resolved.package_name, dep, group);
     manifest::save_manifest(&mf, workspace_dir)?;
@@ -1761,6 +1788,8 @@ fn add_from_local(
     reinstall: bool,
     name_override: Option<&str>,
     version_override: Option<&str>,
+    include_source: bool,
+    source_glob: Option<String>,
     _workspace: Option<&Path>,
 ) -> Result<()> {
     // --- 1. Validate path ---------------------------------------------------
@@ -1818,7 +1847,7 @@ fn add_from_local(
             package_name, version
         );
         // Still write to manifest if not already present.
-        record_local_dep(workspace_dir, &canonical, &package_name, &version, group, None)?;
+        record_local_dep(workspace_dir, &canonical, &package_name, &version, group, None, include_source, source_glob.clone())?;
         return Ok(());
     }
 
@@ -1848,8 +1877,8 @@ fn add_from_local(
         source_dirs: vec![canonical.clone()],
         docs_dirs: vec![canonical.clone()],
         docs_glob: None,
-        include_source: false,
-        source_glob: None,
+        include_source,
+        source_glob: source_glob.clone(),
     };
 
     sembundle::build(build_opts).with_context(|| {
@@ -1864,16 +1893,15 @@ fn add_from_local(
     let bytes = std::fs::read(&bundle_output)
         .with_context(|| format!("Cannot read built bundle at {}", bundle_output.display()))?;
 
-    let info = match store.install_bytes(&bytes) {
-        Ok(i) => i,
-        Err(e) if e.to_string().contains("already installed") => {
-            eprintln!("[sempkg] Bundle already installed, skipping extraction.");
-            store
-                .get_version(&package_name, &version)
-                .ok_or_else(|| anyhow::anyhow!("Bundle installed but not found in store"))?
-        }
-        Err(e) => return Err(e),
-    };
+    // Remove existing bundle dir so install_bytes can extract the freshly-built one.
+    let existing_dir = store.bundle_dir(&package_name, &version);
+    if existing_dir.exists() {
+        std::fs::remove_dir_all(&existing_dir).with_context(|| {
+            format!("Failed to remove existing bundle at {}", existing_dir.display())
+        })?;
+    }
+
+    let info = store.install_bytes(&bytes)?;
 
     println!(
         "Installed {}@{} from {}{}{}",
@@ -1886,7 +1914,7 @@ fn add_from_local(
 
     // --- 7. Record in manifest ----------------------------------------------
     let sha256 = hex::encode(sha2::Sha256::digest(&bytes));
-    record_local_dep(workspace_dir, &canonical, &package_name, &version, group, Some(&sha256))
+    record_local_dep(workspace_dir, &canonical, &package_name, &version, group, Some(&sha256), include_source, source_glob)
 }
 
 /// Try to derive a human-readable version from a git repository at `path`.
@@ -1935,6 +1963,8 @@ fn record_local_dep(
     version: &str,
     group: Option<&str>,
     sha256: Option<&str>,
+    include_source: bool,
+    source_glob: Option<String>,
 ) -> Result<()> {
     let mut mf = manifest::load_manifest(workspace_dir)?;
 
@@ -1947,6 +1977,8 @@ fn record_local_dep(
         subdir: None,
         full: false,
         local: Some(canonical.to_string_lossy().into_owned()),
+        include_source,
+        source_glob,
     };
     insert_dep(&mut mf, package_name, dep, group);
     manifest::save_manifest(&mf, workspace_dir)?;

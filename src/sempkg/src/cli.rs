@@ -138,6 +138,18 @@ pub enum Commands {
         /// Override the version derived from the git ref.
         #[arg(long, short = 'v')]
         version: Option<String>,
+
+        /// Build a LanceDB source-code index (chunked by top-level symbols) and
+        /// embed it in the bundle.  Enables the `search_code` and `read_symbol`
+        /// MCP tools and augments `get_callers`/`get_callees` with source bodies.
+        #[arg(long)]
+        include_source: bool,
+
+        /// Glob mask restricting which source files are included in the code index
+        /// (only meaningful with --include-source).
+        /// Default covers Rust, Python, JS/TS, Go, Java, C/C++.
+        #[arg(long)]
+        source_glob: Option<String>,
     },
 
     /// Remove a bundle dependency from sempkg.toml (from [dependencies] or a group).
