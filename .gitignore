@@ -1,5 +1,8 @@
 *.sembundle
 
+# Signing keys — private key must never be committed
+keys/private.pem
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

@@ -152,9 +152,76 @@ jobs:
           path: ${{ env.ARTIFACT }}
           retention-days: 1
 
+  bundle-sempkg:
+    name: Build and sign sempkg SemBundle
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download sembundle (Linux)
+        uses: actions/download-artifact@v4
+        with:
+          name: sembundle-x86_64-unknown-linux-gnu
+          path: tools/
+
+      - name: Make sembundle executable
+        run: chmod +x tools/sembundle
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install CodeGraph
+        run: npm install -g @colbymchenry/codegraph
+
+      - name: Resolve version and CodeGraph version
+        run: |
+          echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+          CG_VER=$(codegraph --version 2>&1 | grep -oP '\d+\.\d+\.\d+' | head -1)
+          echo "CODEGRAPH_VERSION=${CG_VER:-unknown}" >> "$GITHUB_ENV"
+
+      - name: Build sempkg SemBundle
+        run: |
+          ./tools/sembundle build \
+            --name sempkg \
+            --version "$VERSION" \
+            --source-repo https://github.com/willem445/sempkg \
+            --commit-hash "${{ github.sha }}" \
+            --codegraph-version "$CODEGRAPH_VERSION" \
+            --source-dir src/sempkg/src \
+            --docs-dir docs \
+            --language rust \
+            --output "sempkg-${VERSION}.sembundle"
+
+      - name: Write signing key
+        env:
+          SEMBUNDLE_SIGNING_KEY: ${{ secrets.SEMBUNDLE_SIGNING_KEY }}
+        run: |
+          echo "$SEMBUNDLE_SIGNING_KEY" > "$RUNNER_TEMP/private.pem"
+          chmod 600 "$RUNNER_TEMP/private.pem"
+
+      - name: Sign bundle
+        run: ./tools/sembundle sign "sempkg-${VERSION}.sembundle" --key "$RUNNER_TEMP/private.pem"
+
+      - name: Remove signing key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/private.pem"
+
+      - name: Upload bundle artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sempkg-sembundle
+          path: |
+            sempkg-${{ env.VERSION }}.sembundle
+            sempkg-${{ env.VERSION }}.sembundle.sig
+            keys/public.pem
+          retention-days: 1
+
   release:
     name: Publish GitHub Release
-    needs: build
+    needs: [build, bundle-sempkg]
     runs-on: ubuntu-latest
     steps:
       - name: Download all build artifacts
