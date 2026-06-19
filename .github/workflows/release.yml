@@ -232,8 +232,9 @@ jobs:
       - name: Write signing key
         env:
           SEMBUNDLE_SIGNING_KEY: ${{ secrets.SEMBUNDLE_SIGNING_KEY }}
+        shell: bash
         run: |
-          echo "$SEMBUNDLE_SIGNING_KEY" > "$RUNNER_TEMP/private.pem"
+          printf '%b' "$SEMBUNDLE_SIGNING_KEY" | tr -d '\r' > "$RUNNER_TEMP/private.pem"
           chmod 600 "$RUNNER_TEMP/private.pem"
 
       - name: Sign bundle
