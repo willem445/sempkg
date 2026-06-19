@@ -211,6 +211,7 @@ sempkg add https://github.company.com/org/repo/releases/tag/v3.0.3 --full
 ## Documentation
 
 - [sempkg User Guide](docs/sempkg.md) — CLI reference, MCP tools, workspace setup
+- [sembundle User Guide](docs/sembundle.md) — bundle creation, signing, publishing, and distribution
 - [SemBundle Format Specification](docs/sembundle-spec.md) — `.sembundle` archive format
 - [Registry Server Guide](docs/registry-server.md) — self-hosting the bundle registry
 - [ADR-001: LanceDB Documentation Index](docs/adr-001-lancedb-doc-index.md)
