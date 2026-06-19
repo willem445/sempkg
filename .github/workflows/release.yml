@@ -237,7 +237,8 @@ jobs:
           chmod 600 "$RUNNER_TEMP/private.pem"
 
       - name: Sign bundle
-        run: "$SEMBUNDLE_BIN" sign "sempkg-${VERSION}.sembundle" --key "$RUNNER_TEMP/private.pem"
+        run: |
+          "$SEMBUNDLE_BIN" sign "sempkg-${VERSION}.sembundle" --key "$RUNNER_TEMP/private.pem"
 
       - name: Remove signing key
         if: always()
