@@ -245,6 +245,9 @@ jobs:
         if: always()
         run: rm -f "$RUNNER_TEMP/private.pem"
 
+      - name: Stage public key
+        run: cp keys/public.pem public.pem
+
       - name: Upload bundle artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -252,7 +255,7 @@ jobs:
           path: |
             sempkg-${{ env.VERSION }}.sembundle
             sempkg-${{ env.VERSION }}.sembundle.sig
-            keys/public.pem
+            public.pem
           retention-days: 1
 
   release:
@@ -269,7 +272,7 @@ jobs:
       - name: Generate SHA-256 checksums
         run: |
           cd dist
-          sha256sum * > SHA256SUMS.txt
+          find . -type f | sort | xargs sha256sum > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
       - name: Create GitHub Release
