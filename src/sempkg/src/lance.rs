@@ -5,11 +5,11 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use arrow_array::{RecordBatch, RecordBatchIterator, StringArray, UInt32Array};
+use arrow_array::{RecordBatch, StringArray, UInt32Array};
 use arrow_schema::{DataType, Field, Schema};
 use futures::TryStreamExt;
-use lance_index::scalar::FullTextSearchQuery;
 use lancedb::query::{ExecutableQuery, QueryBase};
+use lancedb::index::scalar::FullTextSearchQuery;
 use serde::Deserialize;
 
 use crate::error::SempkgError;
@@ -607,10 +607,7 @@ pub fn cli_update(
         )
         .map_err(|e| SempkgError::LanceError(e.to_string()))?;
 
-        let reader = RecordBatchIterator::new(
-            vec![Ok::<RecordBatch, arrow_schema::ArrowError>(batch)],
-            schema,
-        );
+        let batches = vec![batch];
 
         let db = lancedb::connect(lance_out.to_str().unwrap_or("."))
             .execute()
@@ -618,10 +615,10 @@ pub fn cli_update(
             .map_err(|e| SempkgError::LanceError(e.to_string()))?;
 
         // Drop existing table if present so re-indexing works.
-        let _ = db.drop_table("docs").await;
+        let _ = db.drop_table("docs", &[]).await;
 
         let tbl = db
-            .create_table("docs", reader)
+            .create_table("docs", batches)
             .execute()
             .await
             .map_err(|e| SempkgError::LanceError(e.to_string()))?;

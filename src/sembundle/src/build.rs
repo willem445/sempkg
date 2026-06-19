@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 
-use arrow_array::{RecordBatch, RecordBatchIterator, StringArray, UInt32Array};
+use arrow_array::{RecordBatch, StringArray, UInt32Array};
 use arrow_schema::{DataType, Field, Schema};
 use serde_json::json;
 use walkdir::WalkDir;
@@ -301,7 +301,7 @@ async fn run_lance_inner(
         reason: e.to_string(),
     })?;
 
-    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    let batches = vec![batch];
 
     let db = lancedb::connect(out_dir.to_str().unwrap_or("."))
         .execute()
@@ -312,7 +312,7 @@ async fn run_lance_inner(
         })?;
 
     let tbl = db
-        .create_table("docs", reader)
+        .create_table("docs", batches)
         .execute()
         .await
         .map_err(|e| PackError::InvalidField {
@@ -748,7 +748,7 @@ async fn run_source_inner(
         reason: e.to_string(),
     })?;
 
-    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    let batches = vec![batch];
 
     let db = lancedb::connect(out_dir.to_str().unwrap_or("."))
         .execute()
@@ -759,7 +759,7 @@ async fn run_source_inner(
         })?;
 
     let tbl = db
-        .create_table("code", reader)
+        .create_table("code", batches)
         .execute()
         .await
         .map_err(|e| PackError::InvalidField {
