@@ -190,8 +190,17 @@ jobs:
           name: sembundle-x86_64-unknown-linux-gnu
           path: tools/
 
-      - name: Make sembundle executable
-        run: chmod +x tools/sembundle
+      - name: Resolve sembundle binary path
+        shell: bash
+        run: |
+          SEMBUNDLE_BIN=$(find tools -maxdepth 1 -type f -name 'sembundle*' | head -1)
+          if [ -z "$SEMBUNDLE_BIN" ]; then
+            echo "No sembundle binary found in tools/"
+            ls -la tools || true
+            exit 1
+          fi
+          chmod +x "$SEMBUNDLE_BIN"
+          echo "SEMBUNDLE_BIN=$SEMBUNDLE_BIN" >> "$GITHUB_ENV"
 
       - name: Install Node.js
         uses: actions/setup-node@v4
@@ -209,7 +218,7 @@ jobs:
 
       - name: Build sempkg SemBundle
         run: |
-          ./tools/sembundle build \
+          "$SEMBUNDLE_BIN" build \
             --name sempkg \
             --version "$VERSION" \
             --source-repo https://github.com/willem445/sempkg \
@@ -228,7 +237,7 @@ jobs:
           chmod 600 "$RUNNER_TEMP/private.pem"
 
       - name: Sign bundle
-        run: ./tools/sembundle sign "sempkg-${VERSION}.sembundle" --key "$RUNNER_TEMP/private.pem"
+        run: "$SEMBUNDLE_BIN" sign "sempkg-${VERSION}.sembundle" --key "$RUNNER_TEMP/private.pem"
 
       - name: Remove signing key
         if: always()
