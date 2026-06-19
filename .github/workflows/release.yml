@@ -12,6 +12,9 @@ jobs:
   build:
     name: Build ${{ matrix.binary }} — ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    env:
+      CARGO_INCREMENTAL: 0
+      RUSTFLAGS: -C debuginfo=0
     strategy:
       fail-fast: false
       matrix:
@@ -52,6 +55,16 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Free disk space (Ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          df -h
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/share/dotnet
+          sudo apt-get clean
+          df -h
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -156,8 +169,20 @@ jobs:
     name: Build and sign sempkg SemBundle
     needs: build
     runs-on: ubuntu-latest
+    env:
+      CARGO_INCREMENTAL: 0
+      RUSTFLAGS: -C debuginfo=0
     steps:
       - uses: actions/checkout@v4
+
+      - name: Free disk space (Ubuntu)
+        run: |
+          df -h
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/share/dotnet
+          sudo apt-get clean
+          df -h
 
       - name: Download sembundle (Linux)
         uses: actions/download-artifact@v4
