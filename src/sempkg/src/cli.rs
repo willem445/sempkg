@@ -82,9 +82,17 @@ pub enum Commands {
     /// Example: sempkg add mylib@2.0.0 --url https://github.com/owner/repo/releases/download/v2.0.0/mylib-2.0.0.sembundle
     /// Example: sempkg add pandas-dev/pandas@v2.2.2
     /// Example: sempkg add https://github.com/pandas-dev/pandas/tree/v2.2.2
+    /// Example: sempkg add /path/to/sdk --name my-sdk
+    /// Example: sempkg add ~/tools/llvm --name llvm --version 17.0
+    /// Example: sempkg add C:\LLVM --name llvm
     ///
     /// When a GitHub source is provided, sempkg immediately fetches, builds,
     /// and installs the bundle into the workspace (no separate `sync` needed).
+    ///
+    /// When a local filesystem path is provided (absolute or relative starting
+    /// with `./`, `../`, or `~/`), sempkg builds the bundle directly from that
+    /// directory and installs it.  The path is recorded in `sempkg.toml` so
+    /// `sempkg sync` can rebuild it later.
     Add {
         /// Package spec in `name@version` format, GitHub shorthand `owner/repo@ref`,
         /// or a full GitHub URL.
@@ -130,6 +138,18 @@ pub enum Commands {
         /// Override the version derived from the git ref.
         #[arg(long, short = 'v')]
         version: Option<String>,
+
+        /// Build a LanceDB source-code index (chunked by top-level symbols) and
+        /// embed it in the bundle.  Enables the `search_code` and `read_symbol`
+        /// MCP tools and augments `get_callers`/`get_callees` with source bodies.
+        #[arg(long)]
+        include_source: bool,
+
+        /// Glob mask restricting which source files are included in the code index
+        /// (only meaningful with --include-source).
+        /// Default covers Rust, Python, JS/TS, Go, Java, C/C++.
+        #[arg(long)]
+        source_glob: Option<String>,
     },
 
     /// Remove a bundle dependency from sempkg.toml (from [dependencies] or a group).

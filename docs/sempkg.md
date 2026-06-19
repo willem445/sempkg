@@ -133,6 +133,34 @@ The URL format for GitHub release assets is always:
 https://github.com/<owner>/<repo>/releases/download/<tag>/<asset-filename>
 ```
 
+### GitHub authentication (private / enterprise)
+
+If the repository or release asset is private, or hosted on GitHub Enterprise,
+set a token environment variable before running `sempkg add` or
+`sempkg install`.
+
+For host `github.company.com`, sempkg checks variables in this order:
+
+1. `GITHUB_TOKEN_GITHUB_COMPANY_COM`
+2. `GH_TOKEN_GITHUB_COMPANY_COM`
+3. `GITHUB_ENTERPRISE_TOKEN`
+4. `GH_ENTERPRISE_TOKEN`
+5. `GITHUB_TOKEN`
+6. `GH_TOKEN`
+
+Use host-specific variables when possible to avoid mixing public GitHub and
+enterprise credentials.
+
+```powershell
+$env:GITHUB_TOKEN_GITHUB_COMPANY_COM = "<your-enterprise-pat>"
+
+# Private / enterprise GitHub release URL
+sempkg add my-sdk@2.0.0 --url https://github.company.com/owner/repo/releases/download/v2.0.0/my-sdk-2.0.0.sembundle
+
+# Direct source add from a release/tag page
+sempkg add https://github.company.com/owner/repo/releases/tag/v2.0.0 --full
+```
+
 ### Sync options
 
 ```powershell

@@ -56,3 +56,18 @@ pub struct LanceMetadata {
     /// Stamped by the packer to match `manifest.json` `created_at`.
     pub created_at: String,
 }
+
+/// Source-code LanceDB index metadata (`code/metadata.json`).
+///
+/// Written by the packer when a `code/` extension is included. The `created_at`
+/// field is stamped by the packer to match `manifest.json` `created_at`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CodeMetadata {
+    pub table_name: String,
+    pub symbol_count: u64,
+    pub chunk_count: u64,
+    pub indexed_paths: Vec<String>,
+    pub fts_enabled: bool,
+    /// Stamped by the packer to match `manifest.json` `created_at`.
+    pub created_at: String,
+}

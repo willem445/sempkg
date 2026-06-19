@@ -38,12 +38,14 @@ Always start with `list_packages` to see what is indexed. The output shows:
 
 | User question type | Tool(s) to use |
 |--------------------|----------------|
+| "I need the best answer across code and docs" / ambiguous troubleshooting, migration, or architecture questions | `query` (hybrid: code + docs + reranker) |
 | "What does `X` do / how is it called?" | `search_symbols` → `get_callers` |
 | "What does function `X` depend on?" | `get_callees` |
 | "What breaks if I change `X`?" | `get_impact` |
 | "How do I accomplish [task]?" | `get_context` (natural language) |
 | "What files are in this package?" | `list_files` |
 | "How does [concept] work in this library?" | `search_docs` (requires `+lance`) |
+| "Show me the implementation of a symbol I just found" | `read_code(file, line)` or `read_symbol(name)` (requires `+code`) |
 
 ### 3. Symbol search tips
 
@@ -61,6 +63,20 @@ Always start with `list_packages` to see what is indexed. The output shows:
   documentation ("what is the retry policy?"). Check `docs_metadata` first to
   confirm the docs index exists and is non-empty.
 
+### 4.5. When to use `query` (hybrid retrieval)
+
+- Use `query` when the user asks a broad or mixed question where both API-level
+  code evidence and prose documentation may be relevant.
+- `query` should be the default for open-ended troubleshooting, migration
+  planning, design comparisons, or "what is the recommended approach" prompts.
+- `query` combines CodeGraph and LanceDB retrieval and uses a reranker to bring
+  the most relevant cross-source evidence to the top.
+- Prefer symbol-first tools (`search_symbols`, `get_callers`, `get_callees`,
+  `get_impact`) when the user asks about a specific known symbol and precise
+  call graph behavior.
+- If `query` results are sparse, follow up with targeted symbol or docs tools
+  rather than guessing.
+
 ### 5. Call graph exploration
 
 - `get_callers`: all places that *call* the symbol — useful for understanding
@@ -69,6 +85,26 @@ Always start with `list_packages` to see what is indexed. The output shows:
   dependencies.
 - `get_impact`: transitive downstream impact — call this before proposing a
   change to understand the blast radius.
+
+### 6. Reading exact source code
+
+When a tool such as `search_symbols`, `get_callers`, `get_callees`, or
+`get_impact` returns a result that includes a file path and line number, use
+that information to retrieve the precise implementation **without doing a
+secondary search**:
+
+- **`read_code(package, file, line)`** — preferred. Pass the file path and any
+  line number within the symbol. Returns the tightest enclosing symbol body
+  (e.g. if the line falls inside a method, you get that method, not the whole
+  class). Requires `+code`.
+- **`read_symbol(package, symbol)`** — alternative when you have the symbol
+  name but not a file/line location. Performs an exact name lookup. Requires
+  `+code`.
+
+Prefer `read_code` over `search_code` whenever you already have a file and line
+from earlier tool results. `search_code` is a vector/BM25 search across all
+indexed symbols and should be reserved for when you are *discovering* symbols by
+keyword, not when you already know where a symbol lives.
 
 ---
 

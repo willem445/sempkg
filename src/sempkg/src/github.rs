@@ -62,7 +62,7 @@ pub struct ReleaseAsset {
 // ---------------------------------------------------------------------------
 
 /// A thin wrapper around `reqwest::blocking::Client` that injects
-/// `Authorization: Bearer <token>` when a token is configured.
+/// `Authorization: token <token>` when a token is configured.
 pub struct GhClient {
     inner: reqwest::blocking::Client,
     token: Option<String>,
@@ -84,7 +84,8 @@ impl GhClient {
     pub fn get(&self, url: &str) -> reqwest::blocking::RequestBuilder {
         let mut rb = self.inner.get(url);
         if let Some(tok) = &self.token {
-            rb = rb.header("Authorization", format!("Bearer {tok}"));
+            // GitHub Enterprise commonly expects PAT auth as `token <PAT>`.
+            rb = rb.header("Authorization", format!("token {tok}"));
         }
         rb
     }
@@ -697,9 +698,66 @@ pub fn detect_language(root: &Path) -> String {
 
 /// Read GitHub token from environment (`GITHUB_TOKEN` preferred, then `GH_TOKEN`).
 pub fn github_token() -> Option<String> {
-    std::env::var("GITHUB_TOKEN")
-        .or_else(|_| std::env::var("GH_TOKEN"))
-        .ok()
+    github_token_for_host("github.com")
+}
+
+/// Read a GitHub token for a specific host.
+///
+/// Resolution order (first match wins):
+/// 1) `GITHUB_TOKEN_<HOST>`
+/// 2) `GH_TOKEN_<HOST>`
+/// 3) For non-github.com hosts: `GITHUB_ENTERPRISE_TOKEN`, `GH_ENTERPRISE_TOKEN`
+/// 4) `GITHUB_TOKEN`, `GH_TOKEN`
+///
+/// Where `<HOST>` uppercases and replaces non-alphanumeric chars with `_`.
+/// Example: `github.company.com` -> `GITHUB_TOKEN_GITHUB_COMPANY_COM`.
+pub fn github_token_for_host(host: &str) -> Option<String> {
+    let suffix = host_env_suffix(host);
+
+    let host_scoped = [
+        format!("GITHUB_TOKEN_{suffix}"),
+        format!("GH_TOKEN_{suffix}"),
+    ];
+
+    for key in host_scoped {
+        if let Ok(v) = std::env::var(&key) {
+            if !v.trim().is_empty() {
+                return Some(v);
+            }
+        }
+    }
+
+    if !host.eq_ignore_ascii_case("github.com") {
+        for key in ["GITHUB_ENTERPRISE_TOKEN", "GH_ENTERPRISE_TOKEN"] {
+            if let Ok(v) = std::env::var(key) {
+                if !v.trim().is_empty() {
+                    return Some(v);
+                }
+            }
+        }
+    }
+
+    for key in ["GITHUB_TOKEN", "GH_TOKEN"] {
+        if let Ok(v) = std::env::var(key) {
+            if !v.trim().is_empty() {
+                return Some(v);
+            }
+        }
+    }
+
+    None
+}
+
+fn host_env_suffix(host: &str) -> String {
+    host.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -801,6 +859,12 @@ mod tests {
         assert_eq!(src.repo, "pandas");
         assert_eq!(src.git_ref.as_deref(), Some("v2.2.2"));
         assert!(src.subdir.is_none());
+    }
+
+    #[test]
+    fn test_host_env_suffix() {
+        assert_eq!(host_env_suffix("github.com"), "GITHUB_COM");
+        assert_eq!(host_env_suffix("github.company.com"), "GITHUB_COMPANY_COM");
     }
 
     #[test]

@@ -189,6 +189,44 @@ fn all_tools() -> Value {
             }),
             &["package"]
         ),
+        tool_schema(
+            "search_code",
+            "Search the embedded source-code index for a bundle. \
+             Returns BM25-ranked symbol excerpts with their file location, \
+             kind, and signature. Only available for bundles built with --include-source.",
+            json!({
+                "package": { "type": "string", "description": "Bundle name" },
+                "query":   { "type": "string", "description": "Natural-language or keyword code search query" },
+                "kind":    { "type": "string", "description": "Optional kind filter: function, class, struct, enum, trait, impl, ..." },
+                "limit":   { "type": "integer", "description": "Max results (default 10)" }
+            }),
+            &["package", "query"]
+        ),
+        tool_schema(
+            "read_symbol",
+            "Fetch the full source body of a named symbol from the embedded code index. \
+             Returns the complete implementation, file path, and line range. \
+             Only available for bundles built with --include-source.",
+            json!({
+                "package": { "type": "string", "description": "Bundle name" },
+                "symbol":  { "type": "string", "description": "Symbol name to look up (short or qualified)" }
+            }),
+            &["package", "symbol"]
+        ),
+        tool_schema(
+            "read_code",
+            "Read the exact source body of the symbol that contains a given file and line number. \
+             Use this after search_symbols, get_callers, get_callees, or get_impact return a \
+             file path and line number — pass those directly here to retrieve the precise \
+             implementation without doing a secondary search. \
+             Only available for bundles built with --include-source.",
+            json!({
+                "package": { "type": "string", "description": "Bundle name" },
+                "file":    { "type": "string", "description": "Source file path as returned by codegraph (e.g. src/foo.rs)" },
+                "line":    { "type": "integer", "description": "Line number within that file (1-based)" }
+            }),
+            &["package", "file", "line"]
+        ),
     ])
 }
 
@@ -372,13 +410,14 @@ impl McpContext {
                     "no graph"
                 };
                 let lance = if b.has_lance() { "  +lance" } else { "" };
+                let code = if b.has_code() { "  +code" } else { "" };
                 let scope = match b.scope {
                     crate::store::BundleScope::Workspace => "workspace",
                     crate::store::BundleScope::Global => "global",
                 };
                 lines.push(format!(
-                    "  \u{2022} **{}** @ {}  [{}]  [{}]{}",
-                    b.name, b.version, idx, scope, lance
+                    "  \u{2022} **{}** @ {}  [{}]  [{}]{}{}",
+                    b.name, b.version, idx, scope, lance, code
                 ));
             }
         }
@@ -418,7 +457,9 @@ impl McpContext {
         match self.resolve_codegraph_path(package) {
             Err(e) => e,
             Ok(path) => {
-                codegraph::callers(&path, symbol, limit).unwrap_or_else(|e| format!("Error: {e}"))
+                let raw = codegraph::callers(&path, symbol, limit)
+                    .unwrap_or_else(|e| format!("Error: {e}"));
+                self.augment_with_source(package, &raw)
             }
         }
     }
@@ -427,7 +468,9 @@ impl McpContext {
         match self.resolve_codegraph_path(package) {
             Err(e) => e,
             Ok(path) => {
-                codegraph::callees(&path, symbol, limit).unwrap_or_else(|e| format!("Error: {e}"))
+                let raw = codegraph::callees(&path, symbol, limit)
+                    .unwrap_or_else(|e| format!("Error: {e}"));
+                self.augment_with_source(package, &raw)
             }
         }
     }
@@ -456,6 +499,81 @@ impl McpContext {
                 match lance::search(&lance_dir, query, fetch_limit) {
                     Ok(results) => self.apply_rerank_to_lance(query, results, limit),
                     Err(e) => format!("Error searching docs: {e}"),
+                }
+            }
+        }
+    }
+
+    fn tool_search_code(&self, package: &str, query: &str, kind_filter: Option<&str>, limit: usize) -> String {
+        match self.resolve_code_path(package) {
+            Err(e) => e,
+            Ok(code_dir) => {
+                let fetch_limit = self.reranker_fetch_limit(limit);
+                match lance::search_code(&code_dir, query, fetch_limit) {
+                    Err(e) => format!("Error searching code: {e}"),
+                    Ok(mut results) => {
+                        // Client-side kind filter
+                        if let Some(k) = kind_filter {
+                            results.retain(|r| {
+                                r.kind.as_deref().map_or(false, |rk| rk == k)
+                            });
+                        }
+                        self.apply_rerank_to_lance(query, results, limit)
+                    }
+                }
+            }
+        }
+    }
+
+    fn tool_read_code(&self, package: &str, file: &str, line: u32) -> String {
+        match self.resolve_code_path(package) {
+            Err(e) => e,
+            Ok(code_dir) => {
+                match lance::fetch_symbol_at_location(&code_dir, file, line) {
+                    Err(e) => format!("Error reading code: {e}"),
+                    Ok(None) => format!(
+                        "No symbol found covering {file}:{line} in the code index for '{package}'. \
+                         Verify the file path and line number from the codegraph results, or use \
+                         read_symbol to look up by name."
+                    ),
+                    Ok(Some(src)) => {
+                        let loc = format!("{}:{}-{}", src.path, src.start_line, src.end_line);
+                        let sig_part = if src.signature.is_empty() {
+                            String::new()
+                        } else {
+                            format!("\n_{}_", src.signature)
+                        };
+                        format!(
+                            "**{}** ({}) @ {}{}\n\n```\n{}\n```",
+                            src.symbol, src.kind, loc, sig_part, src.content
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    fn tool_read_symbol(&self, package: &str, symbol: &str) -> String {
+        match self.resolve_code_path(package) {
+            Err(e) => e,
+            Ok(code_dir) => {
+                match lance::fetch_symbol_source(&code_dir, symbol) {
+                    Err(e) => format!("Error reading symbol: {e}"),
+                    Ok(None) => format!(
+                        "Symbol '{symbol}' not found in the code index for '{package}'. \
+                         Try search_code to locate it first."
+                    ),
+                    Ok(Some(src)) => {
+                        let loc = if src.start_line > 0 {
+                            format!("{}:{}-{}", src.path, src.start_line, src.end_line)
+                        } else {
+                            src.path.clone()
+                        };
+                        format!(
+                            "**{}** ({}) @ {}\n\n```\n{}\n```",
+                            src.symbol, src.kind, loc, src.content
+                        )
+                    }
                 }
             }
         }
@@ -571,6 +689,82 @@ impl McpContext {
         }
     }
 
+    /// Resolve a package/bundle name to its code-index directory (`code/`).
+    fn resolve_code_path(&self, name: &str) -> Result<PathBuf, String> {
+        if let Some(bundle) = resolve_bundle(name, self.workspace().map(|p| p.as_path())) {
+            if !bundle.has_code() {
+                return Err(format!(
+                    "Bundle '{name}@{}' does not have a source-code index. \
+                     Rebuild with 'sembundle build --include-source'.",
+                    bundle.version
+                ));
+            }
+            return Ok(bundle.bundle_dir.join("code"));
+        }
+        Err(format!(
+            "'{name}' not found or has no source-code index. \
+             Use 'sempkg list' to see available bundles."
+        ))
+    }
+
+    /// When a code index is available, parse callee/caller JSON and append
+    /// the full source body for each returned symbol.
+    fn augment_with_source(&self, package: &str, codegraph_json: &str) -> String {
+        let code_dir = match self.resolve_code_path(package) {
+            Ok(d) => d,
+            Err(_) => return codegraph_json.to_string(), // no code index, return as-is
+        };
+
+        // Parse JSON array of { "node": { "qualifiedName": ..., "name": ... }, ... }
+        let arr = match serde_json::from_str::<Vec<serde_json::Value>>(codegraph_json) {
+            Ok(a) => a,
+            Err(_) => return codegraph_json.to_string(),
+        };
+
+        const BYTE_BUDGET: usize = 12_000;
+        let mut total_bytes = 0usize;
+        let mut sections: Vec<String> = Vec::new();
+
+        for v in &arr {
+            let node = v.get("node").unwrap_or(v);
+            let get_str = |k: &str| node.get(k).and_then(|x| x.as_str()).unwrap_or("");
+            let qualified = get_str("qualifiedName");
+            let name = get_str("name");
+            let sym = if !qualified.is_empty() { qualified } else { name };
+            if sym.is_empty() {
+                continue;
+            }
+
+            if let Ok(Some(src)) = lance::fetch_symbol_source(&code_dir, sym) {
+                if total_bytes + src.content.len() > BYTE_BUDGET {
+                    // Include signature only once budget is exceeded
+                    let sig_line = src.signature.chars().take(120).collect::<String>();
+                    if !sig_line.is_empty() {
+                        sections.push(format!("**{}** ({}:{}-{}) \u{2014} body omitted (budget)\n_{sig_line}_",
+                            src.symbol, src.path, src.start_line, src.end_line));
+                    }
+                    continue;
+                }
+                total_bytes += src.content.len();
+                let loc = format!("{}:{}-{}", src.path, src.start_line, src.end_line);
+                sections.push(format!(
+                    "**{}** ({}) @ {}\n\n```\n{}\n```",
+                    src.symbol, src.kind, loc, src.content
+                ));
+            }
+        }
+
+        if sections.is_empty() {
+            return codegraph_json.to_string();
+        }
+
+        format!(
+            "{}\n\n---\n\n### Source bodies\n\n{}",
+            codegraph_json,
+            sections.join("\n\n---\n\n")
+        )
+    }
+
     fn dispatch_tool(&self, name: &str, args: &Value) -> String {
         let str_arg = |key: &str| args.get(key).and_then(|v| v.as_str()).unwrap_or_default();
         let int_arg = |key: &str, default: usize| {
@@ -603,6 +797,20 @@ impl McpContext {
                 self.tool_search_docs(str_arg("package"), str_arg("query"), int_arg("limit", 10))
             }
             "docs_metadata" => self.tool_docs_metadata(str_arg("package")),
+            "search_code" => self.tool_search_code(
+                str_arg("package"),
+                str_arg("query"),
+                opt_str("kind"),
+                int_arg("limit", 10),
+            ),
+            "read_symbol" => self.tool_read_symbol(str_arg("package"), str_arg("symbol")),
+            "read_code" => {
+                let line = args
+                    .get("line")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as u32;
+                self.tool_read_code(str_arg("package"), str_arg("file"), line)
+            }
             _ => format!("Unknown tool: {name}"),
         }
     }
