@@ -161,45 +161,58 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
         } => {
             let dir = require_workspace(workspace)?;
 
-            // Check if this is a local folder path first
-            if let Some(local_path) = parse_local_source(&spec) {
-                return add_from_local(
-                    local_path,
-                    dir,
-                    group.as_deref(),
-                    reinstall,
-                    name_override.as_deref(),
-                    version_override.as_deref(),
-                    include_source,
-                    source_glob.clone(),
-                    source_dirs,
-                    docs_dirs,
-                    exclude_dirs,
-                    workspace,
-                );
-            }
+            let source_input = spec
+                .as_deref()
+                .or_else(|| url.as_deref().filter(|candidate| github::parse_source(candidate).is_some()));
 
-            // Check if this is a GitHub source
-            if let Some(gh_src) = github::parse_source(&spec) {
-                return add_from_github(
-                    gh_src,
-                    dir,
-                    group.as_deref(),
-                    build,
-                    reinstall,
-                    full,
-                    name_override.as_deref(),
-                    version_override.as_deref(),
-                    include_source,
-                    source_glob.clone(),
-                    source_dirs,
-                    docs_dirs,
-                    exclude_dirs,
-                    workspace,
-                );
+            if let Some(source_input) = source_input {
+                // Check if this is a local folder path first.
+                if let Some(local_path) = parse_local_source(source_input) {
+                    return add_from_local(
+                        local_path,
+                        dir,
+                        group.as_deref(),
+                        reinstall,
+                        name_override.as_deref(),
+                        version_override.as_deref(),
+                        include_source,
+                        source_glob.clone(),
+                        source_dirs,
+                        docs_dirs,
+                        exclude_dirs,
+                        workspace,
+                    );
+                }
+
+                // Check if this is a GitHub source.
+                if let Some(gh_src) = github::parse_source(source_input) {
+                    return add_from_github(
+                        gh_src,
+                        dir,
+                        group.as_deref(),
+                        build,
+                        reinstall,
+                        full,
+                        name_override.as_deref(),
+                        version_override.as_deref(),
+                        include_source,
+                        source_glob.clone(),
+                        source_dirs,
+                        docs_dirs,
+                        exclude_dirs,
+                        workspace,
+                    );
+                }
             }
 
             // --- Existing registry / URL path (unchanged) ---
+            let spec = spec.as_deref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Direct bundle URLs still require <SPEC> in name@version format. \
+                     Use `sempkg add <name>@<version> --url <bundle-asset-url>` for assets, \
+                     or pass a GitHub source URL to `--url` to build from source."
+                )
+            })?;
             let (name, version) = parse_spec(&spec)?;
 
             let mut mf = manifest::load_manifest(dir)?;

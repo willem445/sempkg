@@ -80,6 +80,7 @@ pub enum Commands {
     ///
     /// Example: sempkg add aws-sdk@1.11.210 --registry https://reg.example.com
     /// Example: sempkg add mylib@2.0.0 --url https://github.com/owner/repo/releases/download/v2.0.0/mylib-2.0.0.sembundle
+    /// Example: sempkg add --url https://github.com/pandas-dev/pandas/releases/tag/v3.0.3 --full --include-source
     /// Example: sempkg add pandas-dev/pandas@v2.2.2
     /// Example: sempkg add https://github.com/pandas-dev/pandas/tree/v2.2.2
     /// Example: sempkg add /path/to/sdk --name my-sdk
@@ -96,7 +97,11 @@ pub enum Commands {
     Add {
         /// Package spec in `name@version` format, GitHub shorthand `owner/repo@ref`,
         /// or a full GitHub URL.
-        spec: String,
+        ///
+        /// May be omitted when `--url` is used with a GitHub source URL. Direct
+        /// bundle asset URLs still require a separate `name@version` spec.
+        #[arg(required_unless_present = "url")]
+        spec: Option<String>,
 
         /// Override the registry URL for this dependency.
         #[arg(long, short = 'r')]
@@ -106,7 +111,10 @@ pub enum Commands {
         #[arg(long)]
         registry: Option<String>,
 
-        /// Direct download URL for the bundle asset (e.g. a GitHub release URL).
+        /// Direct download URL for the bundle asset.
+        ///
+        /// A GitHub source URL can also be supplied here as an alternative to the
+        /// positional spec, for example with `--full` / `--include-source`.
         /// When set, no registry is needed.
         #[arg(long, short = 'u')]
         url: Option<String>,
@@ -442,4 +450,42 @@ pub enum RerankerCommands {
         /// The document string to score against the query.
         document: String,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, Commands};
+    use clap::Parser;
+
+    #[test]
+    fn add_accepts_github_source_url_via_flag_without_spec() {
+        let cli = Cli::try_parse_from([
+            "sempkg",
+            "add",
+            "--url",
+            "https://github.com/pandas-dev/pandas/releases/tag/v3.0.3",
+            "--full",
+            "--include-source",
+        ])
+        .expect("add command should parse");
+
+        match cli.command {
+            Commands::Add {
+                spec,
+                url,
+                full,
+                include_source,
+                ..
+            } => {
+                assert_eq!(spec, None);
+                assert_eq!(
+                    url.as_deref(),
+                    Some("https://github.com/pandas-dev/pandas/releases/tag/v3.0.3")
+                );
+                assert!(full);
+                assert!(include_source);
+            }
+            _ => panic!("expected add command"),
+        }
+    }
 }
