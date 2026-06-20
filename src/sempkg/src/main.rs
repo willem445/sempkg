@@ -61,24 +61,9 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
         }
 
         // -----------------------------------------------------------------------
-        // Index — one-shot workspace indexing
+        // Refresh — rebuild current local workspace dependency
         // -----------------------------------------------------------------------
-        Commands::Index {
-            path,
-            name,
-            docs_pattern,
-            no_docs,
-            no_code,
-            global,
-        } => run_index(
-            path.as_deref(),
-            name.as_deref(),
-            &docs_pattern,
-            no_docs,
-            no_code,
-            global,
-            workspace,
-        ),
+        Commands::Refresh => run_refresh(workspace),
 
         // -----------------------------------------------------------------------
         // List
@@ -1081,162 +1066,6 @@ fn run_reranker(cmd: RerankerCommands, workspace: Option<&Path>) -> Result<()> {
 // ---------------------------------------------------------------------------
 // index — one-shot workspace indexing
 // ---------------------------------------------------------------------------
-
-/// Index the current (or specified) directory so it can be searched without
-/// any separate QMD / codegraph setup steps.
-///
-/// Steps performed (any can be skipped with --no-code / --no-docs):
-///  1. Resolve the target directory and derive a package name from its basename.
-///  2. Register the package in `~/.sempkg/packages.json` (global registry).
-///  3. Run `codegraph init --index` (or `sync` if already indexed).
-///  4. Build / update the LanceDB full-text documentation index.
-///  5. If a `sempkg.toml` exists in the target dir, record the package there.
-fn run_index(
-    path_override: Option<&std::path::Path>,
-    name_override: Option<&str>,
-    docs_pattern: &str,
-    no_docs: bool,
-    no_code: bool,
-    global: bool,
-    workspace: Option<&Path>,
-) -> Result<()> {
-    // Resolve target directory.
-    let target_dir: PathBuf = if let Some(p) = path_override {
-        p.canonicalize()
-            .with_context(|| format!("Path does not exist: {}", p.display()))?
-    } else {
-        std::env::current_dir().context("Cannot determine current directory")?
-    };
-
-    // Derive package name.
-    let name: String = if let Some(n) = name_override {
-        n.to_string()
-    } else {
-        target_dir
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "workspace".to_string())
-    };
-
-    println!("Indexing '{}' at {}", name, target_dir.display());
-
-    // --- 1. Register the package ------------------------------------------
-    // Default: workspace-scoped (sempkg.toml [packages] entry).
-    // With --global: also upsert into ~/.sempkg/packages.json.
-    let toml_dir = path_override.unwrap_or_else(|| workspace.unwrap_or(&target_dir));
-    let has_manifest = manifest::load_manifest(toml_dir).is_ok();
-
-    if !has_manifest && !global {
-        // No manifest present and --global not requested — fall back to global
-        // so the package is still queryable, but warn the user.
-        eprintln!(
-            "  Warning: no sempkg.toml found in {}.  \
-             Registering globally in ~/.sempkg/packages.json instead.\n  \
-             Run `sempkg init` first if you want workspace-scoped registration.",
-            toml_dir.display()
-        );
-        let mut reg = packages::PackageRegistry::load()?;
-        if reg.get(&name).is_none() {
-            reg.add(&name, &target_dir, "")?;
-            println!("  Registered '{}' in global sempkg registry.", name);
-        } else {
-            println!("  '{}' already in global registry (skipping).", name);
-        }
-    } else if global {
-        let mut reg = packages::PackageRegistry::load()?;
-        if reg.get(&name).is_none() {
-            reg.add(&name, &target_dir, "")?;
-            println!("  Registered '{}' in global sempkg registry.", name);
-        } else {
-            println!("  '{}' already in global registry (skipping).", name);
-        }
-    }
-
-    // --- 2. CodeGraph symbol index ----------------------------------------
-    if !no_code {
-        let already_indexed = codegraph::is_indexed(&target_dir);
-        if already_indexed {
-            print!("  Updating CodeGraph symbol index ... ");
-            std::io::Write::flush(&mut std::io::stdout())?;
-            match codegraph::sync(&target_dir) {
-                Ok(out) => {
-                    println!("done.");
-                    if !out.is_empty() {
-                        println!("{out}");
-                    }
-                }
-                Err(e) => {
-                    println!("failed.");
-                    eprintln!("  Warning: codegraph sync error: {e}");
-                    eprintln!("  Run `sempkg pkg reindex {name}` to retry.");
-                }
-            }
-        } else {
-            print!("  Building CodeGraph symbol index ... ");
-            std::io::Write::flush(&mut std::io::stdout())?;
-            match codegraph::init_and_index(&target_dir) {
-                Ok(out) => {
-                    println!("done.");
-                    if !out.is_empty() {
-                        println!("{out}");
-                    }
-                }
-                Err(e) => {
-                    println!("failed.");
-                    eprintln!("  Warning: codegraph init error: {e}");
-                    eprintln!("  Ensure `codegraph` is on PATH, then retry.");
-                }
-            }
-        }
-    } else {
-        println!("  Skipping CodeGraph symbol index (--no-code).");
-    }
-
-    // --- 3. LanceDB documentation index -----------------------------------
-    if !no_docs {
-        println!("  Building LanceDB documentation index (pattern: {docs_pattern}) ...");
-        match lance::cli_update(&target_dir, &name, docs_pattern) {
-            Ok(lance_dir) => {
-                println!("  LanceDB index ready at {}.", lance_dir.display());
-            }
-            Err(e) => {
-                eprintln!("  Warning: LanceDB index failed: {e}");
-                eprintln!("  Re-run with --docs-pattern to adjust the glob, or --no-docs to skip.");
-            }
-        }
-    } else {
-        println!("  Skipping LanceDB documentation index (--no-docs).");
-    }
-
-    // --- 4. Persist into sempkg.toml (workspace-scoped, primary path) -----
-    if let Ok(mut mf) = manifest::load_manifest(toml_dir) {
-        if !mf.packages.contains_key(&name) {
-            mf.packages.insert(
-                name.clone(),
-                manifest::PackageEntry {
-                    path: target_dir.to_string_lossy().into_owned(),
-                    description: String::new(),
-                },
-            );
-            manifest::save_manifest(&mf, toml_dir)?;
-            println!("  Added [packages.{name}] to sempkg.toml.");
-        } else {
-            println!("  [packages.{name}] already in sempkg.toml (skipping).");
-        }
-    }
-
-    println!();
-    println!(
-        "Done. Use these commands to query '{name}':\n\
-         \n  sempkg search {name} <query>      # fast symbol search\
-         \n  sempkg docs   {name} <query>      # fast documentation search\
-         \n  sempkg query  {name} <query>      # reranked hybrid search (requires --features reranker)"
-    );
-
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
 // pkg sub-commands
 // ---------------------------------------------------------------------------
 
@@ -1822,6 +1651,8 @@ fn parse_local_source(spec: &str) -> Option<PathBuf> {
     }
 
     let looks_local = s.starts_with('/')
+        || s == "."
+        || s == ".."
         || s.starts_with("./")
         || s.starts_with("../")
         || s.starts_with(".\\")
@@ -1845,6 +1676,101 @@ fn parse_local_source(spec: &str) -> Option<PathBuf> {
     };
 
     Some(expanded)
+}
+
+fn run_refresh(workspace: Option<&Path>) -> Result<()> {
+    let dir = require_workspace(workspace)?;
+    let canonical = dir
+        .canonicalize()
+        .with_context(|| format!("Failed to canonicalize workspace path '{}'", dir.display()))?;
+    let manifest = manifest::load_manifest(dir)?;
+
+    let (dep_name, dep, group_name) = find_local_dependency_for_workspace(&manifest, &canonical)?;
+    let local_path = PathBuf::from(
+        dep.local
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("Local dependency '{}' is missing its source path.", dep_name))?,
+    );
+
+    println!(
+        "Refreshing {} from local path {} ...",
+        dep_name,
+        local_path.display()
+    );
+
+    add_from_local(
+        local_path,
+        dir,
+        group_name.as_deref(),
+        true,
+        Some(dep_name.as_str()),
+        Some(dep.version.as_str()),
+        dep.include_source,
+        dep.source_glob.clone(),
+        dep.source_dirs.iter().map(PathBuf::from).collect(),
+        dep.docs_dirs.iter().map(PathBuf::from).collect(),
+        dep.exclude_dirs.iter().map(PathBuf::from).collect(),
+        workspace,
+    )
+}
+
+fn find_local_dependency_for_workspace<'a>(
+    manifest: &'a manifest::WorkspaceManifest,
+    workspace_path: &Path,
+) -> Result<(String, &'a DependencyEntry, Option<String>)> {
+    let mut matches: Vec<(String, &'a DependencyEntry, Option<String>)> = Vec::new();
+
+    for (name, dep) in &manifest.dependencies {
+        if local_dep_matches_workspace(dep, workspace_path)? {
+            matches.push((name.clone(), dep, None));
+        }
+    }
+
+    for (group_name, deps) in &manifest.dependency_groups {
+        for (name, dep) in deps {
+            if local_dep_matches_workspace(dep, workspace_path)? {
+                matches.push((name.clone(), dep, Some(group_name.clone())));
+            }
+        }
+    }
+
+    match matches.len() {
+        0 => anyhow::bail!(
+            "No local dependency in sempkg.toml points at '{}'. Add this workspace first with `sempkg add .`.",
+            workspace_path.display()
+        ),
+        1 => Ok(matches.remove(0)),
+        _ => {
+            let names = matches
+                .iter()
+                .map(|(name, _, group)| match group {
+                    Some(group_name) => format!("{name} (group {group_name})"),
+                    None => name.clone(),
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            anyhow::bail!(
+                "Multiple local dependencies point at '{}': {}. Remove duplicates or keep only one local workspace entry before running `sempkg refresh`.",
+                workspace_path.display(),
+                names
+            )
+        }
+    }
+}
+
+fn local_dep_matches_workspace(dep: &DependencyEntry, workspace_path: &Path) -> Result<bool> {
+    let Some(local_path) = dep.local.as_deref() else {
+        return Ok(false);
+    };
+
+    let canonical = Path::new(local_path).canonicalize().with_context(|| {
+        format!(
+            "Failed to canonicalize local dependency path '{}' recorded in sempkg.toml",
+            local_path
+        )
+    })?;
+
+    Ok(canonical == workspace_path)
 }
 
 // ---------------------------------------------------------------------------
@@ -2045,8 +1971,13 @@ fn local_git_sha(path: &Path) -> Option<String> {
             return Some(sha);
         }
     }
+
     None
 }
+
+// ---------------------------------------------------------------------------
+// pkg sub-commands
+// ---------------------------------------------------------------------------
 
 /// Write the `{ local = "...", version = "..." }` entry into `sempkg.toml`
 /// and update `sempkg.lock`.

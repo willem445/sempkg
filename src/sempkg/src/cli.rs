@@ -32,46 +32,12 @@ pub enum Commands {
         registry: Option<String>,
     },
 
-    /// Index the current repository (or a specified path) so it can be
-    /// searched with `sempkg search`, `sempkg docs`, and `sempkg query`.
+    /// Rebuild and reinstall the local dependency for the current workspace.
     ///
-    /// This is a one-shot alternative to running:
-    ///   1. `sempkg pkg add <name> <path>`  — register with codegraph
-    ///   2. `sempkg pkg lance-index <name>` — build the LanceDB docs index
-    ///
-    /// The command is **idempotent**: re-running it updates the index without
-    /// duplicating entries.  If a `sempkg.toml` exists in the target directory
-    /// the package is also recorded in its `[packages]` table.
-    Index {
-        /// Directory to index.  Defaults to the current working directory.
-        path: Option<PathBuf>,
-
-        /// Short name used to identify this package in sempkg commands.
-        /// Defaults to the directory's basename.
-        #[arg(long, short = 'n')]
-        name: Option<String>,
-
-        /// Glob pattern of documentation files to include in the LanceDB
-        /// full-text index.  May be comma-separated for multiple patterns.
-        /// Defaults to all Markdown, RST, and plain-text files.
-        #[arg(long, default_value = "**/*.{md,rst,txt}")]
-        docs_pattern: String,
-
-        /// Skip building / updating the LanceDB documentation index.
-        #[arg(long)]
-        no_docs: bool,
-
-        /// Skip building / updating the CodeGraph symbol index.
-        #[arg(long)]
-        no_code: bool,
-
-        /// Also register the package in the global sempkg registry
-        /// (`~/.sempkg/packages.json`) in addition to the workspace
-        /// `sempkg.toml`.  By default the registration is workspace-scoped
-        /// only (matching the behaviour of `sempkg pkg add`).
-        #[arg(long)]
-        global: bool,
-    },
+    /// This reuses the settings stored by `sempkg add .`, including
+    /// `--include-source`, `--source-glob`, `--source-dir`, `--docs-dir`, and
+    /// `--exclude-dir`.
+    Refresh,
 
     /// List all registered packages and installed bundles.
     List,
@@ -83,6 +49,7 @@ pub enum Commands {
     /// Example: sempkg add --url https://github.com/pandas-dev/pandas/releases/tag/v3.0.3 --full --include-source
     /// Example: sempkg add pandas-dev/pandas@v2.2.2
     /// Example: sempkg add https://github.com/pandas-dev/pandas/tree/v2.2.2
+    /// Example: sempkg add . --name sempkg --include-source --docs-dir docs --source-dir src/sempkg/src
     /// Example: sempkg add /path/to/sdk --name my-sdk
     /// Example: sempkg add ~/tools/llvm --name llvm --version 17.0
     /// Example: sempkg add C:\LLVM --name llvm
@@ -90,10 +57,10 @@ pub enum Commands {
     /// When a GitHub source is provided, sempkg immediately fetches, builds,
     /// and installs the bundle into the workspace (no separate `sync` needed).
     ///
-    /// When a local filesystem path is provided (absolute or relative starting
-    /// with `./`, `../`, or `~/`), sempkg builds the bundle directly from that
-    /// directory and installs it.  The path is recorded in `sempkg.toml` so
-    /// `sempkg sync` can rebuild it later.
+    /// When a local filesystem path is provided (including `.` for the current
+    /// directory), sempkg builds the bundle directly from that directory and
+    /// installs it.  The path is recorded in `sempkg.toml` so `sempkg sync`
+    /// and `sempkg refresh` can rebuild it later.
     Add {
         /// Package spec in `name@version` format, GitHub shorthand `owner/repo@ref`,
         /// or a full GitHub URL.
@@ -456,6 +423,7 @@ pub enum RerankerCommands {
 mod tests {
     use super::{Cli, Commands};
     use clap::Parser;
+    use std::path::PathBuf;
 
     #[test]
     fn add_accepts_github_source_url_via_flag_without_spec() {
@@ -487,5 +455,39 @@ mod tests {
             }
             _ => panic!("expected add command"),
         }
+    }
+
+    #[test]
+    fn add_accepts_current_directory_shortcut() {
+        let cli = Cli::try_parse_from([
+            "sempkg",
+            "add",
+            ".",
+            "--include-source",
+            "--docs-dir",
+            "docs",
+        ])
+        .expect("add command should parse");
+
+        match cli.command {
+            Commands::Add {
+                spec,
+                include_source,
+                docs_dirs,
+                ..
+            } => {
+                assert_eq!(spec.as_deref(), Some("."));
+                assert!(include_source);
+                assert_eq!(docs_dirs, vec![PathBuf::from("docs")]);
+            }
+            _ => panic!("expected add command"),
+        }
+    }
+
+    #[test]
+    fn refresh_command_parses() {
+        let cli = Cli::try_parse_from(["sempkg", "refresh"]).expect("refresh should parse");
+
+        assert!(matches!(cli.command, Commands::Refresh));
     }
 }
