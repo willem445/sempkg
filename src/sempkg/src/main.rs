@@ -155,6 +155,9 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
             version: version_override,
             include_source,
             source_glob,
+            source_dirs,
+            docs_dirs,
+            exclude_dirs,
         } => {
             let dir = require_workspace(workspace)?;
 
@@ -169,6 +172,9 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
                     version_override.as_deref(),
                     include_source,
                     source_glob.clone(),
+                    source_dirs,
+                    docs_dirs,
+                    exclude_dirs,
                     workspace,
                 );
             }
@@ -186,6 +192,9 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
                     version_override.as_deref(),
                     include_source,
                     source_glob.clone(),
+                    source_dirs,
+                    docs_dirs,
+                    exclude_dirs,
                     workspace,
                 );
             }
@@ -208,6 +217,9 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
                     local: None,
                     include_source: false,
                     source_glob: None,
+                    source_dirs: vec![],
+                    docs_dirs: vec![],
+                    exclude_dirs: vec![],
                 };
                 insert_dep(&mut mf, name, dep, group.as_deref());
             } else if let Some(url) = &registry_url {
@@ -231,6 +243,9 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
                     local: None,
                     include_source: false,
                     source_glob: None,
+                    source_dirs: vec![],
+                    docs_dirs: vec![],
+                    exclude_dirs: vec![],
                 };
                 insert_dep(&mut mf, name, dep, group.as_deref());
             } else {
@@ -255,6 +270,9 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
                     local: None,
                     include_source: false,
                     source_glob: None,
+                    source_dirs: vec![],
+                    docs_dirs: vec![],
+                    exclude_dirs: vec![],
                 };
                 insert_dep(&mut mf, name, dep, group.as_deref());
             }
@@ -376,6 +394,9 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
                         None,
                         dep.include_source,
                         dep.source_glob.clone(),
+                        dep.source_dirs.iter().map(PathBuf::from).collect(),
+                        dep.docs_dirs.iter().map(PathBuf::from).collect(),
+                        dep.exclude_dirs.iter().map(PathBuf::from).collect(),
                         workspace,
                     )?;
                     continue;
@@ -394,6 +415,9 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
                         Some(&dep.version),
                         dep.include_source,
                         dep.source_glob.clone(),
+                        dep.source_dirs.iter().map(PathBuf::from).collect(),
+                        dep.docs_dirs.iter().map(PathBuf::from).collect(),
+                        dep.exclude_dirs.iter().map(PathBuf::from).collect(),
                         workspace,
                     )?;
                     continue;
@@ -1346,6 +1370,9 @@ fn add_from_github(
     version_override: Option<&str>,
     include_source: bool,
     source_glob: Option<String>,
+    source_dirs_override: Vec<PathBuf>,
+    docs_dirs_override: Vec<PathBuf>,
+    exclude_dirs: Vec<PathBuf>,
     workspace: Option<&Path>,
 ) -> Result<()> {
     let token = github::github_token_for_host(&src.host);
@@ -1372,7 +1399,7 @@ fn add_from_github(
             resolved.package_name, resolved.version
         );
         // Still write to manifest/lock if not already there
-        record_github_dep(workspace_dir, &resolved, &src, group, None, full_clone, include_source, source_glob)?;
+        record_github_dep(workspace_dir, &resolved, &src, group, None, full_clone, include_source, source_glob, &source_dirs_override, &docs_dirs_override, &exclude_dirs)?;
         return Ok(());
     }
 
@@ -1403,6 +1430,9 @@ fn add_from_github(
                 false, // release asset — full_clone does not apply
                 false, // release asset — source index not rebuilt
                 None,
+                vec![],
+                vec![],
+                vec![],
             );
         }
     }
@@ -1457,11 +1487,26 @@ fn add_from_github(
         language,
         codegraph_version: cg_version,
         output_path: Some(bundle_output.clone()),
-        source_dirs: vec![source_root.clone()],
-        docs_dirs: vec![source_root.clone()],
+        source_dirs: if source_dirs_override.is_empty() {
+            vec![source_root.clone()]
+        } else {
+            source_dirs_override.iter().map(|d| {
+                if d.is_absolute() { d.clone() } else { source_root.join(d) }
+            }).collect()
+        },
+        docs_dirs: if docs_dirs_override.is_empty() {
+            vec![source_root.clone()]
+        } else {
+            docs_dirs_override.iter().map(|d| {
+                if d.is_absolute() { d.clone() } else { source_root.join(d) }
+            }).collect()
+        },
         docs_glob: None,
         include_source,
         source_glob: source_glob.clone(),
+        exclude_dirs: exclude_dirs.iter().map(|d| {
+            if d.is_absolute() { d.clone() } else { source_root.join(d) }
+        }).collect(),
     };
 
     sembundle::build(build_opts).with_context(|| {
@@ -1491,6 +1536,9 @@ fn add_from_github(
         full_clone,
         include_source,
         source_glob,
+        source_dirs_override,
+        docs_dirs_override,
+        exclude_dirs,
     )
 }
 
@@ -1506,6 +1554,9 @@ fn install_github_bundle(
     full_clone: bool,
     include_source: bool,
     source_glob: Option<String>,
+    source_dirs_override: Vec<PathBuf>,
+    docs_dirs_override: Vec<PathBuf>,
+    exclude_dirs: Vec<PathBuf>,
 ) -> Result<()> {
     // Remove existing bundle dir so install_bytes can extract the freshly-built one.
     let existing_dir = store.bundle_dir(&resolved.package_name, &resolved.version);
@@ -1537,6 +1588,9 @@ fn install_github_bundle(
         full_clone,
         include_source,
         source_glob,
+        &source_dirs_override,
+        &docs_dirs_override,
+        &exclude_dirs,
     )
 }
 
@@ -1549,6 +1603,9 @@ fn record_github_dep(
     full_clone: bool,
     include_source: bool,
     source_glob: Option<String>,
+    source_dirs_override: &[PathBuf],
+    docs_dirs_override: &[PathBuf],
+    exclude_dirs: &[PathBuf],
 ) -> Result<()> {
     let mut mf = manifest::load_manifest(workspace_dir)?;
 
@@ -1567,6 +1624,18 @@ fn record_github_dep(
         local: None,
         include_source,
         source_glob,
+        source_dirs: source_dirs_override
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect(),
+        docs_dirs: docs_dirs_override
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect(),
+        exclude_dirs: exclude_dirs
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect(),
     };
     insert_dep(&mut mf, &resolved.package_name, dep, group);
     manifest::save_manifest(&mf, workspace_dir)?;
@@ -1790,6 +1859,9 @@ fn add_from_local(
     version_override: Option<&str>,
     include_source: bool,
     source_glob: Option<String>,
+    source_dirs_override: Vec<PathBuf>,
+    docs_dirs_override: Vec<PathBuf>,
+    exclude_dirs: Vec<PathBuf>,
     _workspace: Option<&Path>,
 ) -> Result<()> {
     // --- 1. Validate path ---------------------------------------------------
@@ -1847,7 +1919,7 @@ fn add_from_local(
             package_name, version
         );
         // Still write to manifest if not already present.
-        record_local_dep(workspace_dir, &canonical, &package_name, &version, group, None, include_source, source_glob.clone())?;
+        record_local_dep(workspace_dir, &canonical, &package_name, &version, group, None, include_source, source_glob.clone(), &source_dirs_override, &docs_dirs_override, &exclude_dirs)?;
         return Ok(());
     }
 
@@ -1874,11 +1946,20 @@ fn add_from_local(
         language,
         codegraph_version: cg_version,
         output_path: Some(bundle_output.clone()),
-        source_dirs: vec![canonical.clone()],
-        docs_dirs: vec![canonical.clone()],
+        source_dirs: if source_dirs_override.is_empty() {
+            vec![canonical.clone()]
+        } else {
+            source_dirs_override.clone()
+        },
+        docs_dirs: if docs_dirs_override.is_empty() {
+            vec![canonical.clone()]
+        } else {
+            docs_dirs_override.clone()
+        },
         docs_glob: None,
         include_source,
         source_glob: source_glob.clone(),
+        exclude_dirs: exclude_dirs.clone(),
     };
 
     sembundle::build(build_opts).with_context(|| {
@@ -1914,7 +1995,7 @@ fn add_from_local(
 
     // --- 7. Record in manifest ----------------------------------------------
     let sha256 = hex::encode(sha2::Sha256::digest(&bytes));
-    record_local_dep(workspace_dir, &canonical, &package_name, &version, group, Some(&sha256), include_source, source_glob)
+    record_local_dep(workspace_dir, &canonical, &package_name, &version, group, Some(&sha256), include_source, source_glob, &source_dirs_override, &docs_dirs_override, &exclude_dirs)
 }
 
 /// Try to derive a human-readable version from a git repository at `path`.
@@ -1965,6 +2046,9 @@ fn record_local_dep(
     sha256: Option<&str>,
     include_source: bool,
     source_glob: Option<String>,
+    source_dirs_override: &[PathBuf],
+    docs_dirs_override: &[PathBuf],
+    exclude_dirs: &[PathBuf],
 ) -> Result<()> {
     let mut mf = manifest::load_manifest(workspace_dir)?;
 
@@ -1979,6 +2063,18 @@ fn record_local_dep(
         local: Some(canonical.to_string_lossy().into_owned()),
         include_source,
         source_glob,
+        source_dirs: source_dirs_override
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect(),
+        docs_dirs: docs_dirs_override
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect(),
+        exclude_dirs: exclude_dirs
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect(),
     };
     insert_dep(&mut mf, package_name, dep, group);
     manifest::save_manifest(&mf, workspace_dir)?;

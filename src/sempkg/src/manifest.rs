@@ -84,6 +84,15 @@ pub struct DependencyEntry {
     /// `include_source` is true).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_glob: Option<String>,
+    /// Source directories to index with codegraph. Empty = use the bundle source root.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_dirs: Vec<String>,
+    /// Documentation directories to index with LanceDB. Empty = use the bundle source root.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub docs_dirs: Vec<String>,
+    /// Directories excluded from all indexing (source, docs, and source-code index).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclude_dirs: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -337,6 +346,33 @@ fn dep_inline(dep: &DependencyEntry) -> InlineTable {
     if let Some(local) = &dep.local {
         it.insert("local", Value::from(local.as_str()));
     }
+    if dep.include_source {
+        it.insert("include_source", Value::from(true));
+    }
+    if let Some(glob) = &dep.source_glob {
+        it.insert("source_glob", Value::from(glob.as_str()));
+    }
+    if !dep.source_dirs.is_empty() {
+        let mut arr = toml_edit::Array::new();
+        for d in &dep.source_dirs {
+            arr.push(d.as_str());
+        }
+        it.insert("source_dirs", Value::Array(arr));
+    }
+    if !dep.docs_dirs.is_empty() {
+        let mut arr = toml_edit::Array::new();
+        for d in &dep.docs_dirs {
+            arr.push(d.as_str());
+        }
+        it.insert("docs_dirs", Value::Array(arr));
+    }
+    if !dep.exclude_dirs.is_empty() {
+        let mut arr = toml_edit::Array::new();
+        for d in &dep.exclude_dirs {
+            arr.push(d.as_str());
+        }
+        it.insert("exclude_dirs", Value::Array(arr));
+    }
     it
 }
 
@@ -405,6 +441,9 @@ mod tests {
                 local: None,
                 include_source: false,
                 source_glob: None,
+                source_dirs: vec![],
+                docs_dirs: vec![],
+                exclude_dirs: vec![],
             },
         );
         manifest.reranker = Some(crate::reranker::RerankerConfig {

@@ -150,6 +150,21 @@ pub enum Commands {
         /// Default covers Rust, Python, JS/TS, Go, Java, C/C++.
         #[arg(long)]
         source_glob: Option<String>,
+
+        /// Source directory to index with codegraph. Repeat the flag to index
+        /// multiple directories. Defaults to the whole source root.
+        #[arg(long = "source-dir", short = 's')]
+        source_dirs: Vec<PathBuf>,
+
+        /// Documentation directory to index with LanceDB. Repeat the flag to
+        /// add multiple directories. Defaults to the whole source root.
+        #[arg(long = "docs-dir", short = 'd')]
+        docs_dirs: Vec<PathBuf>,
+
+        /// Directory to exclude from all indexing (source, docs, and source-code
+        /// index). Repeat the flag to exclude multiple directories.
+        #[arg(long = "exclude-dir", short = 'e')]
+        exclude_dirs: Vec<PathBuf>,
     },
 
     /// Remove a bundle dependency from sempkg.toml (from [dependencies] or a group).

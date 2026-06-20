@@ -52,6 +52,12 @@ pub struct BuildOptions {
     /// Glob mask restricting which source files are included in the code index.
     /// Default: `**/*.rs,**/*.py,**/*.ts,**/*.js,**/*.go,**/*.java,**/*.cpp,**/*.c,**/*.h`.
     pub source_glob: Option<String>,
+
+    // --- Exclusions (optional) ---
+    /// Directories to exclude from all indexing (source, docs, and source-code index).
+    /// Absolute paths are matched against entry paths directly; relative paths are
+    /// matched against the entry's path relative to its base directory.
+    pub exclude_dirs: Vec<PathBuf>,
 }
 
 /// Run the full build pipeline and return the path of the produced bundle.
@@ -72,7 +78,7 @@ pub fn build(opts: BuildOptions) -> Result<PathBuf, PackError> {
 
     // Step 1: index source directories with codegraph.
     eprintln!("[sembundle] Running codegraph ...");
-    run_codegraph(&opts.source_dirs, &cg_out)?;
+    run_codegraph(&opts.source_dirs, &cg_out, &opts.exclude_dirs)?;
 
     // Step 2: index docs directories with LanceDB (optional, best-effort).
     // When no documents match the glob pattern we log a warning and continue
@@ -84,7 +90,7 @@ pub fn build(opts: BuildOptions) -> Result<PathBuf, PackError> {
             .as_deref()
             .unwrap_or("**/*.md,**/*.txt,**/*.rst");
         eprintln!("[sembundle] Building LanceDB documentation index ...");
-        match run_lance(&opts.docs_dirs, &lance_dir, glob) {
+        match run_lance(&opts.docs_dirs, &lance_dir, glob, &opts.exclude_dirs) {
             Ok(()) => Some(lance_dir),
             Err(PackError::InvalidField { ref field, .. }) if field == "docs_dirs" => {
                 eprintln!(
@@ -107,7 +113,7 @@ pub fn build(opts: BuildOptions) -> Result<PathBuf, PackError> {
             .as_deref()
             .unwrap_or("**/*.rs,**/*.py,**/*.ts,**/*.tsx,**/*.js,**/*.jsx,**/*.go,**/*.java,**/*.cpp,**/*.cc,**/*.cxx,**/*.c,**/*.h,**/*.hpp");
         eprintln!("[sembundle] Building LanceDB source-code index ...");
-        match run_source_index(&opts.source_dirs, &code_dir, glob) {
+        match run_source_index(&opts.source_dirs, &code_dir, glob, &opts.exclude_dirs) {
             Ok(()) => Some(code_dir),
             Err(PackError::InvalidField { ref field, .. }) if field == "source_dirs" => {
                 eprintln!(
@@ -151,12 +157,33 @@ pub fn build(opts: BuildOptions) -> Result<PathBuf, PackError> {
 // CodeGraph step
 // ---------------------------------------------------------------------------
 
-fn run_codegraph(source_dirs: &[PathBuf], out_dir: &Path) -> Result<(), PackError> {
+/// Returns `true` if `path` should be excluded based on `exclude_dirs`.
+///
+/// Absolute entries in `exclude_dirs` are compared against `path` directly.
+/// Relative entries are compared against `path` stripped of `base_dir`.
+fn is_excluded(path: &Path, base_dir: &Path, exclude_dirs: &[PathBuf]) -> bool {
+    exclude_dirs.iter().any(|ex| {
+        if ex.is_absolute() {
+            path.starts_with(ex)
+        } else {
+            path.strip_prefix(base_dir)
+                .map(|rel| rel.starts_with(ex))
+                .unwrap_or(false)
+        }
+    })
+}
+
+fn run_codegraph(source_dirs: &[PathBuf], out_dir: &Path, exclude_dirs: &[PathBuf]) -> Result<(), PackError> {
     let exe = find_tool("codegraph")?;
     let graph_dir = out_dir.join("graph");
     std::fs::create_dir_all(&graph_dir)?;
 
     for source_dir in source_dirs {
+        // Skip source_dirs that are themselves excluded.
+        if !exclude_dirs.is_empty() && is_excluded(source_dir, source_dir, exclude_dirs) {
+            eprintln!("[sembundle]   codegraph: skipping excluded dir {} ...", source_dir.display());
+            continue;
+        }
         eprintln!(
             "[sembundle]   codegraph: indexing {} ...",
             source_dir.display()
@@ -217,18 +244,20 @@ fn run_lance(
     docs_dirs: &[PathBuf],
     out_dir: &Path,
     glob_pattern: &str,
+    exclude_dirs: &[PathBuf],
 ) -> Result<(), PackError> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(PackError::Io)?;
-    rt.block_on(run_lance_inner(docs_dirs, out_dir, glob_pattern))
+    rt.block_on(run_lance_inner(docs_dirs, out_dir, glob_pattern, exclude_dirs))
 }
 
 async fn run_lance_inner(
     docs_dirs: &[PathBuf],
     out_dir: &Path,
     glob_pattern: &str,
+    exclude_dirs: &[PathBuf],
 ) -> Result<(), PackError> {
     std::fs::create_dir_all(out_dir)?;
 
@@ -246,6 +275,9 @@ async fn run_lance_inner(
             .filter(|e| e.file_type().is_file())
         {
             let path = entry.path();
+            if !exclude_dirs.is_empty() && is_excluded(path, docs_dir, exclude_dirs) {
+                continue;
+            }
             let rel = path.strip_prefix(docs_dir).unwrap_or(path);
             let rel_str = rel
                 .components()
@@ -630,18 +662,20 @@ fn run_source_index(
     source_dirs: &[PathBuf],
     out_dir: &Path,
     glob_pattern: &str,
+    exclude_dirs: &[PathBuf],
 ) -> Result<(), PackError> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(PackError::Io)?;
-    rt.block_on(run_source_inner(source_dirs, out_dir, glob_pattern))
+    rt.block_on(run_source_inner(source_dirs, out_dir, glob_pattern, exclude_dirs))
 }
 
 async fn run_source_inner(
     source_dirs: &[PathBuf],
     out_dir: &Path,
     glob_pattern: &str,
+    exclude_dirs: &[PathBuf],
 ) -> Result<(), PackError> {
     const MAX_CHUNK_BYTES: usize = 8 * 1024; // 8 KiB per symbol chunk
 
@@ -668,6 +702,9 @@ async fn run_source_inner(
             .filter(|e| e.file_type().is_file())
         {
             let path = entry.path();
+            if !exclude_dirs.is_empty() && is_excluded(path, source_dir, exclude_dirs) {
+                continue;
+            }
             let rel = path.strip_prefix(source_dir).unwrap_or(path);
             let rel_str = rel
                 .components()
