@@ -170,8 +170,12 @@ sempkg sync --group dev        # also install the "dev" dependency group
 sempkg sync --all-groups       # install every dependency group
 ```
 
-After the first `sync` a `sempkg.lock` file is written. Commit it for
-reproducible installs across machines.
+A `sempkg.lock` file is created and updated by `sync`. It records the resolved
+version, source, archive hash, and manifest checksums for each installed
+bundle—enabling reproducible installs across machines. When a bundle is already
+installed but missing from the lock, `sync` repairs the lock entry from the
+bundle's on-disk metadata. Commit `sempkg.lock` alongside `sempkg.toml` for
+full reproducibility.
 
 ### Ad-hoc install (without manifest)
 

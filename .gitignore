@@ -1,4 +1,5 @@
 *.sembundle
+.sempkg/*
 
 # Signing keys — private key must never be committed
 keys/private.pem

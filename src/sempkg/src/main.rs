@@ -16,7 +16,6 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use clap::Parser;
 
-use sha2::{Digest, Sha256};
 
 use crate::cli::{Cli, Commands, PkgCommands, RerankerCommands};
 use crate::manifest::{DependencyEntry, RegistryEntry};
@@ -166,6 +165,7 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
                         docs_dirs,
                         exclude_dirs,
                         workspace,
+                        None,
                     );
                 }
 
@@ -186,6 +186,7 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
                         docs_dirs,
                         exclude_dirs,
                         workspace,
+                        None,
                     );
                 }
             }
@@ -328,7 +329,6 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
         } => {
             let dir = require_workspace(workspace)?;
             let mf = manifest::load_manifest(dir)?;
-            let mut lock = manifest::load_lock(dir)?;
             let store = BundleStore::workspace(dir);
             let verify_key_path = mf.verify_key_path(dir);
 
@@ -350,14 +350,10 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
                 .map(verify::load_verifying_key)
                 .transpose()?;
 
+            let mut lock = manifest::load_lock(dir)?;
             let mut installed = Vec::new();
 
             for (dep_name, dep) in &deps {
-                if !reinstall && store.is_installed(dep_name, &dep.version) {
-                    println!("  {dep_name}@{} already installed, skipping.", dep.version);
-                    continue;
-                }
-
                 // GitHub-sourced dependency — re-run the build flow
                 if dep.git.is_some() {
                     let git_src = dep.git.as_deref().unwrap_or_default();
@@ -396,7 +392,9 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
                         dep.docs_dirs.iter().map(PathBuf::from).collect(),
                         dep.exclude_dirs.iter().map(PathBuf::from).collect(),
                         workspace,
+                        Some(&mut lock),
                     )?;
+                    installed.push(format!("{dep_name}@{}", dep.version));
                     continue;
                 }
 
@@ -419,19 +417,42 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
                         dep.docs_dirs.iter().map(PathBuf::from).collect(),
                         dep.exclude_dirs.iter().map(PathBuf::from).collect(),
                         workspace,
+                        Some(&mut lock),
+                    )?;
+                    installed.push(format!("{dep_name}@{}", dep.version));
+                    continue;
+                }
+
+                let source_label = if let Some(direct_url) = &dep.url {
+                    direct_url.clone()
+                } else {
+                    mf.registry_for(dep)
+                        .with_context(|| format!("No registry found for dependency '{dep_name}'"))?
+                        .url
+                        .clone()
+                };
+
+                if !reinstall && store.is_installed(dep_name, &dep.version) {
+                    println!("  {dep_name}@{} already installed, skipping.", dep.version);
+                    record_installed_bundle_lock(
+                        dir,
+                        Some(&mut lock),
+                        dep_name,
+                        &dep.version,
+                        source_label,
+                        dep.url.is_none() && verify_key.is_some(),
+                        None,
                     )?;
                     continue;
                 }
 
                 let bytes: Vec<u8>;
-                let source_label: String;
 
                 if let Some(direct_url) = &dep.url {
                     // Direct URL dependency (e.g. GitHub release asset)
                     print!("  Installing {dep_name}@{} from URL ... ", dep.version);
                     std::io::Write::flush(&mut std::io::stdout())?;
                     bytes = download_from_url(direct_url, None)?;
-                    source_label = direct_url.clone();
                 } else {
                     let reg = mf.registry_for(dep).with_context(|| {
                         format!("No registry found for dependency '{dep_name}'")
@@ -447,7 +468,6 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
                     let index_entry = client.lookup(dep_name, &dep.version).ok();
                     let expected_sha256 = index_entry.as_ref().and_then(|e| e.sha256.as_deref());
                     bytes = client.download_bundle(dep_name, &dep.version, expected_sha256)?;
-                    source_label = reg.url.clone();
 
                     // Signature verification
                     if let Some(key) = &verify_key {
@@ -461,21 +481,28 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
                     }
                 }
 
-                let info = store.install_bytes(&bytes)?;
+                store.install_bytes(&bytes)?;
                 println!("done.");
 
-                lock.upsert(manifest::LockEntry {
-                    name: dep_name.clone(),
-                    version: dep.version.clone(),
-                    registry_url: source_label,
-                    sha256: hex::encode(Sha256::digest(&bytes)),
-                    signed: verify_key.is_some() && dep.url.is_none(),
-                    manifest_checksums: info.manifest.checksums.clone(),
-                    commit_sha: None,
-                });
+                record_installed_bundle_lock(
+                    dir,
+                    Some(&mut lock),
+                    dep_name,
+                    &dep.version,
+                    source_label,
+                    dep.url.is_none() && verify_key.is_some(),
+                    None,
+                )?;
                 installed.push(format!("{dep_name}@{}", dep.version));
             }
 
+            let valid_names: std::collections::BTreeSet<String> =
+                mf.resolve_deps(&[], true).keys().cloned().collect();
+            let installed_names: std::collections::BTreeSet<String> =
+                store.list().into_iter().map(|bundle| bundle.name).collect();
+            lock.packages.retain(|entry| {
+                valid_names.contains(&entry.name) || installed_names.contains(&entry.name)
+            });
             manifest::save_lock(&lock, dir)?;
 
             if installed.is_empty() {
@@ -1217,7 +1244,8 @@ fn add_from_github(
     source_dirs_override: Vec<PathBuf>,
     docs_dirs_override: Vec<PathBuf>,
     exclude_dirs: Vec<PathBuf>,
-    workspace: Option<&Path>,
+    _workspace: Option<&Path>,
+    lock: Option<&mut manifest::LockFile>,
 ) -> Result<()> {
     let token = github::github_token_for_host(&src.host);
     let token_ref = token.as_deref();
@@ -1243,7 +1271,19 @@ fn add_from_github(
             resolved.package_name, resolved.version
         );
         // Still write to manifest/lock if not already there
-        record_github_dep(workspace_dir, &resolved, &src, group, None, full_clone, include_source, source_glob, &source_dirs_override, &docs_dirs_override, &exclude_dirs)?;
+        record_github_dep(
+            workspace_dir,
+            &resolved,
+            &src,
+            group,
+            full_clone,
+            include_source,
+            source_glob,
+            &source_dirs_override,
+            &docs_dirs_override,
+            &exclude_dirs,
+            lock,
+        )?;
         return Ok(());
     }
 
@@ -1277,6 +1317,7 @@ fn add_from_github(
                 vec![],
                 vec![],
                 vec![],
+                lock,
             );
         }
     }
@@ -1383,6 +1424,7 @@ fn add_from_github(
         source_dirs_override,
         docs_dirs_override,
         exclude_dirs,
+        lock,
     )
 }
 
@@ -1401,6 +1443,7 @@ fn install_github_bundle(
     source_dirs_override: Vec<PathBuf>,
     docs_dirs_override: Vec<PathBuf>,
     exclude_dirs: Vec<PathBuf>,
+    lock: Option<&mut manifest::LockFile>,
 ) -> Result<()> {
     // Remove existing bundle dir so install_bytes can extract the freshly-built one.
     let existing_dir = store.bundle_dir(&resolved.package_name, &resolved.version);
@@ -1411,8 +1454,6 @@ fn install_github_bundle(
     }
 
     let info = store.install_bytes(&bytes)?;
-
-    let sha256 = hex::encode(sha2::Sha256::digest(&bytes));
 
     println!(
         "Installed {}@{} from {}{}{}",
@@ -1428,13 +1469,13 @@ fn install_github_bundle(
         resolved,
         src,
         group,
-        Some(&sha256),
         full_clone,
         include_source,
         source_glob,
         &source_dirs_override,
         &docs_dirs_override,
         &exclude_dirs,
+        lock,
     )
 }
 
@@ -1443,13 +1484,13 @@ fn record_github_dep(
     resolved: &github::ResolvedSource,
     src: &github::GitHubSource,
     group: Option<&str>,
-    sha256: Option<&str>,
     full_clone: bool,
     include_source: bool,
     source_glob: Option<String>,
     source_dirs_override: &[PathBuf],
     docs_dirs_override: &[PathBuf],
     exclude_dirs: &[PathBuf],
+    lock: Option<&mut manifest::LockFile>,
 ) -> Result<()> {
     let mut mf = manifest::load_manifest(workspace_dir)?;
 
@@ -1484,24 +1525,15 @@ fn record_github_dep(
     insert_dep(&mut mf, &resolved.package_name, dep, group);
     manifest::save_manifest(&mf, workspace_dir)?;
 
-    // Update lock file
-    if let Some(sha) = sha256 {
-        let mut lock = manifest::load_lock(workspace_dir)?;
-        lock.upsert(manifest::LockEntry {
-            name: resolved.package_name.clone(),
-            version: resolved.version.clone(),
-            registry_url: format_manifest_git_source(
-                &resolved.host,
-                &resolved.owner,
-                &resolved.repo,
-            ),
-            sha256: sha.to_owned(),
-            signed: false,
-            manifest_checksums: Default::default(),
-            commit_sha: Some(resolved.commit_sha.clone()),
-        });
-        manifest::save_lock(&lock, workspace_dir)?;
-    }
+    record_installed_bundle_lock(
+        workspace_dir,
+        lock,
+        &resolved.package_name,
+        &resolved.version,
+        format_manifest_git_source(&resolved.host, &resolved.owner, &resolved.repo),
+        false,
+        Some(resolved.commit_sha.clone()),
+    )?;
 
     if let Some(g) = group {
         println!(
@@ -1516,6 +1548,43 @@ fn record_github_dep(
     }
 
     Ok(())
+}
+
+fn record_installed_bundle_lock(
+    workspace_dir: &Path,
+    lock: Option<&mut manifest::LockFile>,
+    name: &str,
+    version: &str,
+    registry_url: String,
+    signed: bool,
+    commit_sha: Option<String>,
+) -> Result<()> {
+    let store = BundleStore::workspace(workspace_dir);
+    let info = store.get_version(name, version).with_context(|| {
+        format!("Installed bundle {name}@{version} is missing from the bundle store")
+    })?;
+
+    let entry = manifest::LockEntry {
+        name: name.to_string(),
+        version: version.to_string(),
+        registry_url,
+        sha256: info.archive_sha256,
+        signed,
+        manifest_checksums: info.manifest.checksums.clone(),
+        commit_sha,
+    };
+
+    match lock {
+        Some(lock) => {
+            lock.upsert(entry);
+            Ok(())
+        }
+        None => {
+            let mut lock = manifest::load_lock(workspace_dir)?;
+            lock.upsert(entry);
+            manifest::save_lock(&lock, workspace_dir)
+        }
+    }
 }
 
 /// Insert a dependency into the manifest, either into [dependencies] or a named group.
@@ -1713,6 +1782,7 @@ fn run_refresh(workspace: Option<&Path>) -> Result<()> {
         dep.docs_dirs.iter().map(PathBuf::from).collect(),
         dep.exclude_dirs.iter().map(PathBuf::from).collect(),
         workspace,
+        None,
     )
 }
 
@@ -1812,6 +1882,7 @@ fn add_from_local(
     docs_dirs_override: Vec<PathBuf>,
     exclude_dirs: Vec<PathBuf>,
     _workspace: Option<&Path>,
+    lock: Option<&mut manifest::LockFile>,
 ) -> Result<()> {
     // --- 1. Validate path ---------------------------------------------------
     if !local_path.exists() {
@@ -1868,7 +1939,19 @@ fn add_from_local(
             package_name, version
         );
         // Still write to manifest if not already present.
-        record_local_dep(workspace_dir, &canonical, &package_name, &version, group, None, include_source, source_glob.clone(), &source_dirs_override, &docs_dirs_override, &exclude_dirs)?;
+        record_local_dep(
+            workspace_dir,
+            &canonical,
+            &package_name,
+            &version,
+            group,
+            include_source,
+            source_glob.clone(),
+            &source_dirs_override,
+            &docs_dirs_override,
+            &exclude_dirs,
+            lock,
+        )?;
         return Ok(());
     }
 
@@ -1943,8 +2026,19 @@ fn add_from_local(
     );
 
     // --- 7. Record in manifest ----------------------------------------------
-    let sha256 = hex::encode(sha2::Sha256::digest(&bytes));
-    record_local_dep(workspace_dir, &canonical, &package_name, &version, group, Some(&sha256), include_source, source_glob, &source_dirs_override, &docs_dirs_override, &exclude_dirs)
+    record_local_dep(
+        workspace_dir,
+        &canonical,
+        &package_name,
+        &version,
+        group,
+        include_source,
+        source_glob,
+        &source_dirs_override,
+        &docs_dirs_override,
+        &exclude_dirs,
+        lock,
+    )
 }
 
 /// Try to derive a human-readable version from a git repository at `path`.
@@ -1997,12 +2091,12 @@ fn record_local_dep(
     package_name: &str,
     version: &str,
     group: Option<&str>,
-    sha256: Option<&str>,
     include_source: bool,
     source_glob: Option<String>,
     source_dirs_override: &[PathBuf],
     docs_dirs_override: &[PathBuf],
     exclude_dirs: &[PathBuf],
+    lock: Option<&mut manifest::LockFile>,
 ) -> Result<()> {
     let mut mf = manifest::load_manifest(workspace_dir)?;
 
@@ -2053,19 +2147,15 @@ fn record_local_dep(
     insert_dep(&mut mf, package_name, dep, group);
     manifest::save_manifest(&mf, workspace_dir)?;
 
-    if let Some(sha) = sha256 {
-        let mut lock = manifest::load_lock(workspace_dir)?;
-        lock.upsert(manifest::LockEntry {
-            name: package_name.to_string(),
-            version: version.to_string(),
-            registry_url: format!("local:{}", stored_path),
-            sha256: sha.to_owned(),
-            signed: false,
-            manifest_checksums: Default::default(),
-            commit_sha: local_git_sha(canonical),
-        });
-        manifest::save_lock(&lock, workspace_dir)?;
-    }
+    record_installed_bundle_lock(
+        workspace_dir,
+        lock,
+        package_name,
+        version,
+        format!("local:{}", stored_path),
+        false,
+        local_git_sha(canonical),
+    )?;
 
     if let Some(g) = group {
         println!("Recorded {}@{} in group '{}' in sempkg.toml.", package_name, version, g);

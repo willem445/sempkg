@@ -65,6 +65,7 @@ pub struct BundleInfo {
     /// Absolute path to the extracted bundle directory
     pub bundle_dir: PathBuf,
     pub manifest: BundleManifest,
+    pub archive_sha256: String,
     pub scope: BundleScope,
 }
 
@@ -151,6 +152,8 @@ impl BundleStore {
             .into());
         }
 
+        let archive_sha256 = hex::encode(Sha256::digest(bytes));
+
         // Validate checksums before extracting
         validate_checksums(bytes, &manifest)?;
 
@@ -192,8 +195,21 @@ impl BundleStore {
             }
         }
 
+        std::fs::write(
+            tmp_dir.path().join(INSTALL_METADATA_FILE),
+            serde_json::to_vec_pretty(&InstallMetadata {
+                archive_sha256: archive_sha256.clone(),
+            })?,
+        )
+        .with_context(|| {
+            format!(
+                "Cannot write install metadata in {}",
+                tmp_dir.path().display()
+            )
+        })?;
+
         // Move temp dir to final destination
-        let tmp_path = tmp_dir.into_path();
+        let tmp_path = tmp_dir.keep();
         std::fs::rename(&tmp_path, &dest)
             .with_context(|| format!("Cannot move bundle to {}", dest.display()))?;
 
@@ -207,6 +223,7 @@ impl BundleStore {
             version: manifest.version.clone(),
             bundle_dir: dest,
             manifest,
+            archive_sha256,
             scope: self.scope,
         })
     }
@@ -227,11 +244,15 @@ impl BundleStore {
                         let manifest_path = bundle_dir.join("manifest.json");
                         if let Ok(text) = std::fs::read_to_string(&manifest_path) {
                             if let Ok(manifest) = serde_json::from_str::<BundleManifest>(&text) {
+                                let archive_sha256 = read_install_metadata(&bundle_dir)
+                                    .map(|meta| meta.archive_sha256)
+                                    .unwrap_or_default();
                                 result.push(BundleInfo {
                                     name: name.clone(),
                                     version: version.clone(),
                                     bundle_dir,
                                     manifest,
+                                    archive_sha256,
                                     scope: self.scope,
                                 });
                             }
@@ -257,11 +278,15 @@ impl BundleStore {
         }
         let text = std::fs::read_to_string(&manifest_path).ok()?;
         let manifest = serde_json::from_str::<BundleManifest>(&text).ok()?;
+        let archive_sha256 = read_install_metadata(&bundle_dir)
+            .map(|meta| meta.archive_sha256)
+            .unwrap_or_default();
         Some(BundleInfo {
             name: name.to_string(),
             version: version.to_string(),
             bundle_dir,
             manifest,
+            archive_sha256,
             scope: self.scope,
         })
     }
@@ -346,6 +371,19 @@ pub fn repair_codegraph_view(bundle_dir: &Path) -> Result<bool> {
     }
     create_codegraph_view(bundle_dir)?;
     Ok(true)
+}
+
+const INSTALL_METADATA_FILE: &str = ".sempkg-install.json";
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct InstallMetadata {
+    archive_sha256: String,
+}
+
+fn read_install_metadata(bundle_dir: &Path) -> Option<InstallMetadata> {
+    let path = bundle_dir.join(INSTALL_METADATA_FILE);
+    let text = std::fs::read_to_string(&path).ok()?;
+    serde_json::from_str(&text).ok()
 }
 
 /// Read `manifest.json` from a .sembundle archive (without extracting).
