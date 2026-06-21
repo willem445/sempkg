@@ -402,7 +402,9 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
 
                 // Local folder dependency — re-build from the stored path
                 if let Some(local_path_str) = &dep.local {
-                    let local_path = PathBuf::from(local_path_str);
+                    // The stored path may be relative to the workspace dir.
+                    let raw = PathBuf::from(local_path_str);
+                    let local_path = if raw.is_absolute() { raw } else { dir.join(raw) };
                     println!("  Syncing {dep_name} from local path {} ...", local_path.display());
                     add_from_local(
                         local_path,
@@ -1763,7 +1765,15 @@ fn local_dep_matches_workspace(dep: &DependencyEntry, workspace_path: &Path) -> 
         return Ok(false);
     };
 
-    let canonical = Path::new(local_path).canonicalize().with_context(|| {
+    // Stored path may be relative to the workspace directory.
+    let raw = Path::new(local_path);
+    let resolved = if raw.is_absolute() {
+        raw.to_path_buf()
+    } else {
+        workspace_path.join(raw)
+    };
+
+    let canonical = resolved.canonicalize().with_context(|| {
         format!(
             "Failed to canonicalize local dependency path '{}' recorded in sempkg.toml",
             local_path
@@ -1996,6 +2006,26 @@ fn record_local_dep(
 ) -> Result<()> {
     let mut mf = manifest::load_manifest(workspace_dir)?;
 
+    // Prefer a path relative to the workspace directory so the manifest is
+    // portable when the whole repo is cloned into a different location.
+    //
+    // Canonicalize the workspace dir too before computing the relative path:
+    // on Windows `canonical` carries a `\\?\` verbatim prefix (from
+    // `canonicalize()`) that a non-canonical `workspace_dir` lacks, which would
+    // otherwise make `strip_prefix` fail and fall back to an absolute,
+    // machine-specific path. When the local source *is* the workspace (the
+    // `sempkg add .` case) the relative path is empty, so record `.` instead.
+    let canonical_workspace = workspace_dir
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_dir.to_path_buf());
+    let stored_path: String = match canonical.strip_prefix(&canonical_workspace) {
+        Ok(rel) if rel.as_os_str().is_empty() => ".".to_string(),
+        // Normalize separators to `/` so the recorded path is portable across
+        // platforms (forward slashes are accepted by `Path::join` on Windows).
+        Ok(rel) => rel.to_string_lossy().replace('\\', "/"),
+        Err(_) => canonical.to_string_lossy().into_owned(),
+    };
+
     let dep = manifest::DependencyEntry {
         version: version.to_string(),
         registry: None,
@@ -2004,7 +2034,7 @@ fn record_local_dep(
         git_ref: None,
         subdir: None,
         full: false,
-        local: Some(canonical.to_string_lossy().into_owned()),
+        local: Some(stored_path.clone()),
         include_source,
         source_glob,
         source_dirs: source_dirs_override
@@ -2028,7 +2058,7 @@ fn record_local_dep(
         lock.upsert(manifest::LockEntry {
             name: package_name.to_string(),
             version: version.to_string(),
-            registry_url: format!("local:{}", canonical.display()),
+            registry_url: format!("local:{}", stored_path),
             sha256: sha.to_owned(),
             signed: false,
             manifest_checksums: Default::default(),
