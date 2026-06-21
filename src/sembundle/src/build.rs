@@ -188,15 +188,20 @@ fn run_codegraph(source_dirs: &[PathBuf], out_dir: &Path, exclude_dirs: &[PathBu
             "[sembundle]   codegraph: indexing {} ...",
             source_dir.display()
         );
-        invoke(
-            &exe,
-            &["init", "--index", &source_dir.to_string_lossy()],
-            None,
-            None,
-            true,
-        )?;
-
+        // `codegraph init --index` only indexes during first-time initialization.
+        // If a `.codegraph/` directory already exists, `init` bails out with
+        // "Already initialized" and performs no indexing, leaving the bundle with
+        // a stale (or empty) graph. Detect that case and run a forced full
+        // re-index instead, so every build produces a fresh, complete index.
+        let src_str = source_dir.to_string_lossy();
         let dot_cg = source_dir.join(".codegraph");
+        let args: Vec<&str> = if dot_cg.exists() {
+            vec!["index", "--force", src_str.as_ref()]
+        } else {
+            vec!["init", "--index", src_str.as_ref()]
+        };
+        invoke(&exe, &args, None, None, true)?;
+
         if dot_cg.is_dir() {
             copy_dir_into(&dot_cg, &graph_dir)?;
         }
