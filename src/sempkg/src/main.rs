@@ -286,9 +286,39 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
         }
 
         // -----------------------------------------------------------------------
-        // Remove dependency from manifest
+        // Remove dependency from manifest and/or uninstall from store
         // -----------------------------------------------------------------------
-        Commands::Remove { name, group } => {
+        Commands::Remove { name, group, global } => {
+            if global {
+                if group.is_some() {
+                    anyhow::bail!("--group cannot be used with --global");
+                }
+
+                let mut removed_any = false;
+
+                let mut registry = PackageRegistry::load()?;
+                if registry.remove(&name)? {
+                    println!("Removed '{name}' from the global package registry.");
+                    removed_any = true;
+                }
+
+                let removed_versions = BundleStore::global().remove_package(&name)?;
+                if removed_versions > 0 {
+                    println!(
+                        "Removed {name} from the global bundle store ({removed_versions} version(s))."
+                    );
+                    removed_any = true;
+                }
+
+                if !removed_any {
+                    anyhow::bail!(
+                        "'{name}' not found in the global package registry or global bundle store."
+                    );
+                }
+
+                return Ok(());
+            }
+
             let dir = require_workspace(workspace)?;
             let mut mf = manifest::load_manifest(dir)?;
 
@@ -301,21 +331,29 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
                 mf.dependencies.remove(&name).is_some()
             };
 
-            if removed {
-                manifest::save_manifest(&mf, dir)?;
-                if let Some(g) = &group {
-                    println!("Removed '{name}' from group '{g}' in sempkg.toml.");
-                } else {
-                    println!("Removed '{name}' from sempkg.toml.");
-                }
-            } else {
+            if !removed {
                 let hint = if group.is_none() {
-                    format!(" Use --group <name> to remove from a specific group.")
+                    " Use --group <name> to remove from a specific group.".to_string()
                 } else {
                     String::new()
                 };
                 anyhow::bail!("'{name}' not found in sempkg.toml.{hint}");
             }
+
+            manifest::save_manifest(&mf, dir)?;
+            if let Some(g) = &group {
+                println!("Removed '{name}' from group '{g}' in sempkg.toml.");
+            } else {
+                println!("Removed '{name}' from sempkg.toml.");
+            }
+
+            let removed_versions = BundleStore::workspace(dir).remove_package(&name)?;
+            if removed_versions > 0 {
+                println!(
+                    "Removed {name} from the workspace store ({removed_versions} version(s))."
+                );
+            }
+
             Ok(())
         }
 
@@ -626,6 +664,25 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
             }
 
             anyhow::bail!("'{name}' not found. Run 'sempkg list' to see available packages.");
+        }
+
+        // -----------------------------------------------------------------------
+        // Uninstall — remove a bundle from store
+        // -----------------------------------------------------------------------
+        Commands::Uninstall { spec, global } => {
+            let (name, version) = parse_spec(&spec)?;
+
+            let store = if global {
+                BundleStore::global()
+            } else {
+                BundleStore::workspace(require_workspace(workspace)?)
+            };
+
+            let scope_label = if global { "global" } else { "workspace" };
+
+            store.remove(name, version)?;
+            println!("Uninstalled {name}@{version} [{scope_label}].");
+            Ok(())
         }
 
         Commands::Repair => {

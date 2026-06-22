@@ -142,14 +142,25 @@ pub enum Commands {
         exclude_dirs: Vec<PathBuf>,
     },
 
-    /// Remove a bundle dependency from sempkg.toml (from [dependencies] or a group).
+    /// Remove a workspace dependency or global package state.
+    ///
+    /// By default, this removes the dependency from sempkg.toml and deletes the
+    /// package from the workspace store. Use --global to delete matching global
+    /// package registrations and global bundle installs without modifying the
+    /// workspace manifest.
     Remove {
         /// Package name to remove.
         name: String,
 
         /// Remove from this named group instead of [dependencies].
+        ///
+        /// Only valid for workspace removals.
         #[arg(long, short = 'g')]
         group: Option<String>,
+
+        /// Remove from global package state without touching sempkg.toml.
+        #[arg(long, short = 'G')]
+        global: bool,
     },
 
     /// Install all bundles declared in sempkg.toml.
@@ -194,6 +205,20 @@ pub enum Commands {
     Status {
         /// Package/bundle name.
         name: String,
+    },
+
+    /// Uninstall a bundle (remove from local or global store).
+    ///
+    /// Does not modify sempkg.toml or .lock files. Use `sempkg remove` to remove
+    /// from the manifest, or manually edit sempkg.toml and run `sempkg sync` to
+    /// reinstall dependencies.
+    Uninstall {
+        /// Package spec in `name@version` format.
+        spec: String,
+
+        /// Uninstall from global store (~/.sempkg/bundles/) instead of workspace-local.
+        #[arg(long, short = 'g')]
+        global: bool,
     },
 
     /// Repair installed bundles — creates missing .codegraph views so the

@@ -304,6 +304,25 @@ impl BundleStore {
         std::fs::remove_dir_all(&dir)
             .with_context(|| format!("Failed to remove bundle at {}", dir.display()))
     }
+
+    /// Remove every installed version of a package from the store.
+    pub fn remove_package(&self, name: &str) -> Result<usize> {
+        let package_dir = self.store_dir.join(name);
+        if !package_dir.exists() {
+            return Ok(0);
+        }
+
+        let version_count = std::fs::read_dir(&package_dir)
+            .with_context(|| format!("Failed to read package store at {}", package_dir.display()))?
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false))
+            .count();
+
+        std::fs::remove_dir_all(&package_dir)
+            .with_context(|| format!("Failed to remove package store at {}", package_dir.display()))?;
+
+        Ok(version_count)
+    }
 }
 
 // ---------------------------------------------------------------------------
