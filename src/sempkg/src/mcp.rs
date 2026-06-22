@@ -127,7 +127,8 @@ fn all_tools() -> Value {
             "Get AI-optimised code context for a task description, scoped to a specific package.",
             json!({
                 "package": { "type": "string", "description": "Package or bundle name" },
-                "task":    { "type": "string", "description": "Natural-language description of the task" }
+                "task":    { "type": "string", "description": "Natural-language description of the task" },
+                "limit":   { "type": "integer", "description": "Max symbols to return (default 20)" }
             }),
             &["package", "task"]
         ),
@@ -446,11 +447,37 @@ impl McpContext {
         }
     }
 
-    fn tool_get_context(&self, package: &str, task: &str) -> String {
-        match self.resolve_codegraph_path(package) {
-            Err(e) => e,
-            Ok(path) => codegraph::context(&path, task).unwrap_or_else(|e| format!("Error: {e}")),
-        }
+    fn tool_get_context(&self, package: &str, task: &str, limit: usize) -> String {
+        let path = match self.resolve_codegraph_path(package) {
+            Err(e) => return e,
+            Ok(p) => p,
+        };
+
+        // Fetch more candidates than `limit` so the reranker has a richer pool.
+        let fetch_limit = self.reranker_fetch_limit(limit).max(limit * 2);
+
+        // Request JSON output with code blocks suppressed so we can rerank the
+        // symbol list before returning it.
+        let raw = match codegraph::context_json(&path, task, fetch_limit) {
+            Ok(s) => s,
+            Err(_) => {
+                // Graceful fallback: return plain markdown output.
+                return codegraph::context(&path, task)
+                    .unwrap_or_else(|e| format!("Error: {e}"));
+            }
+        };
+
+        // Parse the JSON response: extract the `nodes` array and re-serialise
+        // it as a plain array so `codegraph_json_to_candidates` can consume it.
+        let nodes_json: String = match serde_json::from_str::<serde_json::Value>(&raw) {
+            Ok(v) => {
+                let nodes = v.get("nodes").cloned().unwrap_or(serde_json::Value::Array(vec![]));
+                serde_json::to_string(&nodes).unwrap_or_default()
+            }
+            Err(_) => return raw, // not JSON — return as-is
+        };
+
+        self.apply_rerank_to_codegraph(task, &nodes_json, limit)
     }
 
     fn tool_get_callers(&self, package: &str, symbol: &str, limit: usize) -> String {
@@ -782,7 +809,11 @@ impl McpContext {
                 opt_str("kind"),
                 int_arg("limit", 20),
             ),
-            "get_context" => self.tool_get_context(str_arg("package"), str_arg("task")),
+            "get_context" => self.tool_get_context(
+                str_arg("package"),
+                str_arg("task"),
+                int_arg("limit", 20),
+            ),
             "get_callers" => {
                 self.tool_get_callers(str_arg("package"), str_arg("symbol"), int_arg("limit", 20))
             }

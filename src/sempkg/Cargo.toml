@@ -45,6 +45,7 @@ dirs         = "6"
 tempfile     = "3"
 walkdir      = "2"
 which        = "8"
+rusqlite     = { version = "0.31", features = ["bundled"] }
 
 # Optional reranker dependency (enabled via --features reranker)
 # llama-cpp-2 wraps llama.cpp with native Qwen3 + RANK-pooling reranker support.
