@@ -12,6 +12,9 @@ jobs:
   build:
     name: Build ${{ matrix.binary }} — ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    env:
+      CARGO_INCREMENTAL: 0
+      RUSTFLAGS: -C debuginfo=0
     strategy:
       fail-fast: false
       matrix:
@@ -51,7 +54,17 @@ jobs:
             ext: ""
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+
+      - name: Free disk space (Ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          df -h
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/share/dotnet
+          sudo apt-get clean
+          df -h
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -146,19 +159,112 @@ jobs:
           echo "ARTIFACT=${artifact}" >> "${GITHUB_ENV}"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.binary }}-${{ matrix.target }}
           path: ${{ env.ARTIFACT }}
           retention-days: 1
 
+  bundle-sempkg:
+    name: Build and sign sempkg SemBundle
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      CARGO_INCREMENTAL: 0
+      RUSTFLAGS: -C debuginfo=0
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Free disk space (Ubuntu)
+        run: |
+          df -h
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/share/dotnet
+          sudo apt-get clean
+          df -h
+
+      - name: Download sembundle (Linux)
+        uses: actions/download-artifact@v4
+        with:
+          name: sembundle-x86_64-unknown-linux-gnu
+          path: tools/
+
+      - name: Resolve sembundle binary path
+        shell: bash
+        run: |
+          SEMBUNDLE_BIN=$(find tools -maxdepth 1 -type f -name 'sembundle*' | head -1)
+          if [ -z "$SEMBUNDLE_BIN" ]; then
+            echo "No sembundle binary found in tools/"
+            ls -la tools || true
+            exit 1
+          fi
+          chmod +x "$SEMBUNDLE_BIN"
+          echo "SEMBUNDLE_BIN=$SEMBUNDLE_BIN" >> "$GITHUB_ENV"
+
+      - name: Install Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '20'
+
+      - name: Install CodeGraph
+        run: npm install -g @colbymchenry/codegraph
+
+      - name: Resolve version and CodeGraph version
+        run: |
+          echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+          CG_VER=$(codegraph --version 2>&1 | grep -oP '\d+\.\d+\.\d+' | head -1)
+          echo "CODEGRAPH_VERSION=${CG_VER:-unknown}" >> "$GITHUB_ENV"
+
+      - name: Build sempkg SemBundle
+        run: |
+          "$SEMBUNDLE_BIN" build \
+            --name sempkg \
+            --version "$VERSION" \
+            --source-repo https://github.com/willem445/sempkg \
+            --commit-hash "${{ github.sha }}" \
+            --codegraph-version "$CODEGRAPH_VERSION" \
+            --source-dir src/sempkg/src \
+            --docs-dir docs \
+            --language rust \
+            --output "sempkg-${VERSION}.sembundle"
+
+      - name: Write signing key
+        env:
+          SEMBUNDLE_SIGNING_KEY: ${{ secrets.SEMBUNDLE_SIGNING_KEY }}
+        shell: bash
+        run: |
+          printf '%b' "$SEMBUNDLE_SIGNING_KEY" | tr -d '\r' > "$RUNNER_TEMP/private.pem"
+          chmod 600 "$RUNNER_TEMP/private.pem"
+
+      - name: Sign bundle
+        run: |
+          "$SEMBUNDLE_BIN" sign "sempkg-${VERSION}.sembundle" --key "$RUNNER_TEMP/private.pem"
+
+      - name: Remove signing key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/private.pem"
+
+      - name: Stage public key
+        run: cp keys/public.pem public.pem
+
+      - name: Upload bundle artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: sempkg-sembundle
+          path: |
+            sempkg-${{ env.VERSION }}.sembundle
+            sempkg-${{ env.VERSION }}.sembundle.sig
+            public.pem
+          retention-days: 1
+
   release:
     name: Publish GitHub Release
-    needs: build
+    needs: [build, bundle-sempkg]
     runs-on: ubuntu-latest
     steps:
       - name: Download all build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: dist/
           merge-multiple: true
@@ -166,7 +272,7 @@ jobs:
       - name: Generate SHA-256 checksums
         run: |
           cd dist
-          sha256sum * > SHA256SUMS.txt
+          find . -type f | sort | xargs sha256sum > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
       - name: Create GitHub Release

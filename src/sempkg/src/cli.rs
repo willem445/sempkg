@@ -32,46 +32,12 @@ pub enum Commands {
         registry: Option<String>,
     },
 
-    /// Index the current repository (or a specified path) so it can be
-    /// searched with `sempkg search`, `sempkg docs`, and `sempkg query`.
+    /// Rebuild and reinstall the local dependency for the current workspace.
     ///
-    /// This is a one-shot alternative to running:
-    ///   1. `sempkg pkg add <name> <path>`  — register with codegraph
-    ///   2. `sempkg pkg lance-index <name>` — build the LanceDB docs index
-    ///
-    /// The command is **idempotent**: re-running it updates the index without
-    /// duplicating entries.  If a `sempkg.toml` exists in the target directory
-    /// the package is also recorded in its `[packages]` table.
-    Index {
-        /// Directory to index.  Defaults to the current working directory.
-        path: Option<PathBuf>,
-
-        /// Short name used to identify this package in sempkg commands.
-        /// Defaults to the directory's basename.
-        #[arg(long, short = 'n')]
-        name: Option<String>,
-
-        /// Glob pattern of documentation files to include in the LanceDB
-        /// full-text index.  May be comma-separated for multiple patterns.
-        /// Defaults to all Markdown, RST, and plain-text files.
-        #[arg(long, default_value = "**/*.{md,rst,txt}")]
-        docs_pattern: String,
-
-        /// Skip building / updating the LanceDB documentation index.
-        #[arg(long)]
-        no_docs: bool,
-
-        /// Skip building / updating the CodeGraph symbol index.
-        #[arg(long)]
-        no_code: bool,
-
-        /// Also register the package in the global sempkg registry
-        /// (`~/.sempkg/packages.json`) in addition to the workspace
-        /// `sempkg.toml`.  By default the registration is workspace-scoped
-        /// only (matching the behaviour of `sempkg pkg add`).
-        #[arg(long)]
-        global: bool,
-    },
+    /// This reuses the settings stored by `sempkg add .`, including
+    /// `--include-source`, `--source-glob`, `--source-dir`, `--docs-dir`, and
+    /// `--exclude-dir`.
+    Refresh,
 
     /// List all registered packages and installed bundles.
     List,
@@ -80,8 +46,10 @@ pub enum Commands {
     ///
     /// Example: sempkg add aws-sdk@1.11.210 --registry https://reg.example.com
     /// Example: sempkg add mylib@2.0.0 --url https://github.com/owner/repo/releases/download/v2.0.0/mylib-2.0.0.sembundle
+    /// Example: sempkg add --url https://github.com/pandas-dev/pandas/releases/tag/v3.0.3 --full --include-source
     /// Example: sempkg add pandas-dev/pandas@v2.2.2
     /// Example: sempkg add https://github.com/pandas-dev/pandas/tree/v2.2.2
+    /// Example: sempkg add . --name sempkg --include-source --docs-dir docs --source-dir src/sempkg/src
     /// Example: sempkg add /path/to/sdk --name my-sdk
     /// Example: sempkg add ~/tools/llvm --name llvm --version 17.0
     /// Example: sempkg add C:\LLVM --name llvm
@@ -89,14 +57,18 @@ pub enum Commands {
     /// When a GitHub source is provided, sempkg immediately fetches, builds,
     /// and installs the bundle into the workspace (no separate `sync` needed).
     ///
-    /// When a local filesystem path is provided (absolute or relative starting
-    /// with `./`, `../`, or `~/`), sempkg builds the bundle directly from that
-    /// directory and installs it.  The path is recorded in `sempkg.toml` so
-    /// `sempkg sync` can rebuild it later.
+    /// When a local filesystem path is provided (including `.` for the current
+    /// directory), sempkg builds the bundle directly from that directory and
+    /// installs it.  The path is recorded in `sempkg.toml` so `sempkg sync`
+    /// and `sempkg refresh` can rebuild it later.
     Add {
         /// Package spec in `name@version` format, GitHub shorthand `owner/repo@ref`,
         /// or a full GitHub URL.
-        spec: String,
+        ///
+        /// May be omitted when `--url` is used with a GitHub source URL. Direct
+        /// bundle asset URLs still require a separate `name@version` spec.
+        #[arg(required_unless_present = "url")]
+        spec: Option<String>,
 
         /// Override the registry URL for this dependency.
         #[arg(long, short = 'r')]
@@ -106,7 +78,10 @@ pub enum Commands {
         #[arg(long)]
         registry: Option<String>,
 
-        /// Direct download URL for the bundle asset (e.g. a GitHub release URL).
+        /// Direct download URL for the bundle asset.
+        ///
+        /// A GitHub source URL can also be supplied here as an alternative to the
+        /// positional spec, for example with `--full` / `--include-source`.
         /// When set, no registry is needed.
         #[arg(long, short = 'u')]
         url: Option<String>,
@@ -150,16 +125,42 @@ pub enum Commands {
         /// Default covers Rust, Python, JS/TS, Go, Java, C/C++.
         #[arg(long)]
         source_glob: Option<String>,
+
+        /// Source directory to index with codegraph. Repeat the flag to index
+        /// multiple directories. Defaults to the whole source root.
+        #[arg(long = "source-dir", short = 's')]
+        source_dirs: Vec<PathBuf>,
+
+        /// Documentation directory to index with LanceDB. Repeat the flag to
+        /// add multiple directories. Defaults to the whole source root.
+        #[arg(long = "docs-dir", short = 'd')]
+        docs_dirs: Vec<PathBuf>,
+
+        /// Directory to exclude from all indexing (source, docs, and source-code
+        /// index). Repeat the flag to exclude multiple directories.
+        #[arg(long = "exclude-dir", short = 'e')]
+        exclude_dirs: Vec<PathBuf>,
     },
 
-    /// Remove a bundle dependency from sempkg.toml (from [dependencies] or a group).
+    /// Remove a workspace dependency or global package state.
+    ///
+    /// By default, this removes the dependency from sempkg.toml and deletes the
+    /// package from the workspace store. Use --global to delete matching global
+    /// package registrations and global bundle installs without modifying the
+    /// workspace manifest.
     Remove {
         /// Package name to remove.
         name: String,
 
         /// Remove from this named group instead of [dependencies].
+        ///
+        /// Only valid for workspace removals.
         #[arg(long, short = 'g')]
         group: Option<String>,
+
+        /// Remove from global package state without touching sempkg.toml.
+        #[arg(long, short = 'G')]
+        global: bool,
     },
 
     /// Install all bundles declared in sempkg.toml.
@@ -204,6 +205,20 @@ pub enum Commands {
     Status {
         /// Package/bundle name.
         name: String,
+    },
+
+    /// Uninstall a bundle (remove from local or global store).
+    ///
+    /// Does not modify sempkg.toml or .lock files. Use `sempkg remove` to remove
+    /// from the manifest, or manually edit sempkg.toml and run `sempkg sync` to
+    /// reinstall dependencies.
+    Uninstall {
+        /// Package spec in `name@version` format.
+        spec: String,
+
+        /// Uninstall from global store (~/.sempkg/bundles/) instead of workspace-local.
+        #[arg(long, short = 'g')]
+        global: bool,
     },
 
     /// Repair installed bundles — creates missing .codegraph views so the
@@ -427,4 +442,77 @@ pub enum RerankerCommands {
         /// The document string to score against the query.
         document: String,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, Commands};
+    use clap::Parser;
+    use std::path::PathBuf;
+
+    #[test]
+    fn add_accepts_github_source_url_via_flag_without_spec() {
+        let cli = Cli::try_parse_from([
+            "sempkg",
+            "add",
+            "--url",
+            "https://github.com/pandas-dev/pandas/releases/tag/v3.0.3",
+            "--full",
+            "--include-source",
+        ])
+        .expect("add command should parse");
+
+        match cli.command {
+            Commands::Add {
+                spec,
+                url,
+                full,
+                include_source,
+                ..
+            } => {
+                assert_eq!(spec, None);
+                assert_eq!(
+                    url.as_deref(),
+                    Some("https://github.com/pandas-dev/pandas/releases/tag/v3.0.3")
+                );
+                assert!(full);
+                assert!(include_source);
+            }
+            _ => panic!("expected add command"),
+        }
+    }
+
+    #[test]
+    fn add_accepts_current_directory_shortcut() {
+        let cli = Cli::try_parse_from([
+            "sempkg",
+            "add",
+            ".",
+            "--include-source",
+            "--docs-dir",
+            "docs",
+        ])
+        .expect("add command should parse");
+
+        match cli.command {
+            Commands::Add {
+                spec,
+                include_source,
+                docs_dirs,
+                ..
+            } => {
+                assert_eq!(spec.as_deref(), Some("."));
+                assert!(include_source);
+                assert_eq!(docs_dirs, vec![PathBuf::from("docs")]);
+            }
+            _ => panic!("expected add command"),
+        }
+    }
+
+    #[test]
+    fn refresh_command_parses() {
+        let cli = Cli::try_parse_from(["sempkg", "refresh"]).expect("refresh should parse");
+
+        assert!(matches!(cli.command, Commands::Refresh));
+    }
 }

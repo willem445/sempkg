@@ -170,8 +170,12 @@ sempkg sync --group dev        # also install the "dev" dependency group
 sempkg sync --all-groups       # install every dependency group
 ```
 
-After the first `sync` a `sempkg.lock` file is written. Commit it for
-reproducible installs across machines.
+A `sempkg.lock` file is created and updated by `sync`. It records the resolved
+version, source, archive hash, and manifest checksums for each installed
+bundle—enabling reproducible installs across machines. When a bundle is already
+installed but missing from the lock, `sync` repairs the lock entry from the
+bundle's on-disk metadata. Commit `sempkg.lock` alongside `sempkg.toml` for
+full reproducibility.
 
 ### Ad-hoc install (without manifest)
 
@@ -209,33 +213,26 @@ sempkg status aws-sdk
 
 ---
 
-## Indexing a Local Repository
+## Indexing the Current Workspace
 
-`sempkg index` is a one-shot command that registers a local source repository
-with CodeGraph **and** builds its LanceDB documentation index in a single step.
+Use `sempkg add .` to treat the current repository like an editable local
+dependency. This builds and installs a bundle from the current directory and
+stores the source, docs, and exclude settings in `sempkg.toml` so they can be
+reused later.
 
 ```powershell
-# Index the current directory (name defaults to the folder's basename)
-sempkg index
+# Build from the current workspace and persist the filters
+sempkg add . --name mylib --include-source --docs-dir docs --source-dir src --exclude-dir target
 
-# Index a specific path with a custom name
-sempkg index C:\Projects\mylib --name mylib
+# Rebuild the current workspace using the stored settings
+sempkg refresh
 
-# Skip the docs index
-sempkg index C:\Projects\mylib --name mylib --no-docs
-
-# Skip the code index (update docs only)
-sempkg index C:\Projects\mylib --name mylib --no-code
-
-# Register globally (~/.sempkg/packages.json) in addition to sempkg.toml
-sempkg index C:\Projects\mylib --name mylib --global
-
-# Custom docs glob
-sempkg index . --docs-pattern "docs/**/*.md,CHANGELOG.md"
+# Rebuild all manifest dependencies, including local ones
+sempkg sync --reinstall
 ```
 
-The command is **idempotent** — re-running it updates the existing index
-without duplicating entries.
+`sempkg refresh` only works after the current workspace has been added as a
+local dependency with `sempkg add .`.
 
 ---
 
@@ -361,8 +358,8 @@ falls back to plain BM25 results.
 ## Local Package Management
 
 Local packages are source repositories indexed with CodeGraph directly — no
-bundle required. Prefer `sempkg index` for a single-step setup; use `sempkg pkg`
-for finer control.
+bundle required. Use `sempkg add .` plus `sempkg refresh` for the editable
+workspace flow; use `sempkg pkg` for lower-level CodeGraph-only registration.
 
 ```powershell
 # Register and index separately

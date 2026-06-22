@@ -16,7 +16,6 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use clap::Parser;
 
-use sha2::{Digest, Sha256};
 
 use crate::cli::{Cli, Commands, PkgCommands, RerankerCommands};
 use crate::manifest::{DependencyEntry, RegistryEntry};
@@ -61,24 +60,9 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
         }
 
         // -----------------------------------------------------------------------
-        // Index — one-shot workspace indexing
+        // Refresh — rebuild current local workspace dependency
         // -----------------------------------------------------------------------
-        Commands::Index {
-            path,
-            name,
-            docs_pattern,
-            no_docs,
-            no_code,
-            global,
-        } => run_index(
-            path.as_deref(),
-            name.as_deref(),
-            &docs_pattern,
-            no_docs,
-            no_code,
-            global,
-            workspace,
-        ),
+        Commands::Refresh => run_refresh(workspace),
 
         // -----------------------------------------------------------------------
         // List
@@ -155,42 +139,66 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
             version: version_override,
             include_source,
             source_glob,
+            source_dirs,
+            docs_dirs,
+            exclude_dirs,
         } => {
             let dir = require_workspace(workspace)?;
 
-            // Check if this is a local folder path first
-            if let Some(local_path) = parse_local_source(&spec) {
-                return add_from_local(
-                    local_path,
-                    dir,
-                    group.as_deref(),
-                    reinstall,
-                    name_override.as_deref(),
-                    version_override.as_deref(),
-                    include_source,
-                    source_glob.clone(),
-                    workspace,
-                );
-            }
+            let source_input = spec
+                .as_deref()
+                .or_else(|| url.as_deref().filter(|candidate| github::parse_source(candidate).is_some()));
 
-            // Check if this is a GitHub source
-            if let Some(gh_src) = github::parse_source(&spec) {
-                return add_from_github(
-                    gh_src,
-                    dir,
-                    group.as_deref(),
-                    build,
-                    reinstall,
-                    full,
-                    name_override.as_deref(),
-                    version_override.as_deref(),
-                    include_source,
-                    source_glob.clone(),
-                    workspace,
-                );
+            if let Some(source_input) = source_input {
+                // Check if this is a local folder path first.
+                if let Some(local_path) = parse_local_source(source_input) {
+                    return add_from_local(
+                        local_path,
+                        dir,
+                        group.as_deref(),
+                        reinstall,
+                        name_override.as_deref(),
+                        version_override.as_deref(),
+                        include_source,
+                        source_glob.clone(),
+                        source_dirs,
+                        docs_dirs,
+                        exclude_dirs,
+                        workspace,
+                        None,
+                    );
+                }
+
+                // Check if this is a GitHub source.
+                if let Some(gh_src) = github::parse_source(source_input) {
+                    return add_from_github(
+                        gh_src,
+                        dir,
+                        group.as_deref(),
+                        build,
+                        reinstall,
+                        full,
+                        name_override.as_deref(),
+                        version_override.as_deref(),
+                        include_source,
+                        source_glob.clone(),
+                        source_dirs,
+                        docs_dirs,
+                        exclude_dirs,
+                        workspace,
+                        None,
+                    );
+                }
             }
 
             // --- Existing registry / URL path (unchanged) ---
+            let spec = spec.as_deref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Direct bundle URLs still require <SPEC> in name@version format. \
+                     Use `sempkg add <name>@<version> --url <bundle-asset-url>` for assets, \
+                     or pass a GitHub source URL to `--url` to build from source."
+                )
+            })?;
             let (name, version) = parse_spec(&spec)?;
 
             let mut mf = manifest::load_manifest(dir)?;
@@ -208,6 +216,9 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
                     local: None,
                     include_source: false,
                     source_glob: None,
+                    source_dirs: vec![],
+                    docs_dirs: vec![],
+                    exclude_dirs: vec![],
                 };
                 insert_dep(&mut mf, name, dep, group.as_deref());
             } else if let Some(url) = &registry_url {
@@ -231,6 +242,9 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
                     local: None,
                     include_source: false,
                     source_glob: None,
+                    source_dirs: vec![],
+                    docs_dirs: vec![],
+                    exclude_dirs: vec![],
                 };
                 insert_dep(&mut mf, name, dep, group.as_deref());
             } else {
@@ -255,6 +269,9 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
                     local: None,
                     include_source: false,
                     source_glob: None,
+                    source_dirs: vec![],
+                    docs_dirs: vec![],
+                    exclude_dirs: vec![],
                 };
                 insert_dep(&mut mf, name, dep, group.as_deref());
             }
@@ -269,9 +286,39 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
         }
 
         // -----------------------------------------------------------------------
-        // Remove dependency from manifest
+        // Remove dependency from manifest and/or uninstall from store
         // -----------------------------------------------------------------------
-        Commands::Remove { name, group } => {
+        Commands::Remove { name, group, global } => {
+            if global {
+                if group.is_some() {
+                    anyhow::bail!("--group cannot be used with --global");
+                }
+
+                let mut removed_any = false;
+
+                let mut registry = PackageRegistry::load()?;
+                if registry.remove(&name)? {
+                    println!("Removed '{name}' from the global package registry.");
+                    removed_any = true;
+                }
+
+                let removed_versions = BundleStore::global().remove_package(&name)?;
+                if removed_versions > 0 {
+                    println!(
+                        "Removed {name} from the global bundle store ({removed_versions} version(s))."
+                    );
+                    removed_any = true;
+                }
+
+                if !removed_any {
+                    anyhow::bail!(
+                        "'{name}' not found in the global package registry or global bundle store."
+                    );
+                }
+
+                return Ok(());
+            }
+
             let dir = require_workspace(workspace)?;
             let mut mf = manifest::load_manifest(dir)?;
 
@@ -284,21 +331,29 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
                 mf.dependencies.remove(&name).is_some()
             };
 
-            if removed {
-                manifest::save_manifest(&mf, dir)?;
-                if let Some(g) = &group {
-                    println!("Removed '{name}' from group '{g}' in sempkg.toml.");
-                } else {
-                    println!("Removed '{name}' from sempkg.toml.");
-                }
-            } else {
+            if !removed {
                 let hint = if group.is_none() {
-                    format!(" Use --group <name> to remove from a specific group.")
+                    " Use --group <name> to remove from a specific group.".to_string()
                 } else {
                     String::new()
                 };
                 anyhow::bail!("'{name}' not found in sempkg.toml.{hint}");
             }
+
+            manifest::save_manifest(&mf, dir)?;
+            if let Some(g) = &group {
+                println!("Removed '{name}' from group '{g}' in sempkg.toml.");
+            } else {
+                println!("Removed '{name}' from sempkg.toml.");
+            }
+
+            let removed_versions = BundleStore::workspace(dir).remove_package(&name)?;
+            if removed_versions > 0 {
+                println!(
+                    "Removed {name} from the workspace store ({removed_versions} version(s))."
+                );
+            }
+
             Ok(())
         }
 
@@ -312,7 +367,6 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
         } => {
             let dir = require_workspace(workspace)?;
             let mf = manifest::load_manifest(dir)?;
-            let mut lock = manifest::load_lock(dir)?;
             let store = BundleStore::workspace(dir);
             let verify_key_path = mf.verify_key_path(dir);
 
@@ -334,14 +388,10 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
                 .map(verify::load_verifying_key)
                 .transpose()?;
 
+            let mut lock = manifest::load_lock(dir)?;
             let mut installed = Vec::new();
 
             for (dep_name, dep) in &deps {
-                if !reinstall && store.is_installed(dep_name, &dep.version) {
-                    println!("  {dep_name}@{} already installed, skipping.", dep.version);
-                    continue;
-                }
-
                 // GitHub-sourced dependency — re-run the build flow
                 if dep.git.is_some() {
                     let git_src = dep.git.as_deref().unwrap_or_default();
@@ -376,14 +426,21 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
                         None,
                         dep.include_source,
                         dep.source_glob.clone(),
+                        dep.source_dirs.iter().map(PathBuf::from).collect(),
+                        dep.docs_dirs.iter().map(PathBuf::from).collect(),
+                        dep.exclude_dirs.iter().map(PathBuf::from).collect(),
                         workspace,
+                        Some(&mut lock),
                     )?;
+                    installed.push(format!("{dep_name}@{}", dep.version));
                     continue;
                 }
 
                 // Local folder dependency — re-build from the stored path
                 if let Some(local_path_str) = &dep.local {
-                    let local_path = PathBuf::from(local_path_str);
+                    // The stored path may be relative to the workspace dir.
+                    let raw = PathBuf::from(local_path_str);
+                    let local_path = if raw.is_absolute() { raw } else { dir.join(raw) };
                     println!("  Syncing {dep_name} from local path {} ...", local_path.display());
                     add_from_local(
                         local_path,
@@ -394,20 +451,46 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
                         Some(&dep.version),
                         dep.include_source,
                         dep.source_glob.clone(),
+                        dep.source_dirs.iter().map(PathBuf::from).collect(),
+                        dep.docs_dirs.iter().map(PathBuf::from).collect(),
+                        dep.exclude_dirs.iter().map(PathBuf::from).collect(),
                         workspace,
+                        Some(&mut lock),
+                    )?;
+                    installed.push(format!("{dep_name}@{}", dep.version));
+                    continue;
+                }
+
+                let source_label = if let Some(direct_url) = &dep.url {
+                    direct_url.clone()
+                } else {
+                    mf.registry_for(dep)
+                        .with_context(|| format!("No registry found for dependency '{dep_name}'"))?
+                        .url
+                        .clone()
+                };
+
+                if !reinstall && store.is_installed(dep_name, &dep.version) {
+                    println!("  {dep_name}@{} already installed, skipping.", dep.version);
+                    record_installed_bundle_lock(
+                        dir,
+                        Some(&mut lock),
+                        dep_name,
+                        &dep.version,
+                        source_label,
+                        dep.url.is_none() && verify_key.is_some(),
+                        None,
                     )?;
                     continue;
                 }
 
                 let bytes: Vec<u8>;
-                let source_label: String;
 
                 if let Some(direct_url) = &dep.url {
                     // Direct URL dependency (e.g. GitHub release asset)
                     print!("  Installing {dep_name}@{} from URL ... ", dep.version);
                     std::io::Write::flush(&mut std::io::stdout())?;
                     bytes = download_from_url(direct_url, None)?;
-                    source_label = direct_url.clone();
                 } else {
                     let reg = mf.registry_for(dep).with_context(|| {
                         format!("No registry found for dependency '{dep_name}'")
@@ -423,7 +506,6 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
                     let index_entry = client.lookup(dep_name, &dep.version).ok();
                     let expected_sha256 = index_entry.as_ref().and_then(|e| e.sha256.as_deref());
                     bytes = client.download_bundle(dep_name, &dep.version, expected_sha256)?;
-                    source_label = reg.url.clone();
 
                     // Signature verification
                     if let Some(key) = &verify_key {
@@ -437,21 +519,28 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
                     }
                 }
 
-                let info = store.install_bytes(&bytes)?;
+                store.install_bytes(&bytes)?;
                 println!("done.");
 
-                lock.upsert(manifest::LockEntry {
-                    name: dep_name.clone(),
-                    version: dep.version.clone(),
-                    registry_url: source_label,
-                    sha256: hex::encode(Sha256::digest(&bytes)),
-                    signed: verify_key.is_some() && dep.url.is_none(),
-                    manifest_checksums: info.manifest.checksums.clone(),
-                    commit_sha: None,
-                });
+                record_installed_bundle_lock(
+                    dir,
+                    Some(&mut lock),
+                    dep_name,
+                    &dep.version,
+                    source_label,
+                    dep.url.is_none() && verify_key.is_some(),
+                    None,
+                )?;
                 installed.push(format!("{dep_name}@{}", dep.version));
             }
 
+            let valid_names: std::collections::BTreeSet<String> =
+                mf.resolve_deps(&[], true).keys().cloned().collect();
+            let installed_names: std::collections::BTreeSet<String> =
+                store.list().into_iter().map(|bundle| bundle.name).collect();
+            lock.packages.retain(|entry| {
+                valid_names.contains(&entry.name) || installed_names.contains(&entry.name)
+            });
             manifest::save_lock(&lock, dir)?;
 
             if installed.is_empty() {
@@ -575,6 +664,25 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
             }
 
             anyhow::bail!("'{name}' not found. Run 'sempkg list' to see available packages.");
+        }
+
+        // -----------------------------------------------------------------------
+        // Uninstall — remove a bundle from store
+        // -----------------------------------------------------------------------
+        Commands::Uninstall { spec, global } => {
+            let (name, version) = parse_spec(&spec)?;
+
+            let store = if global {
+                BundleStore::global()
+            } else {
+                BundleStore::workspace(require_workspace(workspace)?)
+            };
+
+            let scope_label = if global { "global" } else { "workspace" };
+
+            store.remove(name, version)?;
+            println!("Uninstalled {name}@{version} [{scope_label}].");
+            Ok(())
         }
 
         Commands::Repair => {
@@ -1044,162 +1152,6 @@ fn run_reranker(cmd: RerankerCommands, workspace: Option<&Path>) -> Result<()> {
 // ---------------------------------------------------------------------------
 // index — one-shot workspace indexing
 // ---------------------------------------------------------------------------
-
-/// Index the current (or specified) directory so it can be searched without
-/// any separate QMD / codegraph setup steps.
-///
-/// Steps performed (any can be skipped with --no-code / --no-docs):
-///  1. Resolve the target directory and derive a package name from its basename.
-///  2. Register the package in `~/.sempkg/packages.json` (global registry).
-///  3. Run `codegraph init --index` (or `sync` if already indexed).
-///  4. Build / update the LanceDB full-text documentation index.
-///  5. If a `sempkg.toml` exists in the target dir, record the package there.
-fn run_index(
-    path_override: Option<&std::path::Path>,
-    name_override: Option<&str>,
-    docs_pattern: &str,
-    no_docs: bool,
-    no_code: bool,
-    global: bool,
-    workspace: Option<&Path>,
-) -> Result<()> {
-    // Resolve target directory.
-    let target_dir: PathBuf = if let Some(p) = path_override {
-        p.canonicalize()
-            .with_context(|| format!("Path does not exist: {}", p.display()))?
-    } else {
-        std::env::current_dir().context("Cannot determine current directory")?
-    };
-
-    // Derive package name.
-    let name: String = if let Some(n) = name_override {
-        n.to_string()
-    } else {
-        target_dir
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "workspace".to_string())
-    };
-
-    println!("Indexing '{}' at {}", name, target_dir.display());
-
-    // --- 1. Register the package ------------------------------------------
-    // Default: workspace-scoped (sempkg.toml [packages] entry).
-    // With --global: also upsert into ~/.sempkg/packages.json.
-    let toml_dir = path_override.unwrap_or_else(|| workspace.unwrap_or(&target_dir));
-    let has_manifest = manifest::load_manifest(toml_dir).is_ok();
-
-    if !has_manifest && !global {
-        // No manifest present and --global not requested — fall back to global
-        // so the package is still queryable, but warn the user.
-        eprintln!(
-            "  Warning: no sempkg.toml found in {}.  \
-             Registering globally in ~/.sempkg/packages.json instead.\n  \
-             Run `sempkg init` first if you want workspace-scoped registration.",
-            toml_dir.display()
-        );
-        let mut reg = packages::PackageRegistry::load()?;
-        if reg.get(&name).is_none() {
-            reg.add(&name, &target_dir, "")?;
-            println!("  Registered '{}' in global sempkg registry.", name);
-        } else {
-            println!("  '{}' already in global registry (skipping).", name);
-        }
-    } else if global {
-        let mut reg = packages::PackageRegistry::load()?;
-        if reg.get(&name).is_none() {
-            reg.add(&name, &target_dir, "")?;
-            println!("  Registered '{}' in global sempkg registry.", name);
-        } else {
-            println!("  '{}' already in global registry (skipping).", name);
-        }
-    }
-
-    // --- 2. CodeGraph symbol index ----------------------------------------
-    if !no_code {
-        let already_indexed = codegraph::is_indexed(&target_dir);
-        if already_indexed {
-            print!("  Updating CodeGraph symbol index ... ");
-            std::io::Write::flush(&mut std::io::stdout())?;
-            match codegraph::sync(&target_dir) {
-                Ok(out) => {
-                    println!("done.");
-                    if !out.is_empty() {
-                        println!("{out}");
-                    }
-                }
-                Err(e) => {
-                    println!("failed.");
-                    eprintln!("  Warning: codegraph sync error: {e}");
-                    eprintln!("  Run `sempkg pkg reindex {name}` to retry.");
-                }
-            }
-        } else {
-            print!("  Building CodeGraph symbol index ... ");
-            std::io::Write::flush(&mut std::io::stdout())?;
-            match codegraph::init_and_index(&target_dir) {
-                Ok(out) => {
-                    println!("done.");
-                    if !out.is_empty() {
-                        println!("{out}");
-                    }
-                }
-                Err(e) => {
-                    println!("failed.");
-                    eprintln!("  Warning: codegraph init error: {e}");
-                    eprintln!("  Ensure `codegraph` is on PATH, then retry.");
-                }
-            }
-        }
-    } else {
-        println!("  Skipping CodeGraph symbol index (--no-code).");
-    }
-
-    // --- 3. LanceDB documentation index -----------------------------------
-    if !no_docs {
-        println!("  Building LanceDB documentation index (pattern: {docs_pattern}) ...");
-        match lance::cli_update(&target_dir, &name, docs_pattern) {
-            Ok(lance_dir) => {
-                println!("  LanceDB index ready at {}.", lance_dir.display());
-            }
-            Err(e) => {
-                eprintln!("  Warning: LanceDB index failed: {e}");
-                eprintln!("  Re-run with --docs-pattern to adjust the glob, or --no-docs to skip.");
-            }
-        }
-    } else {
-        println!("  Skipping LanceDB documentation index (--no-docs).");
-    }
-
-    // --- 4. Persist into sempkg.toml (workspace-scoped, primary path) -----
-    if let Ok(mut mf) = manifest::load_manifest(toml_dir) {
-        if !mf.packages.contains_key(&name) {
-            mf.packages.insert(
-                name.clone(),
-                manifest::PackageEntry {
-                    path: target_dir.to_string_lossy().into_owned(),
-                    description: String::new(),
-                },
-            );
-            manifest::save_manifest(&mf, toml_dir)?;
-            println!("  Added [packages.{name}] to sempkg.toml.");
-        } else {
-            println!("  [packages.{name}] already in sempkg.toml (skipping).");
-        }
-    }
-
-    println!();
-    println!(
-        "Done. Use these commands to query '{name}':\n\
-         \n  sempkg search {name} <query>      # fast symbol search\
-         \n  sempkg docs   {name} <query>      # fast documentation search\
-         \n  sempkg query  {name} <query>      # reranked hybrid search (requires --features reranker)"
-    );
-
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
 // pkg sub-commands
 // ---------------------------------------------------------------------------
 
@@ -1346,7 +1298,11 @@ fn add_from_github(
     version_override: Option<&str>,
     include_source: bool,
     source_glob: Option<String>,
-    workspace: Option<&Path>,
+    source_dirs_override: Vec<PathBuf>,
+    docs_dirs_override: Vec<PathBuf>,
+    exclude_dirs: Vec<PathBuf>,
+    _workspace: Option<&Path>,
+    lock: Option<&mut manifest::LockFile>,
 ) -> Result<()> {
     let token = github::github_token_for_host(&src.host);
     let token_ref = token.as_deref();
@@ -1372,7 +1328,19 @@ fn add_from_github(
             resolved.package_name, resolved.version
         );
         // Still write to manifest/lock if not already there
-        record_github_dep(workspace_dir, &resolved, &src, group, None, full_clone, include_source, source_glob)?;
+        record_github_dep(
+            workspace_dir,
+            &resolved,
+            &src,
+            group,
+            full_clone,
+            include_source,
+            source_glob,
+            &source_dirs_override,
+            &docs_dirs_override,
+            &exclude_dirs,
+            lock,
+        )?;
         return Ok(());
     }
 
@@ -1403,6 +1371,10 @@ fn add_from_github(
                 false, // release asset — full_clone does not apply
                 false, // release asset — source index not rebuilt
                 None,
+                vec![],
+                vec![],
+                vec![],
+                lock,
             );
         }
     }
@@ -1457,11 +1429,26 @@ fn add_from_github(
         language,
         codegraph_version: cg_version,
         output_path: Some(bundle_output.clone()),
-        source_dirs: vec![source_root.clone()],
-        docs_dirs: vec![source_root.clone()],
+        source_dirs: if source_dirs_override.is_empty() {
+            vec![source_root.clone()]
+        } else {
+            source_dirs_override.iter().map(|d| {
+                if d.is_absolute() { d.clone() } else { source_root.join(d) }
+            }).collect()
+        },
+        docs_dirs: if docs_dirs_override.is_empty() {
+            vec![source_root.clone()]
+        } else {
+            docs_dirs_override.iter().map(|d| {
+                if d.is_absolute() { d.clone() } else { source_root.join(d) }
+            }).collect()
+        },
         docs_glob: None,
         include_source,
         source_glob: source_glob.clone(),
+        exclude_dirs: exclude_dirs.iter().map(|d| {
+            if d.is_absolute() { d.clone() } else { source_root.join(d) }
+        }).collect(),
     };
 
     sembundle::build(build_opts).with_context(|| {
@@ -1491,6 +1478,10 @@ fn add_from_github(
         full_clone,
         include_source,
         source_glob,
+        source_dirs_override,
+        docs_dirs_override,
+        exclude_dirs,
+        lock,
     )
 }
 
@@ -1506,6 +1497,10 @@ fn install_github_bundle(
     full_clone: bool,
     include_source: bool,
     source_glob: Option<String>,
+    source_dirs_override: Vec<PathBuf>,
+    docs_dirs_override: Vec<PathBuf>,
+    exclude_dirs: Vec<PathBuf>,
+    lock: Option<&mut manifest::LockFile>,
 ) -> Result<()> {
     // Remove existing bundle dir so install_bytes can extract the freshly-built one.
     let existing_dir = store.bundle_dir(&resolved.package_name, &resolved.version);
@@ -1516,8 +1511,6 @@ fn install_github_bundle(
     }
 
     let info = store.install_bytes(&bytes)?;
-
-    let sha256 = hex::encode(sha2::Sha256::digest(&bytes));
 
     println!(
         "Installed {}@{} from {}{}{}",
@@ -1533,10 +1526,13 @@ fn install_github_bundle(
         resolved,
         src,
         group,
-        Some(&sha256),
         full_clone,
         include_source,
         source_glob,
+        &source_dirs_override,
+        &docs_dirs_override,
+        &exclude_dirs,
+        lock,
     )
 }
 
@@ -1545,10 +1541,13 @@ fn record_github_dep(
     resolved: &github::ResolvedSource,
     src: &github::GitHubSource,
     group: Option<&str>,
-    sha256: Option<&str>,
     full_clone: bool,
     include_source: bool,
     source_glob: Option<String>,
+    source_dirs_override: &[PathBuf],
+    docs_dirs_override: &[PathBuf],
+    exclude_dirs: &[PathBuf],
+    lock: Option<&mut manifest::LockFile>,
 ) -> Result<()> {
     let mut mf = manifest::load_manifest(workspace_dir)?;
 
@@ -1567,28 +1566,31 @@ fn record_github_dep(
         local: None,
         include_source,
         source_glob,
+        source_dirs: source_dirs_override
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect(),
+        docs_dirs: docs_dirs_override
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect(),
+        exclude_dirs: exclude_dirs
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect(),
     };
     insert_dep(&mut mf, &resolved.package_name, dep, group);
     manifest::save_manifest(&mf, workspace_dir)?;
 
-    // Update lock file
-    if let Some(sha) = sha256 {
-        let mut lock = manifest::load_lock(workspace_dir)?;
-        lock.upsert(manifest::LockEntry {
-            name: resolved.package_name.clone(),
-            version: resolved.version.clone(),
-            registry_url: format_manifest_git_source(
-                &resolved.host,
-                &resolved.owner,
-                &resolved.repo,
-            ),
-            sha256: sha.to_owned(),
-            signed: false,
-            manifest_checksums: Default::default(),
-            commit_sha: Some(resolved.commit_sha.clone()),
-        });
-        manifest::save_lock(&lock, workspace_dir)?;
-    }
+    record_installed_bundle_lock(
+        workspace_dir,
+        lock,
+        &resolved.package_name,
+        &resolved.version,
+        format_manifest_git_source(&resolved.host, &resolved.owner, &resolved.repo),
+        false,
+        Some(resolved.commit_sha.clone()),
+    )?;
 
     if let Some(g) = group {
         println!(
@@ -1603,6 +1605,43 @@ fn record_github_dep(
     }
 
     Ok(())
+}
+
+fn record_installed_bundle_lock(
+    workspace_dir: &Path,
+    lock: Option<&mut manifest::LockFile>,
+    name: &str,
+    version: &str,
+    registry_url: String,
+    signed: bool,
+    commit_sha: Option<String>,
+) -> Result<()> {
+    let store = BundleStore::workspace(workspace_dir);
+    let info = store.get_version(name, version).with_context(|| {
+        format!("Installed bundle {name}@{version} is missing from the bundle store")
+    })?;
+
+    let entry = manifest::LockEntry {
+        name: name.to_string(),
+        version: version.to_string(),
+        registry_url,
+        sha256: info.archive_sha256,
+        signed,
+        manifest_checksums: info.manifest.checksums.clone(),
+        commit_sha,
+    };
+
+    match lock {
+        Some(lock) => {
+            lock.upsert(entry);
+            Ok(())
+        }
+        None => {
+            let mut lock = manifest::load_lock(workspace_dir)?;
+            lock.upsert(entry);
+            manifest::save_lock(&lock, workspace_dir)
+        }
+    }
 }
 
 /// Insert a dependency into the manifest, either into [dependencies] or a named group.
@@ -1740,6 +1779,8 @@ fn parse_local_source(spec: &str) -> Option<PathBuf> {
     }
 
     let looks_local = s.starts_with('/')
+        || s == "."
+        || s == ".."
         || s.starts_with("./")
         || s.starts_with("../")
         || s.starts_with(".\\")
@@ -1763,6 +1804,110 @@ fn parse_local_source(spec: &str) -> Option<PathBuf> {
     };
 
     Some(expanded)
+}
+
+fn run_refresh(workspace: Option<&Path>) -> Result<()> {
+    let dir = require_workspace(workspace)?;
+    let canonical = dir
+        .canonicalize()
+        .with_context(|| format!("Failed to canonicalize workspace path '{}'", dir.display()))?;
+    let manifest = manifest::load_manifest(dir)?;
+
+    let (dep_name, dep, group_name) = find_local_dependency_for_workspace(&manifest, &canonical)?;
+    let local_path = PathBuf::from(
+        dep.local
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("Local dependency '{}' is missing its source path.", dep_name))?,
+    );
+
+    println!(
+        "Refreshing {} from local path {} ...",
+        dep_name,
+        local_path.display()
+    );
+
+    add_from_local(
+        local_path,
+        dir,
+        group_name.as_deref(),
+        true,
+        Some(dep_name.as_str()),
+        Some(dep.version.as_str()),
+        dep.include_source,
+        dep.source_glob.clone(),
+        dep.source_dirs.iter().map(PathBuf::from).collect(),
+        dep.docs_dirs.iter().map(PathBuf::from).collect(),
+        dep.exclude_dirs.iter().map(PathBuf::from).collect(),
+        workspace,
+        None,
+    )
+}
+
+fn find_local_dependency_for_workspace<'a>(
+    manifest: &'a manifest::WorkspaceManifest,
+    workspace_path: &Path,
+) -> Result<(String, &'a DependencyEntry, Option<String>)> {
+    let mut matches: Vec<(String, &'a DependencyEntry, Option<String>)> = Vec::new();
+
+    for (name, dep) in &manifest.dependencies {
+        if local_dep_matches_workspace(dep, workspace_path)? {
+            matches.push((name.clone(), dep, None));
+        }
+    }
+
+    for (group_name, deps) in &manifest.dependency_groups {
+        for (name, dep) in deps {
+            if local_dep_matches_workspace(dep, workspace_path)? {
+                matches.push((name.clone(), dep, Some(group_name.clone())));
+            }
+        }
+    }
+
+    match matches.len() {
+        0 => anyhow::bail!(
+            "No local dependency in sempkg.toml points at '{}'. Add this workspace first with `sempkg add .`.",
+            workspace_path.display()
+        ),
+        1 => Ok(matches.remove(0)),
+        _ => {
+            let names = matches
+                .iter()
+                .map(|(name, _, group)| match group {
+                    Some(group_name) => format!("{name} (group {group_name})"),
+                    None => name.clone(),
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            anyhow::bail!(
+                "Multiple local dependencies point at '{}': {}. Remove duplicates or keep only one local workspace entry before running `sempkg refresh`.",
+                workspace_path.display(),
+                names
+            )
+        }
+    }
+}
+
+fn local_dep_matches_workspace(dep: &DependencyEntry, workspace_path: &Path) -> Result<bool> {
+    let Some(local_path) = dep.local.as_deref() else {
+        return Ok(false);
+    };
+
+    // Stored path may be relative to the workspace directory.
+    let raw = Path::new(local_path);
+    let resolved = if raw.is_absolute() {
+        raw.to_path_buf()
+    } else {
+        workspace_path.join(raw)
+    };
+
+    let canonical = resolved.canonicalize().with_context(|| {
+        format!(
+            "Failed to canonicalize local dependency path '{}' recorded in sempkg.toml",
+            local_path
+        )
+    })?;
+
+    Ok(canonical == workspace_path)
 }
 
 // ---------------------------------------------------------------------------
@@ -1790,7 +1935,11 @@ fn add_from_local(
     version_override: Option<&str>,
     include_source: bool,
     source_glob: Option<String>,
+    source_dirs_override: Vec<PathBuf>,
+    docs_dirs_override: Vec<PathBuf>,
+    exclude_dirs: Vec<PathBuf>,
     _workspace: Option<&Path>,
+    lock: Option<&mut manifest::LockFile>,
 ) -> Result<()> {
     // --- 1. Validate path ---------------------------------------------------
     if !local_path.exists() {
@@ -1847,7 +1996,19 @@ fn add_from_local(
             package_name, version
         );
         // Still write to manifest if not already present.
-        record_local_dep(workspace_dir, &canonical, &package_name, &version, group, None, include_source, source_glob.clone())?;
+        record_local_dep(
+            workspace_dir,
+            &canonical,
+            &package_name,
+            &version,
+            group,
+            include_source,
+            source_glob.clone(),
+            &source_dirs_override,
+            &docs_dirs_override,
+            &exclude_dirs,
+            lock,
+        )?;
         return Ok(());
     }
 
@@ -1874,11 +2035,20 @@ fn add_from_local(
         language,
         codegraph_version: cg_version,
         output_path: Some(bundle_output.clone()),
-        source_dirs: vec![canonical.clone()],
-        docs_dirs: vec![canonical.clone()],
+        source_dirs: if source_dirs_override.is_empty() {
+            vec![canonical.clone()]
+        } else {
+            source_dirs_override.clone()
+        },
+        docs_dirs: if docs_dirs_override.is_empty() {
+            vec![canonical.clone()]
+        } else {
+            docs_dirs_override.clone()
+        },
         docs_glob: None,
         include_source,
         source_glob: source_glob.clone(),
+        exclude_dirs: exclude_dirs.clone(),
     };
 
     sembundle::build(build_opts).with_context(|| {
@@ -1913,8 +2083,19 @@ fn add_from_local(
     );
 
     // --- 7. Record in manifest ----------------------------------------------
-    let sha256 = hex::encode(sha2::Sha256::digest(&bytes));
-    record_local_dep(workspace_dir, &canonical, &package_name, &version, group, Some(&sha256), include_source, source_glob)
+    record_local_dep(
+        workspace_dir,
+        &canonical,
+        &package_name,
+        &version,
+        group,
+        include_source,
+        source_glob,
+        &source_dirs_override,
+        &docs_dirs_override,
+        &exclude_dirs,
+        lock,
+    )
 }
 
 /// Try to derive a human-readable version from a git repository at `path`.
@@ -1951,8 +2132,13 @@ fn local_git_sha(path: &Path) -> Option<String> {
             return Some(sha);
         }
     }
+
     None
 }
+
+// ---------------------------------------------------------------------------
+// pkg sub-commands
+// ---------------------------------------------------------------------------
 
 /// Write the `{ local = "...", version = "..." }` entry into `sempkg.toml`
 /// and update `sempkg.lock`.
@@ -1962,11 +2148,34 @@ fn record_local_dep(
     package_name: &str,
     version: &str,
     group: Option<&str>,
-    sha256: Option<&str>,
     include_source: bool,
     source_glob: Option<String>,
+    source_dirs_override: &[PathBuf],
+    docs_dirs_override: &[PathBuf],
+    exclude_dirs: &[PathBuf],
+    lock: Option<&mut manifest::LockFile>,
 ) -> Result<()> {
     let mut mf = manifest::load_manifest(workspace_dir)?;
+
+    // Prefer a path relative to the workspace directory so the manifest is
+    // portable when the whole repo is cloned into a different location.
+    //
+    // Canonicalize the workspace dir too before computing the relative path:
+    // on Windows `canonical` carries a `\\?\` verbatim prefix (from
+    // `canonicalize()`) that a non-canonical `workspace_dir` lacks, which would
+    // otherwise make `strip_prefix` fail and fall back to an absolute,
+    // machine-specific path. When the local source *is* the workspace (the
+    // `sempkg add .` case) the relative path is empty, so record `.` instead.
+    let canonical_workspace = workspace_dir
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_dir.to_path_buf());
+    let stored_path: String = match canonical.strip_prefix(&canonical_workspace) {
+        Ok(rel) if rel.as_os_str().is_empty() => ".".to_string(),
+        // Normalize separators to `/` so the recorded path is portable across
+        // platforms (forward slashes are accepted by `Path::join` on Windows).
+        Ok(rel) => rel.to_string_lossy().replace('\\', "/"),
+        Err(_) => canonical.to_string_lossy().into_owned(),
+    };
 
     let dep = manifest::DependencyEntry {
         version: version.to_string(),
@@ -1976,26 +2185,34 @@ fn record_local_dep(
         git_ref: None,
         subdir: None,
         full: false,
-        local: Some(canonical.to_string_lossy().into_owned()),
+        local: Some(stored_path.clone()),
         include_source,
         source_glob,
+        source_dirs: source_dirs_override
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect(),
+        docs_dirs: docs_dirs_override
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect(),
+        exclude_dirs: exclude_dirs
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect(),
     };
     insert_dep(&mut mf, package_name, dep, group);
     manifest::save_manifest(&mf, workspace_dir)?;
 
-    if let Some(sha) = sha256 {
-        let mut lock = manifest::load_lock(workspace_dir)?;
-        lock.upsert(manifest::LockEntry {
-            name: package_name.to_string(),
-            version: version.to_string(),
-            registry_url: format!("local:{}", canonical.display()),
-            sha256: sha.to_owned(),
-            signed: false,
-            manifest_checksums: Default::default(),
-            commit_sha: local_git_sha(canonical),
-        });
-        manifest::save_lock(&lock, workspace_dir)?;
-    }
+    record_installed_bundle_lock(
+        workspace_dir,
+        lock,
+        package_name,
+        version,
+        format!("local:{}", stored_path),
+        false,
+        local_git_sha(canonical),
+    )?;
 
     if let Some(g) = group {
         println!("Recorded {}@{} in group '{}' in sempkg.toml.", package_name, version, g);

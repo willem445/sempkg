@@ -172,6 +172,14 @@ enum Commands {
         /// Default covers common compiled and scripted languages.
         #[arg(long)]
         source_glob: Option<String>,
+
+        // --- Exclusions ---
+        /// Directory to exclude from all indexing (source, docs, and source-code index).
+        /// Repeat the flag to exclude multiple directories.
+        /// Absolute paths are matched directly; relative paths are matched against
+        /// each entry's path relative to its base directory.
+        #[arg(long = "exclude-dir", short = 'x')]
+        exclude_dirs: Vec<PathBuf>,
     },
 
     /// Generate an Ed25519 keypair for bundle signing
@@ -254,6 +262,7 @@ fn main() {
             docs_glob,
             include_source,
             source_glob,
+            exclude_dirs,
         } => build::build(BuildOptions {
             name,
             version,
@@ -268,6 +277,7 @@ fn main() {
             docs_glob,
             include_source,
             source_glob,
+            exclude_dirs,
         })
         .map(|path| {
             println!("Bundle created: {}", path.display());

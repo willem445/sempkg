@@ -7,6 +7,7 @@ This guide covers how to run a local or self-hosted bundle registry, create and 
 The bundle registry server is provided by the sempkg-registry CLI in this repository.
 
 Core endpoints:
+
 - GET /index.json: lists available packages/versions with SHA-256 hash and signing status per version
 - GET /bundles/<package>/<version>/<package>-<version>.SemBundle: downloads bundle archive (includes X-Bundle-SHA256 header)
 - GET /bundles/<package>/<version>/<package>-<version>.SemBundle.sig: downloads Ed25519 signature file (if published)
@@ -54,10 +55,11 @@ sempkg-registry serve --host 0.0.0.0 --port 8765 --storage-dir C:\registry\bundl
 ```
 
 Notes:
-- --storage-dir stores published bundles and generated index.json.
-- --config-dir stores token metadata (tokens.json).
-- For same-machine testing, use http://127.0.0.1:8765.
-- For LAN testing, use your machine IP, for example http://192.168.1.25:8765.
+
+- `--storage-dir` stores published bundles and generated index.json.
+- `--config-dir` stores token metadata (tokens.json).
+- For same-machine testing, use `http://127.0.0.1:8765`.
+- For LAN testing, use your machine IP, for example `http://192.168.1.25:8765`.
 
 ## Docker Self-Hosting
 
@@ -130,6 +132,7 @@ SemBundle keygen --output-dir C:\keys
 ```
 
 Produces:
+
 - `C:\keys\private.pem` — PKCS8 PEM private key. Keep secret, never commit.
 - `C:\keys\public.pem` — SubjectPublicKeyInfo PEM public key. Distribute to consumers.
 
@@ -193,6 +196,7 @@ SemBundle publish .\my-lib-1.2.0.SemBundle --registry http://127.0.0.1:8765 --to
 (The `--sig` flag is passed to `SemBundle publish` and attached in the multipart upload.)
 
 The server will:
+
 - validate token
 - read manifest.json from the uploaded archive
 - compute and store SHA-256 of the bundle
@@ -315,6 +319,7 @@ sempkg bundle install my-lib@1.2.0 --registry http://127.0.0.1:8765 --verify-key
 ```
 
 The client will:
+
 1. Fetch index.json and read the expected SHA-256
 2. Download the bundle and verify SHA-256
 3. Download `my-lib-1.2.0.SemBundle.sig` from the registry
