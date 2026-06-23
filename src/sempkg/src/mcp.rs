@@ -164,10 +164,18 @@ fn all_tools() -> Value {
         ),
         tool_schema(
             "list_files",
-            "List source files tracked by CodeGraph in a specific package.",
+            "List source files tracked by CodeGraph in a specific package. \
+             The optional filter supports both glob patterns (e.g. **/*.rs, src/**/mod.rs) \
+             and plain case-insensitive substring matching (e.g. auth, storage). \
+             Patterns containing * or ? are treated as globs; all other values are substrings. \
+             A 'No files matched' response means the filter was valid but nothing matched — \
+             try a shorter substring or broader glob. \
+             A 'Filter error' response means the glob pattern was syntactically invalid. \
+             Use limit to cap the number of results (default 200).",
             json!({
                 "package": { "type": "string", "description": "Package or bundle name" },
-                "filter":  { "type": "string", "description": "Optional path/glob filter" }
+                "filter":  { "type": "string", "description": "Optional glob pattern (e.g. **/*.rs) or substring (e.g. auth)" },
+                "limit":   { "type": "integer", "description": "Max files to return (default 200)" }
             }),
             &["package"]
         ),
@@ -511,10 +519,10 @@ impl McpContext {
         }
     }
 
-    fn tool_list_files(&self, package: &str, filter: Option<&str>) -> String {
+    fn tool_list_files(&self, package: &str, filter: Option<&str>, limit: usize) -> String {
         match self.resolve_codegraph_path(package) {
             Err(e) => e,
-            Ok(path) => codegraph::files(&path, filter).unwrap_or_else(|e| format!("Error: {e}")),
+            Ok(path) => codegraph::files(&path, filter, limit).unwrap_or_else(|e| format!("Error: {e}")),
         }
     }
 
@@ -823,7 +831,7 @@ impl McpContext {
             "get_impact" => {
                 self.tool_get_impact(str_arg("package"), str_arg("symbol"), int_arg("depth", 3))
             }
-            "list_files" => self.tool_list_files(str_arg("package"), opt_str("filter")),
+            "list_files" => self.tool_list_files(str_arg("package"), opt_str("filter"), int_arg("limit", 200)),
             "search_docs" => {
                 self.tool_search_docs(str_arg("package"), str_arg("query"), int_arg("limit", 10))
             }

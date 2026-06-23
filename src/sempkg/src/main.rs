@@ -767,9 +767,9 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
             Ok(())
         }
 
-        Commands::Files { package, filter } => {
+        Commands::Files { package, filter, limit } => {
             let path = resolve_codegraph_path(&package, workspace)?;
-            println!("{}", codegraph::files(&path, filter.as_deref())?);
+            println!("{}", codegraph::files(&path, filter.as_deref(), limit)?);
             Ok(())
         }
 

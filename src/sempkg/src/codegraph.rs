@@ -136,13 +136,102 @@ pub fn impact(project_path: &Path, symbol: &str, depth: usize) -> Result<String>
     .context("codegraph impact failed")
 }
 
-/// List files tracked by the index.
-pub fn files(project_path: &Path, filter: Option<&str>) -> Result<String> {
-    let mut args = vec!["files", "--json"];
-    if let Some(f) = filter {
-        args.extend(["--filter", f]);
+/// List files tracked by the index, with optional substring or glob filter and a result cap.
+///
+/// Matching rules (applied in order, first rule that matches wins):
+/// 1. If `filter` contains `*` or `?`, it is treated as a glob pattern matched
+///    against the full stored path (case-insensitive on Windows).
+/// 2. Otherwise the filter is treated as a case-insensitive substring match.
+///
+/// Returns a human-readable list or one of two distinct sentinel messages:
+/// - "No files matched …"   → filter syntax was valid, zero results.
+/// - "Filter error: …"      → glob pattern was syntactically invalid.
+pub fn files(project_path: &Path, filter: Option<&str>, limit: usize) -> Result<String> {
+    let db = db_path(project_path);
+    if !db.exists() {
+        anyhow::bail!(
+            "No codegraph index found at '{}'. Run `sempkg index` first.",
+            project_path.display()
+        );
     }
-    run(&args, Some(project_path)).context("codegraph files failed")
+    let conn = open_db(&db)?;
+
+    // Collect distinct file paths from the nodes table.
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT file_path FROM nodes WHERE file_path IS NOT NULL AND file_path != '' ORDER BY file_path"
+    ).context("Failed to prepare files query")?;
+    let all_files: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .context("Failed to query file paths")?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    // Apply filter.
+    let filtered: Vec<&str> = match filter {
+        None => all_files.iter().map(String::as_str).collect(),
+        Some(pat) => {
+            // Glob path if the pattern contains wildcards.
+            if pat.contains('*') || pat.contains('?') {
+                // Build a glob::Pattern. Wrap the error distinctly so callers can
+                // surface "filter syntax unsupported" rather than "no matches".
+                let glob_pat = match glob::Pattern::new(pat) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        return Ok(format!(
+                            "Filter error: invalid glob pattern '{pat}': {e}. \
+                             Use * for any segment, ** for path wildcards, or a plain substring."
+                        ));
+                    }
+                };
+                let opts = glob::MatchOptions {
+                    case_sensitive: cfg!(not(target_os = "windows")),
+                    require_literal_separator: false,
+                    require_literal_leading_dot: false,
+                };
+                all_files
+                    .iter()
+                    .filter(|p| glob_pat.matches_with(p, opts))
+                    .map(String::as_str)
+                    .collect()
+            } else {
+                // Plain substring match (case-insensitive).
+                let lower = pat.to_lowercase();
+                all_files
+                    .iter()
+                    .filter(|p| p.to_lowercase().contains(&lower))
+                    .map(String::as_str)
+                    .collect()
+            }
+        }
+    };
+
+    if filtered.is_empty() {
+        return Ok(match filter {
+            Some(pat) => format!(
+                "No files matched filter '{pat}' in package at '{}'. \
+                 The index has {} file(s) total. \
+                 Try a shorter substring or use * wildcards (e.g. *.rs).",
+                project_path.display(),
+                all_files.len()
+            ),
+            None => format!(
+                "No files are tracked in the codegraph index at '{}'.",
+                project_path.display()
+            ),
+        });
+    }
+
+    let capped = &filtered[..filtered.len().min(limit)];
+    let truncated = filtered.len() > capped.len();
+    let mut out = capped.join("\n");
+    if truncated {
+        out.push_str(&format!(
+            "\n… {} more file(s) not shown (limit {}). Use a filter to narrow results.",
+            filtered.len() - capped.len(),
+            limit
+        ));
+    }
+    Ok(out)
 }
 
 /// Query the installed codegraph version string.

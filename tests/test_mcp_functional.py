@@ -529,3 +529,259 @@ class TestReadCode:
             f"by_name body:\n{_code_body(by_name)[:300]}\n"
             f"by_loc  body:\n{_code_body(by_loc)[:300]}"
         )
+
+
+# ---------------------------------------------------------------------------
+# MCP — list_files
+# ---------------------------------------------------------------------------
+
+# Ground-truth constants for list_files against codegraph@0.9.7.
+#
+# The index contains 118 distinct tracked source files, all TypeScript.
+# The mcp/ subdirectory holds 10 files, all named *.ts.
+LIST_FILES_TOTAL = 118
+LIST_FILES_MCP_COUNT = 10          # files whose path contains "mcp"
+LIST_FILES_MCP_PREFIX = "mcp/"     # each matching file starts with this
+LIST_FILES_KNOWN_FILE = "mcp/tools.ts"   # a well-known file in the index
+
+
+@pytest.mark.functional
+class TestListFiles:
+    """list_files returns accurate file lists with substring/glob filtering and limit."""
+
+    # ------------------------------------------------------------------
+    # No filter — full listing
+    # ------------------------------------------------------------------
+
+    def test_no_filter_returns_files(self, mcp_client: McpClient) -> None:
+        """Unfiltered call must return at least the known total."""
+        text = mcp_client.tool_text(
+            "list_files", {"package": CODEGRAPH_PKG}
+        )
+        lines = [l for l in text.splitlines() if l.strip()]
+        assert len(lines) >= LIST_FILES_TOTAL, (
+            f"Expected ≥{LIST_FILES_TOTAL} files unfiltered, got {len(lines)}:\n{text[:300]}"
+        )
+
+    def test_no_filter_contains_known_file(self, mcp_client: McpClient) -> None:
+        text = mcp_client.tool_text(
+            "list_files", {"package": CODEGRAPH_PKG}
+        )
+        assert LIST_FILES_KNOWN_FILE in text, (
+            f"'{LIST_FILES_KNOWN_FILE}' missing from unfiltered listing:\n{text[:300]}"
+        )
+
+    def test_no_filter_does_not_start_with_no_files(self, mcp_client: McpClient) -> None:
+        """Full listing must not be mistaken for a 'no matches' sentinel."""
+        text = mcp_client.tool_text(
+            "list_files", {"package": CODEGRAPH_PKG}
+        )
+        assert not text.startswith("No files"), (
+            f"list_files (no filter) returned a 'no matches' sentinel:\n{text[:200]}"
+        )
+
+    # ------------------------------------------------------------------
+    # Substring filter
+    # ------------------------------------------------------------------
+
+    def test_substring_filter_narrows_results(self, mcp_client: McpClient) -> None:
+        """A substring filter should return only files whose path contains it."""
+        text = mcp_client.tool_text(
+            "list_files", {"package": CODEGRAPH_PKG, "filter": "mcp"}
+        )
+        lines = [l for l in text.splitlines() if l.strip()]
+        assert len(lines) == LIST_FILES_MCP_COUNT, (
+            f"Expected {LIST_FILES_MCP_COUNT} 'mcp' files, got {len(lines)}:\n{text}"
+        )
+
+    def test_substring_filter_all_lines_match(self, mcp_client: McpClient) -> None:
+        text = mcp_client.tool_text(
+            "list_files", {"package": CODEGRAPH_PKG, "filter": "mcp"}
+        )
+        for line in text.splitlines():
+            if not line.strip():
+                continue
+            assert "mcp" in line.lower(), (
+                f"Non-matching line in substring results: {line!r}"
+            )
+
+    def test_substring_filter_case_insensitive(self, mcp_client: McpClient) -> None:
+        """Substring match should be case-insensitive."""
+        lower = mcp_client.tool_text(
+            "list_files", {"package": CODEGRAPH_PKG, "filter": "mcp"}
+        )
+        upper = mcp_client.tool_text(
+            "list_files", {"package": CODEGRAPH_PKG, "filter": "MCP"}
+        )
+        assert lower == upper, (
+            "Substring filter is case-sensitive — 'mcp' and 'MCP' returned different results"
+        )
+
+    def test_substring_filter_contains_known_file(self, mcp_client: McpClient) -> None:
+        text = mcp_client.tool_text(
+            "list_files", {"package": CODEGRAPH_PKG, "filter": "mcp"}
+        )
+        assert LIST_FILES_KNOWN_FILE in text, (
+            f"Expected '{LIST_FILES_KNOWN_FILE}' in substring-filtered results:\n{text}"
+        )
+
+    # ------------------------------------------------------------------
+    # Glob filter
+    # ------------------------------------------------------------------
+
+    def test_glob_filter_directory_wildcard(self, mcp_client: McpClient) -> None:
+        """mcp/*.ts should match exactly the same files as the 'mcp' substring."""
+        text = mcp_client.tool_text(
+            "list_files", {"package": CODEGRAPH_PKG, "filter": "mcp/*.ts"}
+        )
+        lines = [l for l in text.splitlines() if l.strip()]
+        assert len(lines) == LIST_FILES_MCP_COUNT, (
+            f"Expected {LIST_FILES_MCP_COUNT} files for glob 'mcp/*.ts', got {len(lines)}:\n{text}"
+        )
+
+    def test_glob_filter_all_ts_files(self, mcp_client: McpClient) -> None:
+        """**/*.ts should return all tracked files (all are TypeScript)."""
+        text = mcp_client.tool_text(
+            "list_files", {"package": CODEGRAPH_PKG, "filter": "**/*.ts"}
+        )
+        lines = [l for l in text.splitlines() if l.strip()]
+        assert len(lines) >= LIST_FILES_TOTAL, (
+            f"**/*.ts expected ≥{LIST_FILES_TOTAL} files, got {len(lines)}:\n{text[:300]}"
+        )
+
+    def test_glob_filter_extension_exclusion(self, mcp_client: McpClient) -> None:
+        """**/*.rs should return zero results (no Rust files in codegraph)."""
+        text = mcp_client.tool_text(
+            "list_files", {"package": CODEGRAPH_PKG, "filter": "**/*.rs"}
+        )
+        assert text.startswith("No files matched"), (
+            f"Expected 'No files matched' for **/*.rs glob, got:\n{text[:200]}"
+        )
+
+    def test_glob_filter_known_file_exact(self, mcp_client: McpClient) -> None:
+        """An exact filename glob should return exactly one result."""
+        text = mcp_client.tool_text(
+            "list_files", {"package": CODEGRAPH_PKG, "filter": "mcp/tools.ts"}
+        )
+        lines = [l.strip() for l in text.splitlines() if l.strip()]
+        assert lines == [LIST_FILES_KNOWN_FILE], (
+            f"Expected exactly ['{LIST_FILES_KNOWN_FILE}'], got: {lines}"
+        )
+
+    # ------------------------------------------------------------------
+    # Limit parameter
+    # ------------------------------------------------------------------
+
+    def test_limit_caps_output(self, mcp_client: McpClient) -> None:
+        """limit=5 must return exactly 5 file lines plus a truncation notice."""
+        text = mcp_client.tool_text(
+            "list_files", {"package": CODEGRAPH_PKG, "limit": 5}
+        )
+        # Split off the truncation notice (contains "more file(s) not shown")
+        content_lines = [
+            l for l in text.splitlines()
+            if l.strip() and "more file(s) not shown" not in l
+        ]
+        assert len(content_lines) == 5, (
+            f"Expected 5 file lines with limit=5, got {len(content_lines)}:\n{text}"
+        )
+
+    def test_limit_truncation_notice_present(self, mcp_client: McpClient) -> None:
+        text = mcp_client.tool_text(
+            "list_files", {"package": CODEGRAPH_PKG, "limit": 5}
+        )
+        assert "more file(s) not shown" in text, (
+            f"Truncation notice missing from limit=5 output:\n{text}"
+        )
+
+    def test_limit_truncation_notice_count_is_correct(self, mcp_client: McpClient) -> None:
+        limit = 5
+        text = mcp_client.tool_text(
+            "list_files", {"package": CODEGRAPH_PKG, "limit": limit}
+        )
+        notice_line = next(
+            (l for l in text.splitlines() if "more file(s) not shown" in l), ""
+        )
+        # Extract the leading number from "… N more file(s) not shown"
+        import re
+        m = re.search(r"(\d+) more file\(s\) not shown", notice_line)
+        assert m, f"Could not parse truncation count from: {notice_line!r}"
+        remaining = int(m.group(1))
+        assert remaining == LIST_FILES_TOTAL - limit, (
+            f"Truncation count {remaining} != expected {LIST_FILES_TOTAL - limit}"
+        )
+
+    def test_limit_larger_than_total_no_notice(self, mcp_client: McpClient) -> None:
+        """A limit larger than the total file count must not add a truncation notice."""
+        text = mcp_client.tool_text(
+            "list_files", {"package": CODEGRAPH_PKG, "limit": 10_000}
+        )
+        assert "more file(s) not shown" not in text, (
+            f"Unexpected truncation notice when limit exceeds total:\n{text[:300]}"
+        )
+
+    # ------------------------------------------------------------------
+    # No-match sentinel — clearly distinguishable from filter errors
+    # ------------------------------------------------------------------
+
+    def test_no_match_returns_sentinel_message(self, mcp_client: McpClient) -> None:
+        text = mcp_client.tool_text(
+            "list_files",
+            {"package": CODEGRAPH_PKG, "filter": "nonexistent_xyzzy_404"},
+        )
+        assert text.startswith("No files matched"), (
+            f"Expected 'No files matched' sentinel, got:\n{text[:200]}"
+        )
+
+    def test_no_match_sentinel_includes_total_count(self, mcp_client: McpClient) -> None:
+        """The no-match message must tell the agent how many files exist in total."""
+        text = mcp_client.tool_text(
+            "list_files",
+            {"package": CODEGRAPH_PKG, "filter": "nonexistent_xyzzy_404"},
+        )
+        assert str(LIST_FILES_TOTAL) in text, (
+            f"Total file count ({LIST_FILES_TOTAL}) missing from no-match sentinel:\n{text}"
+        )
+
+    def test_no_match_sentinel_includes_filter_value(self, mcp_client: McpClient) -> None:
+        pat = "nonexistent_xyzzy_404"
+        text = mcp_client.tool_text(
+            "list_files", {"package": CODEGRAPH_PKG, "filter": pat}
+        )
+        assert pat in text, (
+            f"Filter value '{pat}' missing from no-match message:\n{text}"
+        )
+
+    def test_no_match_does_not_say_filter_error(self, mcp_client: McpClient) -> None:
+        """A valid filter with zero matches must NOT be reported as a filter error."""
+        text = mcp_client.tool_text(
+            "list_files",
+            {"package": CODEGRAPH_PKG, "filter": "nonexistent_xyzzy_404"},
+        )
+        assert not text.startswith("Filter error"), (
+            f"Valid filter reported as syntax error:\n{text[:200]}"
+        )
+
+    # ------------------------------------------------------------------
+    # Invalid glob sentinel — clearly distinguishable from no matches
+    # ------------------------------------------------------------------
+
+    def test_invalid_glob_returns_filter_error_sentinel(self, mcp_client: McpClient) -> None:
+        """A syntactically broken glob (contains * but has unclosed bracket) must
+        return 'Filter error: …', not 'No files matched'."""
+        text = mcp_client.tool_text(
+            "list_files",
+            {"package": CODEGRAPH_PKG, "filter": "**/[unclosed"},
+        )
+        assert text.startswith("Filter error"), (
+            f"Expected 'Filter error' sentinel for invalid glob, got:\n{text[:200]}"
+        )
+
+    def test_invalid_glob_does_not_say_no_files_matched(self, mcp_client: McpClient) -> None:
+        text = mcp_client.tool_text(
+            "list_files",
+            {"package": CODEGRAPH_PKG, "filter": "**/[unclosed"},
+        )
+        assert not text.startswith("No files matched"), (
+            f"Invalid glob sentinel must not look like a no-match result:\n{text[:200]}"
+        )
