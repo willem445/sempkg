@@ -54,7 +54,7 @@ pub fn load_metadata(lance_dir: &Path) -> Option<LanceMetadata> {
 // Search
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SearchResult {
     pub path: String,
     pub snippet: String,

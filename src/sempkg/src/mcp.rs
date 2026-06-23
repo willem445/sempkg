@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 
 use crate::packages::PackageRegistry;
 use crate::reranker::{self, Reranker, RerankerConfig};
@@ -237,6 +238,122 @@ fn all_tools() -> Value {
             &["package", "file", "line"]
         ),
     ])
+}
+
+// ---------------------------------------------------------------------------
+// Output formatting helpers (shared by all tools)
+// ---------------------------------------------------------------------------
+
+/// Format a single codegraph node JSON Value as a compact symbol line.
+/// Handles both bare node objects and `{ "node": {...}, "score": N }` envelopes.
+fn fmt_codegraph_hit(item: &serde_json::Value, score: Option<f32>) -> String {
+    let node = item.get("node").unwrap_or(item);
+    let get = |k: &str| node.get(k).and_then(|v| v.as_str()).unwrap_or("");
+    let qualified = get("qualifiedName");
+    let name = get("name");
+    let label = if !qualified.is_empty() { qualified } else { name };
+    let kind = get("kind");
+    let file = get("filePath");
+    let sig = get("signature");
+    let start = node.get("startLine").and_then(|v| v.as_u64()).unwrap_or(0);
+    let end_ln = node.get("endLine").and_then(|v| v.as_u64()).unwrap_or(0);
+
+    let loc = if start > 0 && !file.is_empty() {
+        format!("{}:{}-{}", file, start, end_ln)
+    } else if !file.is_empty() {
+        file.to_string()
+    } else {
+        String::new()
+    };
+
+    let score_str = match score {
+        Some(s) => format!("[{:.2}] ", s),
+        None => String::new(),
+    };
+
+    let header = match (!kind.is_empty(), !loc.is_empty()) {
+        (true, true)  => format!("{}{} ({}) @ {}", score_str, label, kind, loc),
+        (true, false) => format!("{}{} ({})", score_str, label, kind),
+        (false, true) => format!("{}{} @ {}", score_str, label, loc),
+        _             => format!("{}{}", score_str, label),
+    };
+    if sig.is_empty() { header } else { format!("{}
+{}", header, sig) }
+}
+
+/// Parse a codegraph JSON array and render as a compact newline-separated
+/// symbol list.  Returns the raw string unchanged when it is not valid JSON.
+fn fmt_codegraph_json(json: &str) -> String {
+    let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(json) else {
+        return json.to_string();
+    };
+    if arr.is_empty() {
+        return "No results.".to_string();
+    }
+    arr.iter()
+        .map(|v| fmt_codegraph_hit(v, None))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Format a single LanceDB `SearchResult` with an optional rerank score.
+fn fmt_lance_result(r: &lance::SearchResult, score: Option<f32>) -> String {
+    let loc = if r.start_line > 0 {
+        format!("{}:{}-{}", r.path, r.start_line, r.end_line)
+    } else {
+        r.path.clone()
+    };
+    let score_str = match score {
+        Some(s) => format!("[{:.2}] ", s),
+        None => String::new(),
+    };
+    if let Some(sym) = &r.symbol {
+        let kind = r.kind.as_deref().unwrap_or("symbol");
+        let sig = r.signature.as_deref().unwrap_or("");
+        let header = format!("{}{} ({}) @ {}", score_str, sym, kind, loc);
+        if sig.is_empty() {
+            format!("{}
+
+```
+{}
+```", header, r.snippet)
+        } else {
+            format!("{}
+{}
+
+```
+{}
+```", header, sig, r.snippet)
+        }
+    } else {
+        format!("{}{}
+
+{}", score_str, loc, r.snippet)
+    }
+}
+
+/// Format a slice of LanceDB `SearchResult`s, annotating each with its rerank
+/// score when a score map is provided.  Results are separated by `---`.
+fn fmt_lance_results(
+    results: &[lance::SearchResult],
+    score_map: Option<&HashMap<String, f32>>,
+) -> String {
+    if results.is_empty() {
+        return "No results.".to_string();
+    }
+    results
+        .iter()
+        .map(|r| {
+            let loc_key = if r.start_line > 0 {
+                format!("{}:{}-{}", r.path, r.start_line, r.end_line)
+            } else {
+                r.path.clone()
+            };
+            let score = score_map.and_then(|m| m.get(&loc_key)).copied();
+            fmt_lance_result(r, score)
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n---\n\n")
 }
 
 // ---------------------------------------------------------------------------
@@ -494,7 +611,7 @@ impl McpContext {
             Ok(path) => {
                 let raw = codegraph::callers(&path, symbol, limit)
                     .unwrap_or_else(|e| format!("Error: {e}"));
-                self.augment_with_source(package, &raw)
+                self.fmt_codegraph_with_source(package, &raw)
             }
         }
     }
@@ -505,7 +622,7 @@ impl McpContext {
             Ok(path) => {
                 let raw = codegraph::callees(&path, symbol, limit)
                     .unwrap_or_else(|e| format!("Error: {e}"));
-                self.augment_with_source(package, &raw)
+                self.fmt_codegraph_with_source(package, &raw)
             }
         }
     }
@@ -514,7 +631,9 @@ impl McpContext {
         match self.resolve_codegraph_path(package) {
             Err(e) => e,
             Ok(path) => {
-                codegraph::impact(&path, symbol, depth).unwrap_or_else(|e| format!("Error: {e}"))
+                let raw = codegraph::impact(&path, symbol, depth)
+                    .unwrap_or_else(|e| format!("Error: {e}"));
+                fmt_codegraph_json(&raw)
             }
         }
     }
@@ -573,15 +692,13 @@ impl McpContext {
                     ),
                     Ok(Some(src)) => {
                         let loc = format!("{}:{}-{}", src.path, src.start_line, src.end_line);
-                        let sig_part = if src.signature.is_empty() {
-                            String::new()
+                        if src.signature.is_empty() {
+                            format!("{} ({}) @ {}\n\n```\n{}\n```",
+                                src.symbol, src.kind, loc, src.content)
                         } else {
-                            format!("\n_{}_", src.signature)
-                        };
-                        format!(
-                            "**{}** ({}) @ {}{}\n\n```\n{}\n```",
-                            src.symbol, src.kind, loc, sig_part, src.content
-                        )
+                            format!("{} ({}) @ {}\n{}\n\n```\n{}\n```",
+                                src.symbol, src.kind, loc, src.signature, src.content)
+                        }
                     }
                 }
             }
@@ -630,10 +747,13 @@ impl McpContext {
                         } else {
                             src.path.clone()
                         };
-                        format!(
-                            "**{}** ({}) @ {}\n\n```\n{}\n```",
-                            src.symbol, src.kind, loc, src.content
-                        )
+                        if src.signature.is_empty() {
+                            format!("{} ({}) @ {}\n\n```\n{}\n```",
+                                src.symbol, src.kind, loc, src.content)
+                        } else {
+                            format!("{} ({}) @ {}\n{}\n\n```\n{}\n```",
+                                src.symbol, src.kind, loc, src.signature, src.content)
+                        }
                     }
                 }
             }
@@ -656,16 +776,40 @@ impl McpContext {
     }
 
     /// Rerank raw codegraph JSON output (array of symbol objects).
-    /// Falls back to returning the raw string unchanged on any error.
+    /// Both the reranked and BM25 paths produce the same compact text format;
+    /// reranked results include a relevance score prefix `[0.92]`.
     fn apply_rerank_to_codegraph(&self, query: &str, raw_json: &str, output_n: usize) -> String {
         let mut guard = self.reranker.borrow_mut();
         let Some(ranker) = guard.as_mut() else {
-            return raw_json.to_string();
+            return fmt_codegraph_json(raw_json);
         };
+
+        // Build a lookup map: qualified-name (or name) → node Value so the
+        // structured format can be reconstructed after reranking.
+        let node_map: HashMap<String, serde_json::Value> =
+            serde_json::from_str::<Vec<serde_json::Value>>(raw_json)
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|v| {
+                    let node = v.get("node").cloned().unwrap_or(v);
+                    let qual = node
+                        .get("qualifiedName")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let name = node
+                        .get("name")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let key = if !qual.is_empty() { qual } else { name };
+                    if key.is_empty() { None } else { Some((key, node)) }
+                })
+                .collect();
 
         let candidates = reranker::codegraph_json_to_candidates(raw_json);
         if candidates.is_empty() {
-            return raw_json.to_string();
+            return fmt_codegraph_json(raw_json);
         }
 
         match ranker.rerank(query, candidates) {
@@ -674,20 +818,27 @@ impl McpContext {
                 if scored.is_empty() {
                     return format!("No results for '{query}'.");
                 }
-                let header = format!(
-                    "_Reranked {count} results with Qwen3-Reranker (top {output_n} shown):_\n\n",
-                    count = scored.len()
-                );
-                header + &reranker::format_reranked_docs(&scored, query)
+                scored
+                    .iter()
+                    .map(|r| {
+                        if let Some(node) = node_map.get(&r.source) {
+                            fmt_codegraph_hit(node, Some(r.score))
+                        } else {
+                            format!("[{:.2}] {}", r.score, r.source)
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
             }
             Err(e) => {
                 eprintln!("sempkg: reranker error ({e}), returning BM25 results");
-                raw_json.to_string()
+                fmt_codegraph_json(raw_json)
             }
         }
     }
 
     /// Rerank LanceDB search results.
+    /// Both paths produce the same format; reranked results include a `[0.92]` score prefix.
     fn apply_rerank_to_lance(
         &self,
         query: &str,
@@ -696,26 +847,56 @@ impl McpContext {
     ) -> String {
         let mut guard = self.reranker.borrow_mut();
         let Some(ranker) = guard.as_mut() else {
-            return lance::format_results(&results, query);
+            return fmt_lance_results(&results, None);
         };
 
         let candidates = reranker::lance_results_to_candidates(&results);
         if candidates.is_empty() {
-            return lance::format_results(&results, query);
+            return fmt_lance_results(&results, None);
         }
 
         match ranker.rerank(query, candidates) {
             Ok(mut scored) => {
                 scored.truncate(output_n);
-                let header = format!(
-                    "_Reranked {count} docs with Qwen3-Reranker (top {output_n} shown):_\n\n",
-                    count = scored.len()
-                );
-                header + &reranker::format_reranked_docs(&scored, query)
+                // Build score map: loc_key → score
+                let score_map: HashMap<String, f32> = scored
+                    .iter()
+                    .map(|r| (r.source.clone(), r.score))
+                    .collect();
+                // Re-order the original results to match the reranked order,
+                // keeping only those that appear in the scored set.
+                let mut ordered: Vec<lance::SearchResult> = results
+                    .iter()
+                    .filter(|r| {
+                        let key = if r.start_line > 0 {
+                            format!("{}:{}-{}", r.path, r.start_line, r.end_line)
+                        } else {
+                            r.path.clone()
+                        };
+                        score_map.contains_key(&key)
+                    })
+                    .cloned()
+                    .collect();
+                ordered.sort_by(|a, b| {
+                    let ka = if a.start_line > 0 {
+                        format!("{}:{}-{}", a.path, a.start_line, a.end_line)
+                    } else {
+                        a.path.clone()
+                    };
+                    let kb = if b.start_line > 0 {
+                        format!("{}:{}-{}", b.path, b.start_line, b.end_line)
+                    } else {
+                        b.path.clone()
+                    };
+                    let sa = score_map.get(&ka).copied().unwrap_or(0.0);
+                    let sb = score_map.get(&kb).copied().unwrap_or(0.0);
+                    sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                fmt_lance_results(&ordered, Some(&score_map))
             }
             Err(e) => {
                 eprintln!("sempkg: reranker error ({e}), returning BM25 results");
-                lance::format_results(&results, query)
+                fmt_lance_results(&results, None)
             }
         }
     }
@@ -768,62 +949,46 @@ impl McpContext {
         ))
     }
 
-    /// When a code index is available, parse callee/caller JSON and append
-    /// the full source body for each returned symbol.
-    fn augment_with_source(&self, package: &str, codegraph_json: &str) -> String {
-        let code_dir = match self.resolve_code_path(package) {
-            Ok(d) => d,
-            Err(_) => return codegraph_json.to_string(), // no code index, return as-is
-        };
-
-        // Parse JSON array of { "node": { "qualifiedName": ..., "name": ... }, ... }
+    /// Format a codegraph JSON array as a compact symbol list, inlining source
+    /// bodies from the code index when available (within a byte budget).
+    fn fmt_codegraph_with_source(&self, package: &str, codegraph_json: &str) -> String {
         let arr = match serde_json::from_str::<Vec<serde_json::Value>>(codegraph_json) {
             Ok(a) => a,
             Err(_) => return codegraph_json.to_string(),
         };
+        if arr.is_empty() {
+            return "No results.".to_string();
+        }
 
+        let code_dir = self.resolve_code_path(package).ok();
         const BYTE_BUDGET: usize = 12_000;
         let mut total_bytes = 0usize;
         let mut sections: Vec<String> = Vec::new();
 
         for v in &arr {
             let node = v.get("node").unwrap_or(v);
-            let get_str = |k: &str| node.get(k).and_then(|x| x.as_str()).unwrap_or("");
-            let qualified = get_str("qualifiedName");
-            let name = get_str("name");
-            let sym = if !qualified.is_empty() { qualified } else { name };
-            if sym.is_empty() {
-                continue;
-            }
+            let header = fmt_codegraph_hit(node, None);
 
-            if let Ok(lance::SymbolLookup::Unique(src)) = lance::fetch_symbol_source(&code_dir, sym) {
-                if total_bytes + src.content.len() > BYTE_BUDGET {
-                    // Include signature only once budget is exceeded
-                    let sig_line = src.signature.chars().take(120).collect::<String>();
-                    if !sig_line.is_empty() {
-                        sections.push(format!("**{}** ({}:{}-{}) \u{2014} body omitted (budget)\n_{sig_line}_",
-                            src.symbol, src.path, src.start_line, src.end_line));
+            // Attempt to inline the source body when a code index is present.
+            if let Some(ref dir) = code_dir {
+                let get_str = |k: &str| node.get(k).and_then(|x| x.as_str()).unwrap_or("");
+                let qualified = get_str("qualifiedName");
+                let name = get_str("name");
+                let sym = if !qualified.is_empty() { qualified } else { name };
+                if !sym.is_empty() {
+                    if let Ok(lance::SymbolLookup::Unique(src)) = lance::fetch_symbol_source(dir, sym) {
+                        if total_bytes + src.content.len() <= BYTE_BUDGET {
+                            total_bytes += src.content.len();
+                            sections.push(format!("{header}\n\n```\n{}\n```", src.content));
+                            continue;
+                        }
                     }
-                    continue;
                 }
-                total_bytes += src.content.len();
-                let loc = format!("{}:{}-{}", src.path, src.start_line, src.end_line);
-                sections.push(format!(
-                    "**{}** ({}) @ {}\n\n```\n{}\n```",
-                    src.symbol, src.kind, loc, src.content
-                ));
             }
+            sections.push(header);
         }
 
-        if sections.is_empty() {
-            return codegraph_json.to_string();
-        }
-
-        format!(
-            "{}\n\n---\n\n### Source bodies\n\n{}",
-            codegraph_json,
-            sections.join("\n\n---\n\n")
-        )
+        sections.join("\n\n---\n\n")
     }
 
     fn dispatch_tool(&self, name: &str, args: &Value) -> String {
