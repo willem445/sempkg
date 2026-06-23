@@ -785,3 +785,322 @@ class TestListFiles:
         assert not text.startswith("No files matched"), (
             f"Invalid glob sentinel must not look like a no-match result:\n{text[:200]}"
         )
+
+
+# ---------------------------------------------------------------------------
+# MCP — read_symbol ambiguity (new behaviour added in code-bundle branch)
+# ---------------------------------------------------------------------------
+#
+# Ground truth verified live against codegraph@0.9.7:
+#
+#   withLock   → 2 nodes:  FileLock::withLock  (utils.ts 261-268)
+#                           Mutex::withLock     (utils.ts 365-372)
+#   withLockAsync → 1 node: FileLock::withLockAsync (utils.ts 273-280)
+#
+# The test class is split into three logical groups:
+#   1. Ambiguous path  — read_symbol with a short name that matches multiple nodes
+#   2. Disambiguation  — read_code with explicit file:line resolves to the
+#                        correct individual candidate
+#   3. Non-ambiguous paths — unique short name, qualified name, and not-found
+
+AMBIG_SHORT      = "withLock"
+AMBIG_COUNT      = 2
+
+AMBIG_C1_QUAL    = "FileLock::withLock"
+AMBIG_C1_FILE    = "utils.ts"
+AMBIG_C1_START   = 261
+AMBIG_C1_END     = 268
+# Body of FileLock::withLock is a *synchronous* wrapper: calls this.acquire()
+# without await and returns fn() directly.
+AMBIG_C1_BODY_MARKER  = "return fn()"
+
+AMBIG_C2_QUAL    = "Mutex::withLock"
+AMBIG_C2_FILE    = "utils.ts"
+AMBIG_C2_START   = 365
+AMBIG_C2_END     = 372
+# Body of Mutex::withLock is *async*: awaits acquire() and returns await fn().
+AMBIG_C2_BODY_MARKER  = "async withLock"
+
+# A symbol whose short name is unique in the index (only one node named this).
+UNIQUE_SHORT     = "withLockAsync"
+UNIQUE_FILE      = "utils.ts"
+UNIQUE_START     = 273
+UNIQUE_END       = 280
+
+# A symbol name that does not exist in the index.
+NOT_FOUND_SYMBOL = "xyzzy_nonexistent_symbol_12345"
+
+
+@pytest.mark.functional
+class TestReadSymbolAmbiguity:
+    """read_symbol must return a candidate list when a short name is ambiguous,
+    and callers must be able to disambiguate with read_code(file, line)."""
+
+    # ------------------------------------------------------------------
+    # 1. Ambiguous path
+    # ------------------------------------------------------------------
+
+    def test_ambiguous_short_name_is_flagged(self, mcp_client: McpClient) -> None:
+        """read_symbol with an ambiguous short name must not silently return
+        one arbitrary node — it must report ambiguity."""
+        text = mcp_client.tool_text(
+            "read_symbol",
+            {"package": CODEGRAPH_PKG, "symbol": AMBIG_SHORT},
+        )
+        assert "ambiguous" in text.lower(), (
+            f"Expected 'ambiguous' in response for '{AMBIG_SHORT}', got:\n{text[:300]}"
+        )
+
+    def test_ambiguous_response_states_candidate_count(self, mcp_client: McpClient) -> None:
+        """The response must state how many candidates share the name."""
+        text = mcp_client.tool_text(
+            "read_symbol",
+            {"package": CODEGRAPH_PKG, "symbol": AMBIG_SHORT},
+        )
+        assert str(AMBIG_COUNT) in text, (
+            f"Expected candidate count {AMBIG_COUNT} in ambiguous response:\n{text[:300]}"
+        )
+
+    def test_ambiguous_response_contains_candidate_table(self, mcp_client: McpClient) -> None:
+        """The response must include a Markdown table of candidates."""
+        text = mcp_client.tool_text(
+            "read_symbol",
+            {"package": CODEGRAPH_PKG, "symbol": AMBIG_SHORT},
+        )
+        # A Markdown table always has separator row of |---|
+        assert "|---|" in text, (
+            f"No Markdown table (separator '|---|') found in ambiguous response:\n{text[:400]}"
+        )
+
+    def test_ambiguous_table_lists_both_qualified_names(self, mcp_client: McpClient) -> None:
+        """Both qualified names must appear in the candidate table."""
+        text = mcp_client.tool_text(
+            "read_symbol",
+            {"package": CODEGRAPH_PKG, "symbol": AMBIG_SHORT},
+        )
+        assert AMBIG_C1_QUAL in text, (
+            f"'{AMBIG_C1_QUAL}' missing from ambiguous candidate table:\n{text}"
+        )
+        assert AMBIG_C2_QUAL in text, (
+            f"'{AMBIG_C2_QUAL}' missing from ambiguous candidate table:\n{text}"
+        )
+
+    def test_ambiguous_table_contains_file_path(self, mcp_client: McpClient) -> None:
+        text = mcp_client.tool_text(
+            "read_symbol",
+            {"package": CODEGRAPH_PKG, "symbol": AMBIG_SHORT},
+        )
+        # Both candidates live in utils.ts — the path must appear at least twice.
+        assert text.count(AMBIG_C1_FILE) >= AMBIG_COUNT, (
+            f"Expected '{AMBIG_C1_FILE}' to appear {AMBIG_COUNT} times in candidate "
+            f"table, found {text.count(AMBIG_C1_FILE)}:\n{text}"
+        )
+
+    def test_ambiguous_table_contains_line_ranges(self, mcp_client: McpClient) -> None:
+        """Start and end line numbers for both candidates must be present."""
+        text = mcp_client.tool_text(
+            "read_symbol",
+            {"package": CODEGRAPH_PKG, "symbol": AMBIG_SHORT},
+        )
+        for line_no in (AMBIG_C1_START, AMBIG_C1_END, AMBIG_C2_START, AMBIG_C2_END):
+            assert str(line_no) in text, (
+                f"Line number {line_no} missing from ambiguous response:\n{text}"
+            )
+
+    def test_ambiguous_response_suggests_read_code(self, mcp_client: McpClient) -> None:
+        """The message must guide the caller to use read_code to disambiguate."""
+        text = mcp_client.tool_text(
+            "read_symbol",
+            {"package": CODEGRAPH_PKG, "symbol": AMBIG_SHORT},
+        )
+        assert "read_code" in text, (
+            f"Ambiguous response does not mention 'read_code':\n{text}"
+        )
+
+    def test_ambiguous_response_has_no_code_block(self, mcp_client: McpClient) -> None:
+        """An ambiguous response must not include a fenced code block — we do
+        not want an arbitrary body sneaking through."""
+        text = mcp_client.tool_text(
+            "read_symbol",
+            {"package": CODEGRAPH_PKG, "symbol": AMBIG_SHORT},
+        )
+        assert "```" not in text, (
+            f"Ambiguous response must not contain a code fence:\n{text}"
+        )
+
+    # ------------------------------------------------------------------
+    # 2. Disambiguation via read_code
+    # ------------------------------------------------------------------
+
+    def test_read_code_disambiguates_to_first_candidate(self, mcp_client: McpClient) -> None:
+        """read_code at the start line of candidate 1 must return FileLock::withLock."""
+        text = mcp_client.tool_text(
+            "read_code",
+            {
+                "package": CODEGRAPH_PKG,
+                "file": AMBIG_C1_FILE,
+                "line": AMBIG_C1_START,
+            },
+        )
+        assert AMBIG_C1_BODY_MARKER in text, (
+            f"Expected body marker '{AMBIG_C1_BODY_MARKER}' for {AMBIG_C1_QUAL}:\n{text}"
+        )
+
+    def test_read_code_disambiguates_to_second_candidate(self, mcp_client: McpClient) -> None:
+        """read_code at the start line of candidate 2 must return Mutex::withLock."""
+        text = mcp_client.tool_text(
+            "read_code",
+            {
+                "package": CODEGRAPH_PKG,
+                "file": AMBIG_C2_FILE,
+                "line": AMBIG_C2_START,
+            },
+        )
+        assert AMBIG_C2_BODY_MARKER in text, (
+            f"Expected body marker '{AMBIG_C2_BODY_MARKER}' for {AMBIG_C2_QUAL}:\n{text}"
+        )
+
+    def test_two_disambiguated_bodies_differ(self, mcp_client: McpClient) -> None:
+        """The two candidates must resolve to different source bodies."""
+        body1 = _extract_code_block(
+            mcp_client.tool_text(
+                "read_code",
+                {"package": CODEGRAPH_PKG, "file": AMBIG_C1_FILE, "line": AMBIG_C1_START},
+            )
+        )
+        body2 = _extract_code_block(
+            mcp_client.tool_text(
+                "read_code",
+                {"package": CODEGRAPH_PKG, "file": AMBIG_C2_FILE, "line": AMBIG_C2_START},
+            )
+        )
+        assert body1 != body2, (
+            "Both candidates of ambiguous symbol resolved to the same body — "
+            "disambiguation is not working."
+        )
+
+    def test_read_code_candidate1_scoped_to_method(self, mcp_client: McpClient) -> None:
+        """The resolved body for candidate 1 must be scoped to just the method."""
+        text = mcp_client.tool_text(
+            "read_code",
+            {"package": CODEGRAPH_PKG, "file": AMBIG_C1_FILE, "line": AMBIG_C1_START},
+        )
+        body = _extract_code_block(text)
+        span = AMBIG_C1_END - AMBIG_C1_START + 1
+        assert len(body.splitlines()) <= span * 3, (
+            f"read_code candidate 1 returned too many lines ({len(body.splitlines())}), "
+            f"expected ≤{span * 3}"
+        )
+
+    def test_read_code_candidate2_scoped_to_method(self, mcp_client: McpClient) -> None:
+        text = mcp_client.tool_text(
+            "read_code",
+            {"package": CODEGRAPH_PKG, "file": AMBIG_C2_FILE, "line": AMBIG_C2_START},
+        )
+        body = _extract_code_block(text)
+        span = AMBIG_C2_END - AMBIG_C2_START + 1
+        assert len(body.splitlines()) <= span * 3, (
+            f"read_code candidate 2 returned too many lines ({len(body.splitlines())}), "
+            f"expected ≤{span * 3}"
+        )
+
+    # ------------------------------------------------------------------
+    # 3. Non-ambiguous paths — unique short name, qualified bypass, not-found
+    # ------------------------------------------------------------------
+
+    def test_unique_short_name_returns_body_not_ambiguous(self, mcp_client: McpClient) -> None:
+        """A short name with exactly one match must return the code body,
+        not an ambiguity message."""
+        text = mcp_client.tool_text(
+            "read_symbol",
+            {"package": CODEGRAPH_PKG, "symbol": UNIQUE_SHORT},
+        )
+        assert "ambiguous" not in text.lower(), (
+            f"Unique symbol '{UNIQUE_SHORT}' was incorrectly flagged as ambiguous:\n{text}"
+        )
+        assert "```" in text, (
+            f"read_symbol on unique symbol '{UNIQUE_SHORT}' returned no code block:\n{text}"
+        )
+
+    def test_unique_short_name_has_correct_location(self, mcp_client: McpClient) -> None:
+        text = mcp_client.tool_text(
+            "read_symbol",
+            {"package": CODEGRAPH_PKG, "symbol": UNIQUE_SHORT},
+        )
+        assert UNIQUE_FILE in text, (
+            f"Expected file '{UNIQUE_FILE}' in unique-symbol result:\n{text[:200]}"
+        )
+        assert str(UNIQUE_START) in text, (
+            f"Expected start line {UNIQUE_START} in unique-symbol result:\n{text[:200]}"
+        )
+
+    def test_qualified_name_bypasses_ambiguity(self, mcp_client: McpClient) -> None:
+        """Providing a fully-qualified name must resolve to exactly one symbol
+        even when the short name would be ambiguous."""
+        text = mcp_client.tool_text(
+            "read_symbol",
+            {"package": CODEGRAPH_PKG, "symbol": AMBIG_C1_QUAL},
+        )
+        assert "ambiguous" not in text.lower(), (
+            f"Qualified name '{AMBIG_C1_QUAL}' was incorrectly flagged as ambiguous:\n{text}"
+        )
+        assert "```" in text, (
+            f"read_symbol with qualified name returned no code block:\n{text}"
+        )
+
+    def test_qualified_name_returns_correct_candidate(self, mcp_client: McpClient) -> None:
+        """The qualified name for candidate 1 must return candidate 1's body."""
+        text = mcp_client.tool_text(
+            "read_symbol",
+            {"package": CODEGRAPH_PKG, "symbol": AMBIG_C1_QUAL},
+        )
+        assert AMBIG_C1_BODY_MARKER in text, (
+            f"Expected body marker '{AMBIG_C1_BODY_MARKER}' when looking up "
+            f"qualified name '{AMBIG_C1_QUAL}':\n{text}"
+        )
+
+    def test_qualified_name_not_found_returns_candidate_2_body(
+        self, mcp_client: McpClient
+    ) -> None:
+        """Symmetry check: looking up the second qualified name returns its body."""
+        text = mcp_client.tool_text(
+            "read_symbol",
+            {"package": CODEGRAPH_PKG, "symbol": AMBIG_C2_QUAL},
+        )
+        assert "ambiguous" not in text.lower(), (
+            f"Qualified name '{AMBIG_C2_QUAL}' was incorrectly flagged as ambiguous:\n{text}"
+        )
+        assert AMBIG_C2_BODY_MARKER in text, (
+            f"Expected body marker '{AMBIG_C2_BODY_MARKER}' for '{AMBIG_C2_QUAL}':\n{text}"
+        )
+
+    def test_not_found_symbol_returns_not_found_message(
+        self, mcp_client: McpClient
+    ) -> None:
+        text = mcp_client.tool_text(
+            "read_symbol",
+            {"package": CODEGRAPH_PKG, "symbol": NOT_FOUND_SYMBOL},
+        )
+        assert "not found" in text.lower(), (
+            f"Expected 'not found' for nonexistent symbol, got:\n{text[:200]}"
+        )
+
+    def test_not_found_symbol_does_not_say_ambiguous(
+        self, mcp_client: McpClient
+    ) -> None:
+        text = mcp_client.tool_text(
+            "read_symbol",
+            {"package": CODEGRAPH_PKG, "symbol": NOT_FOUND_SYMBOL},
+        )
+        assert "ambiguous" not in text.lower(), (
+            f"Not-found response incorrectly says 'ambiguous':\n{text}"
+        )
+
+    def test_not_found_symbol_has_no_code_block(self, mcp_client: McpClient) -> None:
+        text = mcp_client.tool_text(
+            "read_symbol",
+            {"package": CODEGRAPH_PKG, "symbol": NOT_FOUND_SYMBOL},
+        )
+        assert "```" not in text, (
+            f"Not-found response must not contain a code block:\n{text}"
+        )

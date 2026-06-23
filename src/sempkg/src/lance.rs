@@ -84,6 +84,30 @@ pub struct SymbolSource {
     pub end_line: u32,
 }
 
+/// A lightweight description of a symbol candidate used when a name is ambiguous.
+#[derive(Debug, Clone)]
+pub struct SymbolCandidate {
+    pub name: String,
+    pub qualified_name: String,
+    pub kind: String,
+    pub path: String,
+    pub start_line: u32,
+    pub end_line: u32,
+}
+
+/// Result of a `fetch_symbol_source` lookup.
+///
+/// - `Unique`      — exactly one match; contains the full source.
+/// - `Ambiguous`   — multiple nodes share the same name; the caller must ask
+///                   the user to disambiguate.
+/// - `NotFound`    — no node matched the requested symbol name.
+#[derive(Debug)]
+pub enum SymbolLookup {
+    Unique(SymbolSource),
+    Ambiguous(Vec<SymbolCandidate>),
+    NotFound,
+}
+
 pub fn code_dir_path(bundle_dir: &Path) -> PathBuf {
     bundle_dir.join("code")
 }
@@ -231,16 +255,19 @@ fn search_table(
 /// 1. Query `codegraph.db` (via the `graph/` sibling of `code_dir`) for an
 ///    exact name / qualified-name match — this gives precise `file_path`,
 ///    `start_line`, `end_line`.
-/// 2. Query the LanceDB `code` table with an exact `path + start_line` filter
+/// 2. If more than one node matches the name exactly, return
+///    [`SymbolLookup::Ambiguous`] with a candidate list so the caller can ask
+///    the user to disambiguate via `read_code(file, line)`.
+/// 3. Query the LanceDB `code` table with an exact `path + start_line` filter
 ///    to retrieve the stored content without any BM25 / FTS ambiguity.
-/// 3. If the stored chunk is wider than the codegraph range, slice it to the
+/// 4. If the stored chunk is wider than the codegraph range, slice it to the
 ///    exact lines.
 pub fn fetch_symbol_source(
     code_dir: &Path,
     symbol: &str,
-) -> crate::error::Result<Option<SymbolSource>> {
+) -> crate::error::Result<SymbolLookup> {
     if !code_dir.is_dir() {
-        return Ok(None);
+        return Ok(SymbolLookup::NotFound);
     }
 
     // Derive the codegraph.db path from the bundle directory (parent of code/).
@@ -250,16 +277,35 @@ pub fn fetch_symbol_source(
         .filter(|p| p.exists());
 
     // --- Step 1: resolve symbol location via SQLite ---
-    let node = if let Some(ref db) = db_path {
-        crate::codegraph::db_query_symbol(db, symbol)
-            .ok()
-            .flatten()
+    let nodes: Vec<crate::codegraph::NodeRecord> = if let Some(ref db) = db_path {
+        crate::codegraph::db_query_symbol_all(db, symbol).unwrap_or_default()
     } else {
-        None
+        Vec::new()
     };
 
-    // --- Step 2: find the LanceDB row with an exact path+start_line filter ---
-    fetch_from_code_table(code_dir, node.as_ref(), symbol)
+    // --- Step 2: check for ambiguity ---
+    if nodes.len() > 1 {
+        let candidates = nodes
+            .into_iter()
+            .map(|n| SymbolCandidate {
+                qualified_name: n.qualified_name.clone(),
+                name: n.name,
+                kind: n.kind,
+                path: n.file_path,
+                start_line: n.start_line,
+                end_line: n.end_line,
+            })
+            .collect();
+        return Ok(SymbolLookup::Ambiguous(candidates));
+    }
+
+    let node = nodes.into_iter().next();
+
+    // --- Step 3: find the LanceDB row with an exact path+start_line filter ---
+    match fetch_from_code_table(code_dir, node.as_ref(), symbol)? {
+        Some(src) => Ok(SymbolLookup::Unique(src)),
+        None => Ok(SymbolLookup::NotFound),
+    }
 }
 
 /// Fetch the symbol whose source range contains `line` in `file`.

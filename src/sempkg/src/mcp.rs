@@ -594,11 +594,37 @@ impl McpContext {
             Ok(code_dir) => {
                 match lance::fetch_symbol_source(&code_dir, symbol) {
                     Err(e) => format!("Error reading symbol: {e}"),
-                    Ok(None) => format!(
+                    Ok(lance::SymbolLookup::NotFound) => format!(
                         "Symbol '{symbol}' not found in the code index for '{package}'. \
                          Try search_code to locate it first."
                     ),
-                    Ok(Some(src)) => {
+                    Ok(lance::SymbolLookup::Ambiguous(candidates)) => {
+                        let mut msg = format!(
+                            "**'{symbol}' is ambiguous** — {n} nodes share this name. \
+                             Use `read_code` with a file path and line number to disambiguate.\n\n\
+                             | # | Name | Kind | File | Lines |\n\
+                             |---|------|------|------|-------|\n",
+                            n = candidates.len()
+                        );
+                        for (i, c) in candidates.iter().enumerate() {
+                            let display_name = if c.qualified_name.is_empty() {
+                                c.name.clone()
+                            } else {
+                                c.qualified_name.clone()
+                            };
+                            msg.push_str(&format!(
+                                "| {} | `{}` | {} | {} | {}-{} |\n",
+                                i + 1,
+                                display_name,
+                                c.kind,
+                                c.path,
+                                c.start_line,
+                                c.end_line,
+                            ));
+                        }
+                        msg
+                    }
+                    Ok(lance::SymbolLookup::Unique(src)) => {
                         let loc = if src.start_line > 0 {
                             format!("{}:{}-{}", src.path, src.start_line, src.end_line)
                         } else {
@@ -770,7 +796,7 @@ impl McpContext {
                 continue;
             }
 
-            if let Ok(Some(src)) = lance::fetch_symbol_source(&code_dir, sym) {
+            if let Ok(lance::SymbolLookup::Unique(src)) = lance::fetch_symbol_source(&code_dir, sym) {
                 if total_bytes + src.content.len() > BYTE_BUDGET {
                     // Include signature only once budget is exceeded
                     let sig_line = src.signature.chars().take(120).collect::<String>();

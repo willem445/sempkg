@@ -308,25 +308,38 @@ fn row_to_node(row: &rusqlite::Row<'_>) -> rusqlite::Result<NodeRecord> {
 }
 
 /// Query `codegraph.db` for an exact symbol match by name or qualified name.
-/// Prefers exact `qualified_name` match, then exact `name` match.
-pub fn db_query_symbol(db_path: &Path, symbol: &str) -> Result<Option<NodeRecord>> {
+/// Returns all matching nodes ordered by preference (qualified_name match first,
+/// then by ascending range size).  Call sites that need a single result should
+/// check the length; when more than one is returned the symbol is ambiguous.
+pub fn db_query_symbol_all(db_path: &Path, symbol: &str) -> Result<Vec<NodeRecord>> {
     if !db_path.exists() {
-        return Ok(None);
+        return Ok(Vec::new());
     }
     let conn = open_db(db_path)?;
-    // Try qualified_name first (exact), then name (exact), then qualified_name suffix.
     let sql = "\
         SELECT name, qualified_name, file_path, start_line, end_line, kind, signature, docstring \
         FROM nodes \
         WHERE qualified_name = ?1 OR name = ?1 \
         ORDER BY CASE WHEN qualified_name = ?1 THEN 0 ELSE 1 END, \
-                 (end_line - start_line) ASC \
-        LIMIT 1";
-    let result = conn
-        .query_row(sql, rusqlite::params![symbol], row_to_node)
-        .optional()
-        .with_context(|| format!("db_query_symbol failed for '{symbol}'"))?;
-    Ok(result)
+                 (end_line - start_line) ASC";
+    let mut stmt = conn
+        .prepare(sql)
+        .with_context(|| format!("db_query_symbol_all failed for '{symbol}'"))?;
+    let rows = stmt
+        .query_map(rusqlite::params![symbol], row_to_node)
+        .with_context(|| format!("db_query_symbol_all failed for '{symbol}'"))?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(rows)
+}
+
+/// Query `codegraph.db` for an exact symbol match by name or qualified name.
+/// Prefers exact `qualified_name` match, then exact `name` match.
+/// Returns `None` when there is no match.  When there are multiple matches the
+/// first (highest-priority) row is returned; callers that need to surface
+/// ambiguity should use [`db_query_symbol_all`] instead.
+pub fn db_query_symbol(db_path: &Path, symbol: &str) -> Result<Option<NodeRecord>> {
+    Ok(db_query_symbol_all(db_path, symbol)?.into_iter().next())
 }
 
 /// Query `codegraph.db` for the tightest symbol whose range encloses `line`
