@@ -37,7 +37,7 @@ jobs:
         run: uv pip install --system -e ".[dev]"
 
       - name: Run pytest
-        run: python -m pytest
+        run: python -m pytest --cov=src/sempkg_registry --cov-report=term-missing
 
       - name: Upload coverage reports
         uses: codecov/codecov-action@v3
@@ -144,3 +144,89 @@ jobs:
 
       - name: Test sempkg
         run: cargo test --manifest-path src/sempkg/Cargo.toml --features reranker
+
+  functional-tests:
+    name: Functional MCP tests (ubuntu)
+    runs-on: ubuntu-latest
+    # Only run on pushes/PRs to main or the code-bundle branch, and on
+    # manual dispatch — this job downloads & indexes an external repo so it
+    # takes several minutes.
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      contains(fromJson('["main","code-bundle"]'), github.ref_name)
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install Python test dependencies
+        run: uv pip install --system pytest
+
+      - name: Install Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "lts/*"
+
+      - name: Install codegraph CLI (required by sembundle indexer)
+        run: npm install -g @colbymchenry/codegraph
+
+      # ---- Rust build dependencies ----
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y cmake clang libclang-dev llvm-dev
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+          key: functional-rust-ubuntu
+
+      - name: Build sempkg release binary
+        run: cargo build --release --manifest-path src/sempkg/Cargo.toml
+        env:
+          LIBCLANG_PATH: /usr/lib/llvm-14/lib
+
+      # ---- Install the test bundle ----
+
+      - name: Create test workspace
+        run: mkdir -p /tmp/sempkg-test-workspace
+
+      - name: Install codegraph bundle (fresh build with new sembundle)
+        run: |
+          ./src/sempkg/target/release/sempkg add colbymchenry/codegraph@v0.9.7 \
+            --include-source \
+            --source-dir src/ \
+            --docs-dir docs/ \
+            --workspace /tmp/sempkg-test-workspace \
+            --reinstall
+        env:
+          SEMPKG_WORKSPACE: /tmp/sempkg-test-workspace
+        timeout-minutes: 15
+
+      # ---- Run tests ----
+
+      - name: Run functional MCP tests
+        run: |
+          pytest tests/test_mcp_functional.py -v \
+            --override-ini="addopts=-v" \
+            --tb=short
+        env:
+          SEMPKG_WORKSPACE: /tmp/sempkg-test-workspace
