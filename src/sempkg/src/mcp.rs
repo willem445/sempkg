@@ -397,6 +397,11 @@ struct UnifiedHit {
     kind: Option<String>,
     /// Symbol signature, if applicable.
     signature: Option<String>,
+    /// Normalised retrieval score used to sort candidates from all packages
+    /// before the reranker's top_k cut.  Computed as reciprocal rank within
+    /// each source (1/(pos+1)) so that rank-1 hits from every package compete
+    /// equally for reranker slots regardless of collection order.
+    bm25_rank: f32,
 }
 
 /// Build the text string submitted to the reranker for a `UnifiedHit`.
@@ -825,8 +830,8 @@ impl McpContext {
             let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(raw_json) else {
                 return;
             };
-            for v in arr {
-                let node = v.get("node").cloned().unwrap_or_else(|| v.clone());
+            for (pos, v) in arr.iter().enumerate() {
+                let node = v.get("node").unwrap_or(v);
                 let get_str = |k: &str| {
                     node.get(k)
                         .and_then(|x| x.as_str())
@@ -852,6 +857,13 @@ impl McpContext {
                 } else {
                     format!("{kind} {label}")
                 };
+                // Use the envelope score when present (preserves relative ordering
+                // within this package); fall back to reciprocal rank.
+                let bm25_rank = v
+                    .get("score")
+                    .and_then(|s| s.as_f64())
+                    .map(|s| s as f32)
+                    .unwrap_or_else(|| 1.0 / (pos as f32 + 1.0));
                 hits.push(UnifiedHit {
                     package: pkg_name.to_string(),
                     origin: "codegraph",
@@ -862,6 +874,7 @@ impl McpContext {
                     symbol: Some(label),
                     kind: Some(kind),
                     signature: Some(sig),
+                    bm25_rank,
                 });
             }
         };
@@ -875,7 +888,7 @@ impl McpContext {
             if bundle.has_code() {
                 let code_dir = bundle.bundle_dir.join("code");
                 if let Ok(results) = lance::search_code(&code_dir, query, fetch_limit) {
-                    for r in results {
+                    for (pos, r) in results.into_iter().enumerate() {
                         hits.push(UnifiedHit {
                             package: pkg_name.clone(),
                             origin: "code",
@@ -886,6 +899,7 @@ impl McpContext {
                             symbol: r.symbol,
                             kind: r.kind,
                             signature: r.signature,
+                            bm25_rank: 1.0 / (pos as f32 + 1.0),
                         });
                     }
                 }
@@ -895,7 +909,7 @@ impl McpContext {
             if bundle.has_lance() {
                 let lance_dir = bundle.bundle_dir.join("lance");
                 if let Ok(results) = lance::search(&lance_dir, query, fetch_limit) {
-                    for r in results {
+                    for (pos, r) in results.into_iter().enumerate() {
                         hits.push(UnifiedHit {
                             package: pkg_name.clone(),
                             origin: "docs",
@@ -906,6 +920,7 @@ impl McpContext {
                             symbol: r.symbol,
                             kind: r.kind,
                             signature: r.signature,
+                            bm25_rank: 1.0 / (pos as f32 + 1.0),
                         });
                     }
                 }
@@ -927,7 +942,7 @@ impl McpContext {
             let lance_dir = pkg.abs_path().join(".sempkg").join("lance");
             if lance_dir.is_dir() {
                 if let Ok(results) = lance::search(&lance_dir, query, fetch_limit) {
-                    for r in results {
+                    for (pos, r) in results.into_iter().enumerate() {
                         hits.push(UnifiedHit {
                             package: pkg_name.clone(),
                             origin: "docs",
@@ -938,6 +953,7 @@ impl McpContext {
                             symbol: r.symbol,
                             kind: r.kind,
                             signature: r.signature,
+                            bm25_rank: 1.0 / (pos as f32 + 1.0),
                         });
                     }
                 }
@@ -958,6 +974,17 @@ impl McpContext {
                  index is installed (`sempkg list`)."
             );
         }
+
+        // ── Sort by retrieval rank before reranking ───────────────────────
+        // Sorting globally by bm25_rank ensures that the top-scoring candidates
+        // from every package are interleaved at the front of the list.  The
+        // reranker's internal top_k cut then sees a fair cross-package pool
+        // instead of being dominated by whichever package was enumerated first.
+        hits.sort_by(|a, b| {
+            b.bm25_rank
+                .partial_cmp(&a.bm25_rank)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         // ── Rerank ───────────────────────────────────────────────────────
         let candidates: Vec<reranker::RerankCandidate> = hits
@@ -989,8 +1016,8 @@ impl McpContext {
                     }
                 }
             } else {
-                // No reranker — return top N in retrieval order with no score.
-                hits.iter().enumerate().take(limit).map(|(i, _)| (i, 0.0)).collect()
+                // No reranker — return top N sorted by retrieval rank.
+                hits.iter().enumerate().take(limit).map(|(i, h)| (i, h.bm25_rank)).collect()
             }
         };
 
