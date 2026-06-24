@@ -2,6 +2,8 @@
 ///
 /// Protocol: https://spec.modelcontextprotocol.io
 /// Transport: stdin/stdout (newline-delimited JSON)
+use std::hash::{Hash, Hasher};
+use std::collections::hash_map::DefaultHasher;
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 
@@ -519,15 +521,24 @@ fn normalise_path(path: &str) -> String {
 fn dedup_key(h: &UnifiedHit) -> String {
     let path = normalise_path(&h.path);
     if h.origin == "docs" {
-        // Each doc chunk is a distinct result; only exact duplicates collapse.
-        return format!("{}:{}:{}", path, h.start_line, h.end_line);
+        // Doc chunks carry no line numbers (both fields are always 0), so line
+        // range cannot distinguish chunks.  Hash the snippet content instead:
+        // identical chunks collapse; distinct chunks of the same document are
+        // preserved.  Package is prefixed so the same doc in two bundles stays
+        // separate and both contribute to cross-package RRF.
+        let mut hasher = DefaultHasher::new();
+        h.snippet.hash(&mut hasher);
+        let hash = hasher.finish();
+        return format!("{}:{}:{:x}", h.package, path, hash);
     }
+    // For code / codegraph: package + normalised path + start line is a
+    // precise per-symbol key that matches Windows and Unix path variants.
     if h.start_line > 0 {
-        format!("{}:{}", path, h.start_line)
+        format!("{}:{}:{}", h.package, path, h.start_line)
     } else if let Some(sym) = h.symbol.as_deref().filter(|s| !s.is_empty()) {
-        format!("{}:{}", path, sym.to_lowercase())
+        format!("{}:{}:{}", h.package, path, sym.to_lowercase())
     } else {
-        path
+        format!("{}:{}", h.package, path)
     }
 }
 
@@ -1069,9 +1080,16 @@ impl McpContext {
                     if should_replace {
                         let old = std::mem::replace(&mut deduped[idx], hit);
                         merge_complementary(&mut deduped[idx], &old);
+                        // Preserve the stronger fusion signal: if the loser
+                        // ranked higher in its own source list, carry that
+                        // score forward so pool selection isn't penalised.
+                        deduped[idx].rrf_score = deduped[idx].rrf_score.max(old.rrf_score);
                     } else {
-                        // Existing wins; still harvest any extra fields from the new hit.
+                        // Existing wins; harvest complementary fields and keep
+                        // the better RRF score regardless of which side won.
+                        let new_rrf = hit.rrf_score;
                         merge_complementary(&mut deduped[idx], &hit);
+                        deduped[idx].rrf_score = deduped[idx].rrf_score.max(new_rrf);
                     }
                 } else {
                     key_map.insert(key, deduped.len());

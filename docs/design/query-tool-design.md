@@ -52,11 +52,24 @@ After collection, each hit is assigned a **dedup key** before any sorting occurs
 
 | Origin | Key formula |
 |--------|-------------|
-| `code` / `codegraph` | `normalise(path):start_line` — or `normalise(path):symbol_lowercase` if line is unknown |
-| `docs` | `normalise(path):start_line:end_line` — includes end line so distinct chunks of the same document are **not** collapsed; only byte-for-byte duplicate chunks merge |
+| `code` / `codegraph` | `package:normalise(path):start_line` — or `package:normalise(path):symbol_lowercase` if line is unknown |
+| `docs` | `package:normalise(path):hex(hash(snippet))` — content hash distinguishes distinct chunks; identical content collapses regardless of position |
+
+Two design decisions are worth noting explicitly:
+
+**Package prefix on every key.** An earlier version omitted the package component, which meant
+`src/lib.rs:42` in bundle A and `src/lib.rs:42` in bundle B would silently merge.  That
+undermined the cross-package RRF and diversity-cap work whose entire purpose is to guarantee
+representation from every package.  The package name is now always the first segment.
+
+**Content hash for docs instead of line numbers.** LanceDB doc chunks carry no line-number
+metadata — `start_line` and `end_line` are always 0.  The old `path:0:0` key collapsed every
+chunk of a document onto the same slot; only the first-seen chunk survived, and it was not
+necessarily the most relevant one.  Hashing the snippet content gives each distinct chunk its
+own bucket while still collapsing byte-for-byte duplicates (the same doc indexed in two bundles).
 
 Path normalisation lowercases the string and converts `\` to `/` so Windows-style codegraph
-paths match the forward-slash paths stored in the lance index.
+paths (`src\adc\sampling.rs`) match the forward-slash paths stored in the lance index.
 
 ### 3.2 Collision resolution
 
@@ -77,6 +90,16 @@ harvesting from the loser:
 
 The net result for a typical code/codegraph collision: the `code` hit wins (carries the source
 body), but retains the qualified symbol name and accurate line range from the codegraph record.
+
+### 3.3 RRF score on collision
+
+The `rrf_score` carried by the surviving entry is set to `max(winner.rrf_score, loser.rrf_score)`
+in **both** collision branches.  This matters because richness (payload quality) and retrieval
+rank (relevance signal) are independent: a codegraph hit that ranked 1st in its own source list
+(high RRF) may lose the richness comparison to a code-index hit that ranked 10th.  Discarding
+the stronger fusion signal would penalise the merged entry during the subsequent global sort and
+diversity selection.  Taking the maximum ensures that agreement between two sources can only
+raise a hit's pool-selection priority, never lower it.
 
 ---
 
