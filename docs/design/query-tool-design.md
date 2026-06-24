@@ -15,10 +15,11 @@ needing to know which package to target first.
 
 Internally the tool:
 1. fans out to all available retrieval backends across all packages,
-2. merges the heterogeneous result sets with Reciprocal Rank Fusion,
-3. applies a diversity cap to guarantee balanced source representation, then
-4. scores the resulting pool with the local Qwen3 reranker (when loaded) and
-5. returns rich markdown annotated with package provenance, score, file, lines, and a snippet.
+2. deduplicates hits that refer to the same symbol (codegraph and code-index often return the same function),
+3. merges the deduplicated result sets with Reciprocal Rank Fusion,
+4. applies a diversity cap to guarantee balanced source representation, then
+5. scores the resulting pool with the local Qwen3 reranker (when loaded) and
+6. returns rich markdown annotated with package provenance, score, file, lines, and a snippet.
 
 ---
 
@@ -38,7 +39,48 @@ Each backend is queried for `fetch_limit` candidates (`max(top_k, 20)` where `to
 
 ---
 
-## 3. Reciprocal Rank Fusion
+## 3. Deduplication
+
+CodeGraph and the LanceDB code index are built from the same source corpus.  A function
+`process_adc` will therefore appear in both: once as a structured symbol record (codegraph) and
+again as a snippet-carrying entry in the code index.  Without deduplication, both hits consume
+slots in the reranker pool and the reranker sees redundant content.
+
+### 3.1 Key construction
+
+After collection, each hit is assigned a **dedup key** before any sorting occurs:
+
+| Origin | Key formula |
+|--------|-------------|
+| `code` / `codegraph` | `normalise(path):start_line` — or `normalise(path):symbol_lowercase` if line is unknown |
+| `docs` | `normalise(path):start_line:end_line` — includes end line so distinct chunks of the same document are **not** collapsed; only byte-for-byte duplicate chunks merge |
+
+Path normalisation lowercases the string and converts `\` to `/` so Windows-style codegraph
+paths match the forward-slash paths stored in the lance index.
+
+### 3.2 Collision resolution
+
+On a key collision the **richer** hit wins:
+
+```
+origin_priority:  code (2)  >  codegraph (1)  >  docs (0)
+tiebreaker:       longer snippet wins within the same priority
+```
+
+After selecting the winner, `merge_complementary` fills any gaps the winner is missing by
+harvesting from the loser:
+
+- **Symbol name** — the longer (more qualified) name is kept; codegraph typically holds the
+  fully-qualified name while the code index may store only the short name.
+- **Signature / kind** — filled from the loser when the winner has an empty field.
+- **Line range** — donor's non-zero values replace winner's zeros.
+
+The net result for a typical code/codegraph collision: the `code` hit wins (carries the source
+body), but retains the qualified symbol name and accurate line range from the codegraph record.
+
+---
+
+## 4. Reciprocal Rank Fusion
 
 Results from the three backends arrive on incompatible score scales: CodeGraph uses SQLite FTS
 BM25, the LanceDB code index uses LanceDB BM25, and the docs index uses LanceDB BM25 with
@@ -59,7 +101,7 @@ After scoring, all hits from all packages are sorted globally by `rrf_score` des
 
 ---
 
-## 4. Diversity Selection
+## 5. Diversity Selection
 
 A single large package with all three backends active could still fill the reranker's `top_k`
 pool before smaller packages or less-used origins contribute anything.
@@ -77,7 +119,7 @@ preventing any single source from monopolising the pool the reranker will actual
 
 ---
 
-## 5. Reranking
+## 6. Reranking
 
 The diversity-selected pool (up to `pool_size` candidates) is submitted to the local
 Qwen3-Reranker cross-encoder (see [`reranker-design.md`](reranker-design.md)).  The reranker
@@ -89,7 +131,7 @@ falls back to returning the top `limit` hits from the diversity-selected pool, s
 
 ---
 
-## 6. Output Format
+## 7. Output Format
 
 Each result is rendered as a markdown section containing:
 
@@ -102,30 +144,35 @@ Results are separated by `---` dividers so agents can parse individual sections.
 
 ---
 
-## 7. Pipeline Summary
+## 8. Pipeline Summary
 
 ```
 query string
      │
      ├─► lance::search_code  (per package with code index)  ──┐
      ├─► lance::search       (per package with docs index)  ──┤  RRF score
-     └─► codegraph::query    (per indexed package)          ──┤  1/(60+rank)
-                                                              │
-                                          global sort by rrf_score
-                                                              │
-                                   greedy diversity selection
-                                   per-(package,origin) cap = pool_size/3
-                                                              │
-                                        Qwen3-Reranker
-                                        score each (query, text) pair
-                                                              │
-                                       top limit results
-                                       formatted as markdown
+     └─► codegraph::query    (per indexed package)          ──┘  1/(60+rank)
+                                        │
+                              dedup  O(n) HashMap pass
+                              key = normalise(path):start_line
+                              code > codegraph > docs  (richness)
+                              merge_complementary fills gaps in winner
+                                        │
+                              global sort by rrf_score
+                                        │
+                              greedy diversity selection
+                              per-(package,origin) cap = pool_size/3
+                                        │
+                              Qwen3-Reranker
+                              score each (query, text) pair
+                                        │
+                              top limit results
+                              formatted as markdown
 ```
 
 ---
 
-## 8. Future Directions
+## 9. Future Directions
 
 The query tool is designed to be a stable insertion point for improved retrieval.  Planned
 enhancements (tracked in the roadmap):

@@ -498,6 +498,81 @@ fn format_unified_hit(h: &UnifiedHit, rank: usize, score: Option<f32>) -> String
 }
 
 // ---------------------------------------------------------------------------
+// Dedup helpers for tool_query
+// ---------------------------------------------------------------------------
+
+/// Normalise a file path to a canonical dedup key component:
+/// lowercase + forward-slash separators so that Windows codegraph paths
+/// (`src\adc.rs`) and lance paths (`src/adc.rs`) match.
+fn normalise_path(path: &str) -> String {
+    path.replace('\\', "/").to_lowercase()
+}
+
+/// Build the dedup key for a `UnifiedHit`.
+///
+/// - Code / codegraph hits sharing the same file and start line represent the
+///   same symbol and are collapsed regardless of origin.
+/// - Doc hits are keyed by file + start + end so that distinct chunks from the
+///   same document are preserved while truly identical chunks are merged.
+/// - When line information is unavailable the symbol name is used as a
+///   tiebreaker to avoid over-aggressive collapsing.
+fn dedup_key(h: &UnifiedHit) -> String {
+    let path = normalise_path(&h.path);
+    if h.origin == "docs" {
+        // Each doc chunk is a distinct result; only exact duplicates collapse.
+        return format!("{}:{}:{}", path, h.start_line, h.end_line);
+    }
+    if h.start_line > 0 {
+        format!("{}:{}", path, h.start_line)
+    } else if let Some(sym) = h.symbol.as_deref().filter(|s| !s.is_empty()) {
+        format!("{}:{}", path, sym.to_lowercase())
+    } else {
+        path
+    }
+}
+
+/// Richness rank: higher = more payload.  `code` carries the source body and
+/// wins over `codegraph` (structured location only) which wins over `docs`.
+fn origin_priority(origin: &str) -> u8 {
+    match origin {
+        "code" => 2,
+        "codegraph" => 1,
+        _ => 0,
+    }
+}
+
+/// Merge complementary structured fields from `donor` into `winner` in-place.
+///
+/// After a collision the winner already holds the richer snippet/body.  This
+/// pass fills in any fields the winner is missing — typically the qualified
+/// symbol name from a codegraph hit when the code-index hit only recorded the
+/// short name.
+fn merge_complementary(winner: &mut UnifiedHit, donor: &UnifiedHit) {
+    // Prefer the longer (more qualified) symbol name.
+    match (&winner.symbol, &donor.symbol) {
+        (Some(w), Some(d)) if d.len() > w.len() => winner.symbol = Some(d.clone()),
+        (None, Some(d)) => winner.symbol = Some(d.clone()),
+        _ => {}
+    }
+    // Fill missing signature / kind from donor.
+    if winner.signature.as_deref().unwrap_or("").is_empty() {
+        if let Some(s) = donor.signature.as_deref().filter(|s| !s.is_empty()) {
+            winner.signature = Some(s.to_string());
+        }
+    }
+    if winner.kind.as_deref().unwrap_or("").is_empty() {
+        if let Some(k) = donor.kind.as_deref().filter(|s| !s.is_empty()) {
+            winner.kind = Some(k.to_string());
+        }
+    }
+    // Prefer accurate line range (non-zero wins).
+    if winner.start_line == 0 && donor.start_line > 0 {
+        winner.start_line = donor.start_line;
+        winner.end_line = donor.end_line;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tool implementations
 // ---------------------------------------------------------------------------
 
@@ -973,6 +1048,38 @@ impl McpContext {
                  index is installed (`sempkg list`)."
             );
         }
+
+        // ── Dedup ────────────────────────────────────────────────────────
+        // O(n) pass: collapse codegraph and code-index hits that refer to the
+        // same symbol at the same file:line.  On collision the richer origin
+        // wins (code > codegraph > docs); structured fields absent from the
+        // winner are filled in from the loser so no location or signature data
+        // is lost.
+        let mut hits: Vec<UnifiedHit> = {
+            let mut key_map: HashMap<String, usize> = HashMap::with_capacity(hits.len());
+            let mut deduped: Vec<UnifiedHit> = Vec::with_capacity(hits.len());
+            for hit in hits {
+                let key = dedup_key(&hit);
+                if let Some(&idx) = key_map.get(&key) {
+                    let existing_priority = origin_priority(deduped[idx].origin);
+                    let new_priority = origin_priority(hit.origin);
+                    let should_replace = new_priority > existing_priority
+                        || (new_priority == existing_priority
+                            && hit.snippet.len() > deduped[idx].snippet.len());
+                    if should_replace {
+                        let old = std::mem::replace(&mut deduped[idx], hit);
+                        merge_complementary(&mut deduped[idx], &old);
+                    } else {
+                        // Existing wins; still harvest any extra fields from the new hit.
+                        merge_complementary(&mut deduped[idx], &hit);
+                    }
+                } else {
+                    key_map.insert(key, deduped.len());
+                    deduped.push(hit);
+                }
+            }
+            deduped
+        };
 
         // ── Global RRF sort ───────────────────────────────────────────────
         // All sources used the same RRF formula so this sort is apples-to-apples.
