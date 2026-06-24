@@ -17,9 +17,10 @@ Internally the tool:
 1. fans out to all available retrieval backends across all packages,
 2. deduplicates hits that refer to the same symbol (codegraph and code-index often return the same function),
 3. merges the deduplicated result sets with Reciprocal Rank Fusion,
-4. applies a diversity cap to guarantee balanced source representation, then
-5. scores the resulting pool with the local Qwen3 reranker (when loaded) and
-6. returns rich markdown annotated with package provenance, score, file, lines, and a snippet.
+4. applies a diversity cap to guarantee balanced source representation,
+5. **expands** each pool hit to its full symbol body (small-to-big retrieval),
+6. scores the resulting pool with the local Qwen3 reranker (when loaded), and
+7. returns rich markdown annotated with package provenance, score, file, lines, and a snippet.
 
 ---
 
@@ -142,7 +143,67 @@ preventing any single source from monopolising the pool the reranker will actual
 
 ---
 
-## 6. Reranking
+## 6. Small-to-big Retrieval Expansion
+
+BM25 retrieval returns a truncated display snippet (600 chars for code, 400 for docs) because
+storing and transferring the full symbol body for every candidate in the fan-out pool would be
+unworkable.  However, the reranker is a cross-encoder that reads the full `(query, document)`
+pair character by character — sending it only 600 characters of a 2 KB function body means it
+judges relevance on a partial view of the evidence.
+
+After the diversity selection step has committed to a small pool (typically 10–20 hits), the
+tool runs a **small-to-big expansion pass** that replaces each hit's truncated snippet with the
+complete symbol body fetched via a precise key lookup into the code index:
+
+```
+BM25 retrieval (fine-grained)     ─► small candidate pool
+                                       │
+               expand_pool_hits ──────►│ fetch full body for each code/codegraph hit
+                                       │
+              Qwen3-Reranker (big) ────►│ score (query, full_body) pair
+```
+
+### 6.1 Lookup strategy
+
+For each pool hit the expansion function (`McpContext::expand_pool_hits`) attempts two lookups
+in priority order:
+
+1. **Location-keyed lookup** — `lance::fetch_symbol_at_location(code_dir, path, start_line)`.
+   Uses the file path and start line recorded in the hit to retrieve the exact `SymbolSource`
+   row from the code index.  This is the primary path for `code` origin hits because the
+   location is embedded in the index at bundle-build time.
+
+2. **Name-keyed lookup (fallback)** — `lance::fetch_symbol_source(code_dir, symbol)`.  Used
+   when `start_line == 0` (common for `codegraph` hits that were not matched to the code index
+   during dedup) or when the location lookup returns nothing.  Only fires if the match is
+   unambiguous (`SymbolLookup::Unique`); ambiguous matches are left unexpanded to avoid
+   returning the wrong function body.
+
+### 6.2 Expansion guard
+
+The expansion is written only when `body.len() > snippet.len()`.  This ensures the expansion
+never silently replaces a richer snippet with a shorter one (e.g. when the code index stores a
+one-liner whose signature _is_ the full body).
+
+### 6.3 What is expanded and what is not
+
+| Origin | Expanded? | Rationale |
+|--------|-----------|-----------|
+| `code` | Yes | Primary target; symbol bodies with leading/trailing comments are stored in the code index |
+| `codegraph` | Yes (when a code index is available for the package) | Symbol bodies are available via the shared code index; codegraph itself stores only signatures |
+| `docs` | **No** | Documentation chunks are already the natural retrieval unit; there is no larger parent entity to expand into |
+
+### 6.4 Display vs. reranker input
+
+The `snippet` field on `UnifiedHit` is **never mutated** during expansion.  The `expanded_text`
+field is stored separately and consumed only by `unified_hit_candidate_text` when building the
+reranker input string.  The output markdown always shows the original display snippet.  Agents
+that need the full body can call the `read_code` tool with the path and line numbers that are
+already present in every result.
+
+---
+
+## 7. Reranking
 
 The diversity-selected pool (up to `pool_size` candidates) is submitted to the local
 Qwen3-Reranker cross-encoder (see [`reranker-design.md`](reranker-design.md)).  The reranker
@@ -154,7 +215,19 @@ falls back to returning the top `limit` hits from the diversity-selected pool, s
 
 ---
 
-## 7. Output Format
+## 8. Relevance Floor
+
+When the reranker is active a relevance floor of **0.10** is applied: hits whose reranker score
+falls below this threshold are dropped from the output even if they would otherwise rank within
+the top `limit`.  This prevents the tool from surfacing syntactically matching but semantically
+irrelevant results to the agent.
+
+The floor is not applied in fallback (RRF-only) mode, where no calibrated relevance signal
+exists.
+
+---
+
+## 9. Output Format
 
 Each result is rendered as a markdown section containing:
 
@@ -167,7 +240,7 @@ Results are separated by `---` dividers so agents can parse individual sections.
 
 ---
 
-## 8. Pipeline Summary
+## 10. Pipeline Summary
 
 ```
 query string
@@ -177,7 +250,7 @@ query string
      └─► codegraph::query    (per indexed package)          ──┘  1/(60+rank)
                                         │
                               dedup  O(n) HashMap pass
-                              key = normalise(path):start_line
+                              key = package:normalise(path):start_line
                               code > codegraph > docs  (richness)
                               merge_complementary fills gaps in winner
                                         │
@@ -186,8 +259,15 @@ query string
                               greedy diversity selection
                               per-(package,origin) cap = pool_size/3
                                         │
+                              small-to-big expansion
+                              fetch full symbol body from code index
+                              location-keyed → name-keyed fallback
+                              docs hits skipped (already natural unit)
+                                        │
                               Qwen3-Reranker
-                              score each (query, text) pair
+                              score each (query, expanded_text|snippet) pair
+                                        │
+                              relevance floor 0.10 (reranker mode only)
                                         │
                               top limit results
                               formatted as markdown
@@ -195,7 +275,7 @@ query string
 
 ---
 
-## 9. Future Directions
+## 11. Future Directions
 
 The query tool is designed to be a stable insertion point for improved retrieval.  Planned
 enhancements (tracked in the roadmap):

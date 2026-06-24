@@ -413,9 +413,18 @@ struct UnifiedHit {
     /// can dominate via a different score scale.  Used to sort globally before
     /// the reranker pool is assembled.
     rrf_score: f32,
+    /// Full symbol body fetched during the small-to-big expansion pass.
+    /// When present this is used as the reranker input instead of the
+    /// truncated `snippet`, giving the cross-encoder much richer context.
+    /// The `snippet` field is always kept for display output.
+    expanded_text: Option<String>,
 }
 
 /// Build the text string submitted to the reranker for a `UnifiedHit`.
+///
+/// Prefers `expanded_text` (full symbol body from the small-to-big expansion
+/// pass) over the truncated `snippet`.  Falls back through signature → path
+/// when neither is available.
 fn unified_hit_candidate_text(h: &UnifiedHit) -> String {
     let mut parts: Vec<&str> = Vec::new();
     if let Some(k) = h.kind.as_deref() {
@@ -431,13 +440,20 @@ fn unified_hit_candidate_text(h: &UnifiedHit) -> String {
     let prefix = parts.join(" ");
 
     let sig = h.signature.as_deref().unwrap_or("");
-    let body = if !h.snippet.is_empty() {
-        h.snippet.as_str()
-    } else if !sig.is_empty() {
-        sig
-    } else {
-        h.path.as_str()
-    };
+    // Prefer the full expanded body (small-to-big); fall back to display snippet.
+    let body = h
+        .expanded_text
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            if !h.snippet.is_empty() {
+                h.snippet.as_str()
+            } else if !sig.is_empty() {
+                sig
+            } else {
+                h.path.as_str()
+            }
+        });
 
     if prefix.is_empty() {
         body.to_string()
@@ -914,6 +930,69 @@ impl McpContext {
         }
     }
 
+    /// Small-to-big expansion: for each hit in `pool_indices`, attempt to
+    /// replace the truncated display snippet with the full symbol body from
+    /// the code index, giving the reranker far richer context to score.
+    ///
+    /// Strategy (in priority order):
+    /// 1. `code` origin hits: fetch by `path + start_line` (precise location).
+    /// 2. `codegraph` origin hits: try the same location lookup via the code
+    ///    index; fall back to symbol-name lookup when line data is missing.
+    /// 3. `docs` origin hits: skipped — doc chunks are already at their natural
+    ///    granularity and have no separate code-index entry to expand into.
+    ///
+    /// On any lookup failure the hit is left unchanged (snippet still used).
+    /// `expanded_text` is set only on hits where the returned content is
+    /// strictly longer than the existing snippet, so truncated snippets are
+    /// always replaced by something richer.
+    fn expand_pool_hits(&self, hits: &mut Vec<UnifiedHit>, pool_indices: &[usize]) {
+        for &hit_idx in pool_indices {
+            // Extract the fields we need before taking any mutable reference.
+            let (origin, pkg, path, start_line, symbol) = {
+                let h = &hits[hit_idx];
+                (h.origin, h.package.clone(), h.path.clone(), h.start_line, h.symbol.clone())
+            };
+
+            if origin == "docs" {
+                continue;
+            }
+
+            let code_dir = match self.resolve_code_path(&pkg) {
+                Ok(d) => d,
+                Err(_) => continue, // no code index for this package
+            };
+
+            // Primary: location-keyed lookup (path + start_line).
+            let mut full_body: Option<String> = if start_line > 0 {
+                lance::fetch_symbol_at_location(&code_dir, &path, start_line)
+                    .ok()
+                    .flatten()
+                    .map(|src| src.content)
+            } else {
+                None
+            };
+
+            // Fallback: symbol-name lookup (for codegraph hits without line info).
+            if full_body.is_none() {
+                if let Some(sym) = symbol.as_deref().filter(|s| !s.is_empty()) {
+                    if let Ok(lance::SymbolLookup::Unique(src)) =
+                        lance::fetch_symbol_source(&code_dir, sym)
+                    {
+                        full_body = Some(src.content);
+                    }
+                }
+            }
+
+            // Only store when we actually got something longer than the snippet.
+            if let Some(body) = full_body {
+                let current_len = hits[hit_idx].snippet.len();
+                if body.len() > current_len {
+                    hits[hit_idx].expanded_text = Some(body);
+                }
+            }
+        }
+    }
+
     /// Unified cross-package search: queries code, docs, and codegraph across
     /// all installed bundles and local packages, then reranks everything together.
     fn tool_query(&self, query: &str, limit: usize) -> String {
@@ -968,6 +1047,7 @@ impl McpContext {
                     kind: Some(kind),
                     signature: Some(sig),
                     rrf_score,
+                    expanded_text: None,
                 });
             }
         };
@@ -993,6 +1073,7 @@ impl McpContext {
                             kind: r.kind,
                             signature: r.signature,
                             rrf_score: 1.0 / (60.0 + pos as f32 + 1.0),
+                            expanded_text: None,
                         });
                     }
                 }
@@ -1014,6 +1095,7 @@ impl McpContext {
                             kind: r.kind,
                             signature: r.signature,
                             rrf_score: 1.0 / (60.0 + pos as f32 + 1.0),
+                            expanded_text: None,
                         });
                     }
                 }
@@ -1047,6 +1129,7 @@ impl McpContext {
                             kind: r.kind,
                             signature: r.signature,
                             rrf_score: 1.0 / (60.0 + pos as f32 + 1.0),
+                            expanded_text: None,
                         });
                     }
                 }
@@ -1143,6 +1226,14 @@ impl McpContext {
             })
             .take(pool_size)
             .collect();
+
+        // ── Small-to-big expansion ────────────────────────────────────────
+        // Fetch the full symbol body for each code/codegraph hit in the pool.
+        // The reranker then scores the complete implementation + its comment
+        // context rather than the truncated 600-char display snippet.
+        // Doc hits are left unchanged (their chunks are already the natural
+        // retrieval unit).
+        self.expand_pool_hits(&mut hits, &pool_indices);
 
         // ── Rerank ───────────────────────────────────────────────────────
         let candidates: Vec<reranker::RerankCandidate> = pool_indices
