@@ -438,8 +438,9 @@ struct UnifiedHit {
     /// top-`PASS1_K` hits that were actually expanded and windowed.
     best_window: Option<String>,
     /// `true` when `best_window` is window 0 (the function-opening /
-    /// signature region).  Combined with an absent `expanded_text` this
-    /// signals a name/signature match that renders without a snippet block.
+    /// signature region).  Retained for diagnostics; not used in display
+    /// routing — see `format_unified_hit` for rationale.
+    #[allow(dead_code)]
     best_window_first: bool,
     /// Total number of KWIC windows the body was split into during pass-2.
     /// 0 = not windowed; 1 = body fits in a single window; >1 = multi-window.
@@ -618,10 +619,13 @@ fn format_unified_hit(h: &UnifiedHit, query: &str, rank: usize, score: Option<f3
     // 3. No pass-2 window available (no reranker / fallback path): show the
     //    original display snippet verbatim.
     let snippet_block = if let Some(ref window) = h.best_window {
-        let name_match = query_matches_name_or_signature(query, h);
-        if name_match && h.best_window_first {
-            // Tier 1: lexical name/signature match in the opening region.
-            // Signature block already rendered above — no snippet needed.
+        // Tier 1: query terms land in the name/signature — the heading +
+        // Signature line already show the matched text, no code block needed.
+        // `best_window_first` is intentionally NOT part of this check: for
+        // functions whose body fits in a single KWIC window (< 1500 chars)
+        // `best_window_first` is trivially true and would incorrectly suppress
+        // the body for every small function regardless of where the match was.
+        if query_matches_name_or_signature(query, h) {
             String::new()
         } else {
             // Tier 2: show the best KWIC window + optional affordance.
