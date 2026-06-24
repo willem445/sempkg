@@ -19,6 +19,14 @@ use crate::reranker::{self, Reranker, RerankerConfig};
 use crate::store::{list_all_bundles, resolve_bundle};
 use crate::{codegraph, lance};
 
+// Minimum reranker score (P(yes) from the Qwen3 cross-encoder) a result must
+// reach to be returned to the agent.  Results below this threshold are
+// considered irrelevant and suppressed to avoid wasting context.
+// Only applied when the reranker model is actually loaded; the RRF-only
+// fallback path does not use this floor (RRF scores carry no absolute
+// relevance meaning).
+const RERANKER_SCORE_FLOOR: f32 = 0.10;
+
 // ---------------------------------------------------------------------------
 // JSON-RPC types
 // ---------------------------------------------------------------------------
@@ -1151,19 +1159,23 @@ impl McpContext {
             })
             .collect();
 
+        let mut reranker_was_active = false;
         let scored: Vec<(usize, f32)> = {
             let mut guard = self.reranker.borrow_mut();
             if let Some(ranker) = guard.as_mut() {
                 match ranker.rerank(query, candidates) {
-                    Ok(results) => results
-                        .into_iter()
-                        .take(limit)
-                        .filter_map(|r| {
-                            r.source.parse::<usize>().ok().and_then(|pool_pos| {
-                                pool_indices.get(pool_pos).map(|&hit_idx| (hit_idx, r.score))
+                    Ok(results) => {
+                        reranker_was_active = true;
+                        results
+                            .into_iter()
+                            .take(limit)
+                            .filter_map(|r| {
+                                r.source.parse::<usize>().ok().and_then(|pool_pos| {
+                                    pool_indices.get(pool_pos).map(|&hit_idx| (hit_idx, r.score))
+                                })
                             })
-                        })
-                        .collect(),
+                            .collect()
+                    }
                     Err(e) => {
                         eprintln!("sempkg: reranker error in query ({e}), returning top {limit} RRF hits");
                         pool_indices.iter().take(limit).map(|&i| (i, hits[i].rrf_score)).collect()
@@ -1175,8 +1187,29 @@ impl McpContext {
             }
         };
 
+        // ── Relevance floor ──────────────────────────────────────────────
+        // Drop results the reranker considers irrelevant.  Only applied when
+        // the reranker ran; RRF scores are not a relevance signal.
+        let scored: Vec<(usize, f32)> = if reranker_was_active {
+            scored
+                .into_iter()
+                .filter(|&(_, s)| s >= RERANKER_SCORE_FLOOR)
+                .collect()
+        } else {
+            scored
+        };
+
         if scored.is_empty() {
-            return format!("No results for: `{query}`.");
+            return if reranker_was_active {
+                format!(
+                    "No relevant results for: `{query}`\n\n\
+                     All candidates scored below the relevance floor ({RERANKER_SCORE_FLOOR:.2}). \
+                     Try rephrasing the query or use `search_code`, `search_docs`, or \
+                     `search_symbols` to inspect a specific package directly."
+                )
+            } else {
+                format!("No results for: `{query}`.")
+            };
         }
 
         // ── Format ───────────────────────────────────────────────────────
