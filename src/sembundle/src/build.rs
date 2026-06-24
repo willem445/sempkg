@@ -406,6 +406,84 @@ async fn run_lance_inner(
 // Source-code index step
 // ---------------------------------------------------------------------------
 
+/// Returns `true` when `trimmed` (already `.trim()`-ed) looks like a comment
+/// line in any of the languages the code index supports.
+///
+/// Covers:
+/// - `//`  `///`  `////`  — Rust / C / C++ / Java / JS / TS / Go / Swift
+/// - `#`               — Python / Ruby / Shell / TOML / YAML / R
+/// - `/*`  `*/`  `*`   — C-family block comments (middle lines start with `*`)
+/// - `--`              — SQL / Lua / Haskell
+/// - `%`               — MATLAB / LaTeX
+fn is_comment_line(trimmed: &str) -> bool {
+    trimmed.starts_with("//")
+        || trimmed.starts_with('#')
+        || trimmed.starts_with("/*")
+        || trimmed.starts_with("*/")
+        || trimmed.starts_with('*')
+        || trimmed.starts_with("--")
+        || trimmed.starts_with('%')
+}
+
+/// Walk backward from `symbol_start` (0-based index into `lines`) and return
+/// the index of the first line of the comment block that immediately precedes
+/// the symbol.
+///
+/// Algorithm:
+/// 1. Allow **at most one** blank line between the symbol and the comment
+///    block above (e.g. an empty separator line after the previous symbol).
+/// 2. Collect contiguous comment lines walking upward until the first
+///    non-comment line is reached — blank lines inside the comment block
+///    are **not** crossed, so comments for a different symbol above a blank
+///    separator are never captured.
+///
+/// Returns `symbol_start` unchanged when no qualifying comment is found.
+fn collect_leading_comment_start(lines: &[&str], symbol_start: usize) -> usize {
+    if symbol_start == 0 {
+        return symbol_start;
+    }
+    let mut scan = symbol_start - 1;
+
+    // Allow one blank separator line between the symbol and the comment.
+    if lines[scan].trim().is_empty() {
+        if scan == 0 {
+            return symbol_start;
+        }
+        scan -= 1;
+        // After the blank, the very next line must be a comment or we give up.
+        if !is_comment_line(lines[scan].trim()) {
+            return symbol_start;
+        }
+    } else if !is_comment_line(lines[scan].trim()) {
+        return symbol_start;
+    }
+
+    // `scan` is now on a comment line.  Walk upward while lines stay comments.
+    let mut comment_start = scan;
+    while scan > 0 && is_comment_line(lines[scan - 1].trim()) {
+        scan -= 1;
+        comment_start = scan;
+    }
+    comment_start
+}
+
+/// Walk forward from `symbol_end` (0-based, inclusive) and return the index
+/// of the last contiguous trailing comment line.
+///
+/// Only strictly adjacent lines are included — the first blank or non-comment
+/// line terminates the scan.  This is intentionally conservative: trailing
+/// comments are rare and we must not capture the leading comment of the next
+/// symbol.
+fn collect_trailing_comment_end(lines: &[&str], symbol_end: usize) -> usize {
+    let mut comment_end = symbol_end;
+    let mut scan = symbol_end + 1;
+    while scan < lines.len() && is_comment_line(lines[scan].trim()) {
+        comment_end = scan;
+        scan += 1;
+    }
+    comment_end
+}
+
 /// A single symbol chunk ready to be written into the LanceDB `code` table.
 struct SymbolChunk {
     path: String,
@@ -539,7 +617,21 @@ fn extract_chunks_from_codegraph_db(
             let start_idx = s - 1;
             let end_idx = (e - 1).min(n_lines.saturating_sub(1));
 
-            let body: String = text_lines[start_idx..=end_idx].join("\n");
+            // Extend the content window to include adjacent comment blocks.
+            // start_line/end_line stored in the chunk remain the *symbol's*
+            // own boundaries so that read_symbol / read_code location lookups
+            // (which filter by path + start_line) are completely unaffected.
+            let ctx_start = collect_leading_comment_start(&text_lines, start_idx);
+            let ctx_end   = collect_trailing_comment_end(&text_lines, end_idx);
+            let body: String = text_lines[ctx_start..=ctx_end].join("\n");
+
+            // Signature comes from the first non-empty line of the symbol
+            // itself (not the comment prefix), so skip leading comment lines.
+            let sig = text_lines[start_idx..=end_idx]
+                .iter()
+                .find(|l| !l.trim().is_empty() && !is_comment_line(l.trim()))
+                .copied()
+                .unwrap_or("");
 
             // Prefer qualified_name; it is more unique (e.g. "Vec::push" vs "push").
             let sym_name = if !row.qualified_name.is_empty() {
@@ -548,7 +640,7 @@ fn extract_chunks_from_codegraph_db(
                 row.name.clone()
             };
 
-            let sig = body.lines().find(|l| !l.trim().is_empty()).unwrap_or("").to_string();
+            let sig = sig.to_string();
 
             if body.len() > max_chunk_bytes {
                 // Sub-chunk oversized bodies; every sub-chunk keeps the same
@@ -658,13 +750,29 @@ fn extract_symbol_chunks(rel_path: &str, text: &str, max_chunk_bytes: usize) -> 
     let mut chunks: Vec<SymbolChunk> = Vec::new();
     for (idx, b) in boundaries.iter().enumerate() {
         let start = b.line_idx;
+
+        // Content ends just before the NEXT symbol's leading comments begin,
+        // so each symbol owns its own comment block rather than stealing the
+        // next symbol's documentation.
         let end = if idx + 1 < boundaries.len() {
-            boundaries[idx + 1].line_idx.saturating_sub(1)
+            let next_ctx = collect_leading_comment_start(&lines, boundaries[idx + 1].line_idx);
+            next_ctx.saturating_sub(1)
         } else {
             lines.len().saturating_sub(1)
         };
-        let body: String = lines[start..=end.min(lines.len().saturating_sub(1))].join("\n");
-        let sig = body.lines().find(|l| !l.trim().is_empty()).unwrap_or("").to_string();
+
+        // Walk upward from this symbol's first line to pick up any preceding
+        // comment block.  The stored start_line reflects the symbol keyword
+        // line, not the comment.
+        let content_start = collect_leading_comment_start(&lines, start);
+        let body: String = lines[content_start..=end.min(lines.len().saturating_sub(1))].join("\n");
+
+        // Signature = first non-empty, non-comment line of the symbol itself.
+        let sig = lines[start..=end.min(lines.len().saturating_sub(1))]
+            .iter()
+            .find(|l| !l.trim().is_empty() && !is_comment_line(l.trim()))
+            .copied()
+            .unwrap_or("");
         let start_line = (start + 1) as u32;
         let end_line = (end + 1) as u32;
 
@@ -674,14 +782,14 @@ fn extract_symbol_chunks(rel_path: &str, text: &str, max_chunk_bytes: usize) -> 
                     path: rel_path.to_string(),
                     symbol: format!("{}#{}", b.name, sub_idx),
                     kind: b.kind.clone(),
-                    signature: if sub_idx == 0 { sig.clone() } else { String::new() },
+                    signature: if sub_idx == 0 { sig.to_string() } else { String::new() },
                     content: sub, start_line, end_line,
                 });
             }
         } else {
             chunks.push(SymbolChunk {
                 path: rel_path.to_string(), symbol: b.name.clone(),
-                kind: b.kind.clone(), signature: sig, content: body,
+                kind: b.kind.clone(), signature: sig.to_string(), content: body,
                 start_line, end_line,
             });
         }
