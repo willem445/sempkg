@@ -27,6 +27,22 @@ use crate::{codegraph, lance};
 // relevance meaning).
 const RERANKER_SCORE_FLOOR: f32 = 0.10;
 
+/// Number of pool hits promoted from cheap pass-1 (snippet reranking) to the
+/// expensive pass-2 (small-to-big expansion + KWIC-windowed reranking).
+/// Keeping this small (5) means at most 5 × N_windows DB round-trips and
+/// reranker calls, regardless of how large the pool is.
+const PASS1_K: usize = 5;
+
+/// Maximum characters per KWIC window fed to the pass-2 reranker.
+/// At ~4 chars/token this is ≈ 375 tokens, leaving ample room for the
+/// Qwen3-0.6B 4096-token context to hold the system prompt + query overhead.
+const KWIC_WINDOW_CHARS: usize = 1_500;
+
+/// Stride between consecutive KWIC windows (50 % overlap so that relevant
+/// content near a window boundary is always captured in full by at least
+/// one window).
+const KWIC_STRIDE_CHARS: usize = 750;
+
 // ---------------------------------------------------------------------------
 // JSON-RPC types
 // ---------------------------------------------------------------------------
@@ -418,29 +434,52 @@ struct UnifiedHit {
     /// truncated `snippet`, giving the cross-encoder much richer context.
     /// The `snippet` field is always kept for display output.
     expanded_text: Option<String>,
+    /// Best KWIC window from pass-2 reranking.  Populated only for the
+    /// top-`PASS1_K` hits that were actually expanded and windowed.
+    best_window: Option<String>,
+    /// `true` when `best_window` is window 0 (the function-opening /
+    /// signature region).  Combined with an absent `expanded_text` this
+    /// signals a name/signature match that renders without a snippet block.
+    best_window_first: bool,
+    /// Total number of KWIC windows the body was split into during pass-2.
+    /// 0 = not windowed; 1 = body fits in a single window; >1 = multi-window.
+    kwic_count: usize,
+}
+
+/// Build the kind+symbol prefix used in all reranker candidate strings.
+/// Returns an empty string when neither field is set.
+fn hit_kind_symbol_prefix(h: &UnifiedHit) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    if let Some(k) = h.kind.as_deref().filter(|s| !s.is_empty()) {
+        parts.push(k);
+    }
+    if let Some(s) = h.symbol.as_deref().filter(|s| !s.is_empty()) {
+        parts.push(s);
+    }
+    parts.join(" ")
+}
+
+/// Build the text string submitted to the reranker given an explicit body.
+/// This is the inner primitive; callers choose which body to pass:
+/// - Pass-1 uses the display snippet.
+/// - Pass-2 uses an individual KWIC window from the expanded body.
+fn hit_candidate_text_with_body(h: &UnifiedHit, body: &str) -> String {
+    let prefix = hit_kind_symbol_prefix(h);
+    if prefix.is_empty() {
+        body.to_string()
+    } else {
+        format!("{prefix}: {body}")
+    }
 }
 
 /// Build the text string submitted to the reranker for a `UnifiedHit`.
 ///
 /// Prefers `expanded_text` (full symbol body from the small-to-big expansion
 /// pass) over the truncated `snippet`.  Falls back through signature → path
-/// when neither is available.
+/// when neither is available.  Used in the no-reranker fallback path and for
+/// pass-1 snippet scoring (before expansion).
 fn unified_hit_candidate_text(h: &UnifiedHit) -> String {
-    let mut parts: Vec<&str> = Vec::new();
-    if let Some(k) = h.kind.as_deref() {
-        if !k.is_empty() {
-            parts.push(k);
-        }
-    }
-    if let Some(sym) = h.symbol.as_deref() {
-        if !sym.is_empty() {
-            parts.push(sym);
-        }
-    }
-    let prefix = parts.join(" ");
-
     let sig = h.signature.as_deref().unwrap_or("");
-    // Prefer the full expanded body (small-to-big); fall back to display snippet.
     let body = h
         .expanded_text
         .as_deref()
@@ -454,12 +493,42 @@ fn unified_hit_candidate_text(h: &UnifiedHit) -> String {
                 h.path.as_str()
             }
         });
+    hit_candidate_text_with_body(h, body)
+}
 
-    if prefix.is_empty() {
-        body.to_string()
-    } else {
-        format!("{prefix}: {body}")
+/// Split `text` into overlapping KWIC windows of at most `KWIC_WINDOW_CHARS`
+/// characters with `KWIC_STRIDE_CHARS` stride (≈ 50 % overlap).
+///
+/// All splits are snapped to UTF-8 char boundaries.  If `text` fits in a
+/// single window the returned `Vec` has exactly one element (no windowing
+/// overhead, same as before).
+fn kwic_windows(text: &str) -> Vec<String> {
+    if text.len() <= KWIC_WINDOW_CHARS {
+        return vec![text.to_string()];
     }
+    let mut windows: Vec<String> = Vec::new();
+    let mut start = 0usize;
+    loop {
+        // Snap end to a valid char boundary.
+        let raw_end = (start + KWIC_WINDOW_CHARS).min(text.len());
+        let end = (raw_end..=text.len())
+            .find(|&i| text.is_char_boundary(i))
+            .unwrap_or(text.len());
+        windows.push(text[start..end].to_string());
+        if end == text.len() {
+            break;
+        }
+        // Advance by stride, snapping to char boundary.
+        let raw_next = start + KWIC_STRIDE_CHARS;
+        let next = (raw_next..=text.len())
+            .find(|&i| text.is_char_boundary(i))
+            .unwrap_or(text.len());
+        if next <= start {
+            break; // safety: never loop if stride maps to zero advance
+        }
+        start = next;
+    }
+    windows
 }
 
 /// Format a `UnifiedHit` as a markdown section for the `query` tool output.
@@ -513,8 +582,49 @@ fn format_unified_hit(h: &UnifiedHit, rank: usize, score: Option<f32>) -> String
         .map(|s| format!("\n**Signature:** `{s}`"))
         .unwrap_or_default();
 
-    // ── Snippet ──────────────────────────────────────────────────────────
-    let snippet_block = if h.snippet.is_empty() {
+    // ── Snippet block (tiered display) ───────────────────────────────────
+    // Three tiers, in priority order:
+    //
+    // 1. Name/signature match (compact body, best window is the only window):
+    //    The function is short enough to fit in a single KWIC window and the
+    //    match is in the opening region.  The signature line already shown
+    //    above captures the relevant information; skip the snippet block to
+    //    avoid redundancy.
+    //
+    // 2. Body match with KWIC window:
+    //    The best-scoring window is not the first (match deep in the body) OR
+    //    the body spans multiple windows.  Show the best window with a
+    //    "+N more lines → read_code" affordance so agents can retrieve the
+    //    full implementation when needed.
+    //
+    // 3. Default: show the original display snippet verbatim.
+    let snippet_block = if let Some(ref window) = h.best_window {
+        let single_window = h.kwic_count <= 1;
+        if h.best_window_first && single_window {
+            // Tier 1: name/signature match on a compact body.
+            // Signature block already rendered above — no snippet needed.
+            String::new()
+        } else {
+            // Tier 2: show the best KWIC window + optional affordance.
+            let affordance = if h.start_line > 0 && h.end_line > h.start_line {
+                let total_lines = (h.end_line - h.start_line + 1) as usize;
+                let window_lines = window.lines().count();
+                if total_lines > window_lines + 2 {
+                    let more = total_lines.saturating_sub(window_lines);
+                    format!(
+                        "\n*+{more} more lines — call `read_code` with \
+                         package `{}`, file `{}`, line `{}`*",
+                        h.package, h.path, h.start_line
+                    )
+                } else {
+                    String::new()
+                }
+            } else {
+                String::new()
+            };
+            format!("\n```\n{window}\n```{affordance}")
+        }
+    } else if h.snippet.is_empty() {
         String::new()
     } else {
         format!("\n```\n{}\n```", h.snippet)
@@ -1048,6 +1158,9 @@ impl McpContext {
                     signature: Some(sig),
                     rrf_score,
                     expanded_text: None,
+                    best_window: None,
+                    best_window_first: false,
+                    kwic_count: 0,
                 });
             }
         };
@@ -1074,6 +1187,9 @@ impl McpContext {
                             signature: r.signature,
                             rrf_score: 1.0 / (60.0 + pos as f32 + 1.0),
                             expanded_text: None,
+                            best_window: None,
+                            best_window_first: false,
+                            kwic_count: 0,
                         });
                     }
                 }
@@ -1096,6 +1212,9 @@ impl McpContext {
                             signature: r.signature,
                             rrf_score: 1.0 / (60.0 + pos as f32 + 1.0),
                             expanded_text: None,
+                            best_window: None,
+                            best_window_first: false,
+                            kwic_count: 0,
                         });
                     }
                 }
@@ -1130,6 +1249,9 @@ impl McpContext {
                             signature: r.signature,
                             rrf_score: 1.0 / (60.0 + pos as f32 + 1.0),
                             expanded_text: None,
+                            best_window: None,
+                            best_window_first: false,
+                            kwic_count: 0,
                         });
                     }
                 }
@@ -1235,48 +1357,146 @@ impl McpContext {
         // retrieval unit).
         self.expand_pool_hits(&mut hits, &pool_indices);
 
-        // ── Rerank ───────────────────────────────────────────────────────
-        let candidates: Vec<reranker::RerankCandidate> = pool_indices
-            .iter()
-            .enumerate()
-            .map(|(pool_pos, &hit_idx)| reranker::RerankCandidate {
-                source: pool_pos.to_string(),
-                text: unified_hit_candidate_text(&hits[hit_idx]),
-                origin: if hits[hit_idx].origin == "codegraph" {
-                    reranker::RerankOrigin::Codegraph
-                } else {
-                    reranker::RerankOrigin::Docs
-                },
-            })
-            .collect();
-
+        // ── Two-pass reranking ────────────────────────────────────────────
+        //
+        // Pass 1 (cheap): score every pool hit using its display snippet.
+        //   The snippets are already in memory and small enough that the
+        //   reranker can process the whole pool in one call.  Output is a
+        //   ranked list; we keep the top PASS1_K entries for the expensive
+        //   second pass.
+        //
+        // Pass 2 (expensive): for each pass-1 top-k hit:
+        //   1. Use the expanded full body (from small-to-big) if available.
+        //   2. Split the body into overlapping KWIC windows.
+        //   3. Score every (query, window) pair and take the max.
+        //   4. Record which window scored best for tiered display.
+        //
+        // This means at most PASS1_K × N_windows reranker evaluations on
+        // full bodies, instead of pool_size evaluations.
         let mut reranker_was_active = false;
         let scored: Vec<(usize, f32)> = {
             let mut guard = self.reranker.borrow_mut();
             if let Some(ranker) = guard.as_mut() {
-                match ranker.rerank(query, candidates) {
-                    Ok(results) => {
-                        reranker_was_active = true;
-                        results
-                            .into_iter()
-                            .take(limit)
-                            .filter_map(|r| {
-                                r.source.parse::<usize>().ok().and_then(|pool_pos| {
-                                    pool_indices.get(pool_pos).map(|&hit_idx| (hit_idx, r.score))
-                                })
+                // ── Pass 1: snippet scoring ───────────────────────────────
+                let p1_candidates: Vec<reranker::RerankCandidate> = pool_indices
+                    .iter()
+                    .enumerate()
+                    .map(|(pp, &hi)| {
+                        let sig = hits[hi].signature.as_deref().unwrap_or("");
+                        let body = if !hits[hi].snippet.is_empty() {
+                            hits[hi].snippet.as_str()
+                        } else if !sig.is_empty() {
+                            sig
+                        } else {
+                            hits[hi].path.as_str()
+                        };
+                        reranker::RerankCandidate {
+                            source: pp.to_string(),
+                            text: hit_candidate_text_with_body(&hits[hi], body),
+                            origin: reranker::RerankOrigin::Docs,
+                        }
+                    })
+                    .collect();
+
+                let p1_scored: Vec<(usize, f32)> = match ranker.rerank(query, p1_candidates) {
+                    Ok(results) => results
+                        .into_iter()
+                        .filter_map(|r| {
+                            r.source.parse::<usize>().ok().and_then(|pp| {
+                                pool_indices.get(pp).map(|&hi| (hi, r.score))
                             })
-                            .collect()
-                    }
+                        })
+                        .collect(),
                     Err(e) => {
-                        eprintln!("sempkg: reranker error in query ({e}), returning top {limit} RRF hits");
-                        pool_indices.iter().take(limit).map(|&i| (i, hits[i].rrf_score)).collect()
+                        eprintln!(
+                            "sempkg: reranker error in pass-1 ({e}), using RRF order"
+                        );
+                        pool_indices.iter().map(|&i| (i, hits[i].rrf_score)).collect()
+                    }
+                };
+
+                // Select top PASS1_K for expansion pass.
+                let top_indices: Vec<usize> =
+                    p1_scored.iter().take(PASS1_K).map(|&(i, _)| i).collect();
+
+                // ── Pass 2: KWIC-windowed scoring on expanded bodies ──────
+                // Call score_pair() directly per window instead of going through
+                // rerank(), which would silently truncate via its top_k cap
+                // (applied before scoring) and output_n cap (applied after) —
+                // both would drop valid windows when total windows > top_k.
+                //
+                // By calling score_pair() ourselves we score every window of
+                // every top-k hit, regardless of how many windows a large body
+                // produces, and we accumulate the maximum per hit without losing
+                // any candidates to internal caps.
+                reranker_was_active = true;
+                let mut best: HashMap<usize, (f32, usize)> = HashMap::new();
+
+                for (tp, &hi) in top_indices.iter().enumerate() {
+                    let body = {
+                        let h = &hits[hi];
+                        h.expanded_text
+                            .as_deref()
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or(if !h.snippet.is_empty() {
+                                h.snippet.as_str()
+                            } else {
+                                h.path.as_str()
+                            })
+                            .to_string()
+                    };
+                    let windows = kwic_windows(&body);
+                    for (wi, window) in windows.iter().enumerate() {
+                        let text = hit_candidate_text_with_body(&hits[hi], window);
+                        let score = ranker.score_pair(query, &text).unwrap_or(0.0);
+                        let e = best.entry(tp).or_insert((f32::NEG_INFINITY, 0));
+                        if score > e.0 {
+                            *e = (score, wi);
+                        }
                     }
                 }
+
+                // Write best_window / best_window_first / kwic_count back into
+                // each hit.  Body + windows are recomputed cheaply from the
+                // already-fetched expanded_text — no second DB round-trip.
+                for (tp, &hi) in top_indices.iter().enumerate() {
+                    if let Some(&(_, wi)) = best.get(&tp) {
+                        let body = {
+                            let h = &hits[hi];
+                            h.expanded_text
+                                .as_deref()
+                                .filter(|s| !s.is_empty())
+                                .unwrap_or(if !h.snippet.is_empty() {
+                                    h.snippet.as_str()
+                                } else {
+                                    h.path.as_str()
+                                })
+                                .to_string()
+                        };
+                        let windows = kwic_windows(&body);
+                        let n = windows.len();
+                        hits[hi].best_window = windows.into_iter().nth(wi);
+                        hits[hi].best_window_first = wi == 0;
+                        hits[hi].kwic_count = n;
+                    }
+                }
+
+                // Final ranking: sort top_indices by their best pass-2 score.
+                let mut final_scored: Vec<(usize, f32)> = top_indices
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(tp, &hi)| best.get(&tp).map(|&(s, _)| (hi, s)))
+                    .collect();
+                final_scored.sort_by(|a, b| {
+                    b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                final_scored.into_iter().take(limit).collect()
             } else {
                 // No reranker — return top N from the diversity-selected pool, scored by RRF.
                 pool_indices.iter().take(limit).map(|&i| (i, hits[i].rrf_score)).collect()
             }
         };
+
 
         // ── Relevance floor ──────────────────────────────────────────────
         // Drop results the reranker considers irrelevant.  Only applied when

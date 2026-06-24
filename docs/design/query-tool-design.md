@@ -18,9 +18,8 @@ Internally the tool:
 2. deduplicates hits that refer to the same symbol (codegraph and code-index often return the same function),
 3. merges the deduplicated result sets with Reciprocal Rank Fusion,
 4. applies a diversity cap to guarantee balanced source representation,
-5. **expands** each pool hit to its full symbol body (small-to-big retrieval),
-6. scores the resulting pool with the local Qwen3 reranker (when loaded), and
-7. returns rich markdown annotated with package provenance, score, file, lines, and a snippet.
+5. **two-pass reranks**: a cheap snippet-based pass narrows the pool to 5 candidates, then a full small-to-big expansion with KWIC windowing gives the cross-encoder the richest possible evidence, and
+6. returns rich markdown annotated with package provenance, score, file, lines, and a tiered snippet.
 
 ---
 
@@ -203,15 +202,77 @@ already present in every result.
 
 ---
 
-## 7. Reranking
+## 7. Two-pass Reranking with KWIC Windowing
 
-The diversity-selected pool (up to `pool_size` candidates) is submitted to the local
-Qwen3-Reranker cross-encoder (see [`reranker-design.md`](reranker-design.md)).  The reranker
-scores each `(query, candidate_text)` pair and returns results sorted by descending relevance.
-The top `limit` results (default 10, configurable per call) are kept.
+Feeding entire expanded symbol bodies to the cross-encoder causes two problems:
 
-When the reranker model is not loaded (feature disabled or model not yet downloaded) the tool
-falls back to returning the top `limit` hits from the diversity-selected pool, scored by RRF.
+1. **Token overflow** — large functions (500+ lines) can exceed the model's 4096-token context
+   window, causing silent truncation and potentially discarding the most relevant part of the body.
+2. **Relevance dilution** — a long function body where only 10 lines are relevant to the query
+   will score lower than a short function that is entirely relevant, even though the long function
+   is the correct answer.
+
+### 7.1 Cheap first pass (pass-1)
+
+All `pool_size` diversity-selected hits are scored using their **display snippets** (already in
+memory, no DB access, typically ≤ 600 chars).  The reranker's `rerank()` method handles the full
+pool in one call.  The top `PASS1_K = 5` candidates are promoted to the expensive second pass;
+all other hits are discarded.
+
+Pass-1 is intentionally cheap: it exists only to filter obviously irrelevant hits before the
+costly expansion and windowing step.  Score accuracy at this stage is secondary.
+
+### 7.2 Expensive second pass (pass-2)
+
+For each of the top-5 candidates:
+
+1. **Expand**: fetch the full symbol body from the code index if not already done (small-to-big).
+2. **Window**: split the body into overlapping KWIC windows (`KWIC_WINDOW_CHARS = 1 500` chars,
+   `KWIC_STRIDE_CHARS = 750` chars — 50 % overlap).
+3. **Score**: call `Reranker::score_pair(query, window)` directly for each window.
+4. **Max-pool**: the hit's final pass-2 score is the **maximum** across all its windows.
+5. Record which window index achieved the max — used for the tiered display.
+
+Calling `score_pair()` directly (rather than `rerank()`) is essential: `rerank()` applies both a
+`top_k` cap before scoring and an `output_n` cap after, both of which silently drop windows when
+the total window count across all hits exceeds either limit.  Pass-2 must score every window of
+every top-k hit without truncation.
+
+### 7.3 Token budget for KWIC windows
+
+The Qwen3-Reranker-0.6B model is loaded with `n_ctx = 4096` tokens.
+
+| Component | Tokens (est.) |
+|-----------|---------------|
+| System prompt + instruction template | ~85 |
+| Typical query | ~10 – 50 |
+| **Total overhead** | **~150** |
+| **Available for document** | **~3 950** |
+| KWIC window (1 500 chars, best case 4 ch/tok for prose) | ~375 |
+| KWIC window (1 500 chars, worst case 1 ch/tok for dense symbols) | ~1 500 |
+| **Max total with worst-case window** | **~1 650** |
+
+1 650 tokens is comfortably within 4 096.  The `tokens.truncate(n_ctx)` guard in `score_pair`
+provides a hard safety net even for pathological inputs.
+
+### 7.4 Performance profile
+
+```
+pass-1 calls:  pool_size  (≤ 20)  — scored in one rerank() batch
+pass-2 calls:  PASS1_K × N_windows  (typically 5 × 1–3 = 5–15)
+```
+
+For a function with no expansion (body ≤ 600 chars) `N_windows = 1`; pass-2 adds only 5 extra
+cross-encoder calls compared to the original single-pass approach, while correctly handling
+bodies that would otherwise overflow the context window.
+
+### 7.5 Graceful degradation
+
+- If the reranker is not loaded, the pipeline falls back to the top-`limit` diversity-selected
+  hits scored by RRF.
+- If pass-1 returns an error, the fallback is the top-`limit` pool hits by RRF.
+- Individual `score_pair` failures in pass-2 return `0.0` (via `unwrap_or(0.0)`) and do not
+  abort the pass; the hit may still rank if other windows scored above zero.
 
 ---
 
@@ -227,16 +288,27 @@ exists.
 
 ---
 
-## 9. Output Format
+## 9. Output Format — Tiered Display Snippet
 
-Each result is rendered as a markdown section containing:
+Instead of always showing the same truncated 600-char snippet, the display adapts to where the
+relevance was found:
 
-- **Heading** — rank number, symbol name or path, kind, and reranker score
-- **Metadata table** — package, origin (code / docs / codegraph), source file, line range
-- **Signature** — if present (code and codegraph hits)
-- **Snippet** — fenced code block with the relevant excerpt
+| Condition | What is shown |
+|-----------|---------------|
+| `best_window` is absent (no reranker, or fallback path) | Original display snippet verbatim |
+| `best_window_first == true` AND `kwic_count == 1` (compact body, match in opening) | **Signature only** — no snippet block; the heading + signature already capture the relevant information |
+| `best_window_first == true` AND `kwic_count > 1` (large body, opening region matched) | First KWIC window + `+N more lines` affordance |
+| `best_window_first == false` (match found deeper in the body) | Best KWIC window + `+N more lines` affordance |
 
-Results are separated by `---` dividers so agents can parse individual sections.
+The `+N more lines` affordance tells the agent how many lines of the full symbol are not shown
+and provides the exact `read_code` call to retrieve them:
+
+```
+*+42 more lines — call `read_code` with package `mylib@1.0`, file `src/adc.rs`, line `87`*
+```
+
+The `snippet` field on `UnifiedHit` is **never mutated**; `best_window` is stored separately.
+Agents that need the full body after seeing a KWIC window can call `read_code` immediately.
 
 ---
 
@@ -259,18 +331,31 @@ query string
                               greedy diversity selection
                               per-(package,origin) cap = pool_size/3
                                         │
-                              small-to-big expansion
-                              fetch full symbol body from code index
-                              location-keyed → name-keyed fallback
-                              docs hits skipped (already natural unit)
+                     ┌── Pass 1 (cheap) ─────────────────────────────┐
+                     │  score all pool hits with display snippet      │
+                     │  rerank() batch call (one context per hit)     │
+                     │  select top PASS1_K = 5 candidates             │
+                     └───────────────────────────────────────────────┘
                                         │
-                              Qwen3-Reranker
-                              score each (query, expanded_text|snippet) pair
+                     ┌── Small-to-big expansion ──────────────────────┐
+                     │  fetch full symbol body from code index        │
+                     │  location-keyed → name-keyed fallback          │
+                     │  docs hits skipped (already natural unit)      │
+                     └───────────────────────────────────────────────┘
+                                        │
+                     ┌── Pass 2 (expensive) ──────────────────────────┐
+                     │  split each expanded body into KWIC windows    │
+                     │  KWIC_WINDOW_CHARS=1500, KWIC_STRIDE_CHARS=750 │
+                     │  score_pair() called per window (no top_k cap) │
+                     │  hit score = max(window scores)                │
+                     │  record best window + whether it is window 0   │
+                     └───────────────────────────────────────────────┘
                                         │
                               relevance floor 0.10 (reranker mode only)
                                         │
-                              top limit results
-                              formatted as markdown
+                              tiered display snippet
+                              sig-only / KWIC window / raw snippet
+                              +N more lines → read_code affordance
 ```
 
 ---
