@@ -237,6 +237,23 @@ fn all_tools() -> Value {
             }),
             &["package", "file", "line"]
         ),
+        tool_schema(
+            "query",
+            "Unified cross-package search. Submit a natural-language question or keyword query \
+             (e.g. 'Where does ADC sampling happen?') and receive ranked results from every \
+             installed bundle and local package. Searches code indexes, documentation indexes, \
+             and CodeGraph symbol tables across all packages in a single call, then re-ranks \
+             all candidates together with the local reranker (when available). \
+             Returns rich markdown with package provenance, relevance score, source file, \
+             line range, and a source snippet for each hit. \
+             Use the other MCP tools (read_code, read_symbol, search_symbols, …) to drill \
+             into specific results.",
+            json!({
+                "query": { "type": "string", "description": "Natural-language or keyword search query" },
+                "limit": { "type": "integer", "description": "Max results to return after reranking (default 10)" }
+            }),
+            &["query"]
+        ),
     ])
 }
 
@@ -354,6 +371,124 @@ fn fmt_lance_results(
         })
         .collect::<Vec<_>>()
         .join("\n\n---\n\n")
+}
+
+// ---------------------------------------------------------------------------
+// Unified query — cross-package hit type
+// ---------------------------------------------------------------------------
+
+/// A single search hit collected from any source (code index, docs, codegraph).
+struct UnifiedHit {
+    /// "pkg@version" or local package name.
+    package: String,
+    /// "code", "docs", or "codegraph".
+    origin: &'static str,
+    /// Source file path as recorded in the index.
+    path: String,
+    /// 1-based start line (0 = unknown).
+    start_line: u32,
+    /// 1-based end line (0 = unknown).
+    end_line: u32,
+    /// Text excerpt (snippet, signature, or synthesised description).
+    snippet: String,
+    /// Symbol name, if applicable.
+    symbol: Option<String>,
+    /// Symbol kind, if applicable.
+    kind: Option<String>,
+    /// Symbol signature, if applicable.
+    signature: Option<String>,
+}
+
+/// Build the text string submitted to the reranker for a `UnifiedHit`.
+fn unified_hit_candidate_text(h: &UnifiedHit) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    if let Some(k) = h.kind.as_deref() {
+        if !k.is_empty() {
+            parts.push(k);
+        }
+    }
+    if let Some(sym) = h.symbol.as_deref() {
+        if !sym.is_empty() {
+            parts.push(sym);
+        }
+    }
+    let prefix = parts.join(" ");
+
+    let sig = h.signature.as_deref().unwrap_or("");
+    let body = if !h.snippet.is_empty() {
+        h.snippet.as_str()
+    } else if !sig.is_empty() {
+        sig
+    } else {
+        h.path.as_str()
+    };
+
+    if prefix.is_empty() {
+        body.to_string()
+    } else {
+        format!("{prefix}: {body}")
+    }
+}
+
+/// Format a `UnifiedHit` as a markdown section for the `query` tool output.
+fn format_unified_hit(h: &UnifiedHit, rank: usize, score: Option<f32>) -> String {
+    // ── Header line ──────────────────────────────────────────────────────
+    let score_str = match score {
+        Some(s) => format!(" · score {s:.3}"),
+        None => String::new(),
+    };
+    let label = h
+        .symbol
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(&h.path);
+    let kind_str = h
+        .kind
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(|k| format!(" ({k})"))
+        .unwrap_or_default();
+
+    let header = format!("### {rank}. `{label}`{kind_str}{score_str}");
+
+    // ── Metadata table ───────────────────────────────────────────────────
+    let lines_str = if h.start_line > 0 && h.end_line > 0 {
+        format!("{} – {}", h.start_line, h.end_line)
+    } else if h.start_line > 0 {
+        h.start_line.to_string()
+    } else {
+        "—".to_string()
+    };
+
+    let meta = format!(
+        "| Field | Value |\n\
+         |-------|-------|\n\
+         | **Package** | `{package}` |\n\
+         | **Origin** | {origin} |\n\
+         | **Source** | `{path}` |\n\
+         | **Lines** | {lines} |",
+        package = h.package,
+        origin = h.origin,
+        path = h.path,
+        lines = lines_str,
+    );
+
+    // ── Signature (if present) ───────────────────────────────────────────
+    let sig_block = h
+        .signature
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(|s| format!("\n**Signature:** `{s}`"))
+        .unwrap_or_default();
+
+    // ── Snippet ──────────────────────────────────────────────────────────
+    let snippet_block = if h.snippet.is_empty() {
+        String::new()
+    } else {
+        format!("\n```\n{}\n```", h.snippet)
+    };
+
+    format!("{header}\n\n{meta}{sig_block}{snippet_block}")
 }
 
 // ---------------------------------------------------------------------------
@@ -677,6 +812,210 @@ impl McpContext {
                 }
             }
         }
+    }
+
+    /// Unified cross-package search: queries code, docs, and codegraph across
+    /// all installed bundles and local packages, then reranks everything together.
+    fn tool_query(&self, query: &str, limit: usize) -> String {
+        let fetch_limit = self.reranker_fetch_limit(limit).max(20);
+        let mut hits: Vec<UnifiedHit> = Vec::new();
+
+        // ── Helper: push codegraph JSON nodes into hits ──────────────────
+        let push_codegraph_hits = |hits: &mut Vec<UnifiedHit>, pkg_name: &str, raw_json: &str| {
+            let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(raw_json) else {
+                return;
+            };
+            for v in arr {
+                let node = v.get("node").cloned().unwrap_or_else(|| v.clone());
+                let get_str = |k: &str| {
+                    node.get(k)
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string()
+                };
+                let qualified = get_str("qualifiedName");
+                let name = get_str("name");
+                let label = if !qualified.is_empty() { qualified } else { name };
+                let kind = get_str("kind");
+                let sig = get_str("signature");
+                let file = get_str("filePath");
+                let start = node
+                    .get("startLine")
+                    .and_then(|x| x.as_u64())
+                    .unwrap_or(0) as u32;
+                let end = node
+                    .get("endLine")
+                    .and_then(|x| x.as_u64())
+                    .unwrap_or(0) as u32;
+                let snippet = if !sig.is_empty() {
+                    sig.clone()
+                } else {
+                    format!("{kind} {label}")
+                };
+                hits.push(UnifiedHit {
+                    package: pkg_name.to_string(),
+                    origin: "codegraph",
+                    path: file,
+                    start_line: start,
+                    end_line: end,
+                    snippet,
+                    symbol: Some(label),
+                    kind: Some(kind),
+                    signature: Some(sig),
+                });
+            }
+        };
+
+        // ── Installed bundles ────────────────────────────────────────────
+        let bundles = list_all_bundles(self.workspace().map(|p| p.as_path()));
+        for bundle in &bundles {
+            let pkg_name = format!("{}@{}", bundle.name, bundle.version);
+
+            // Source-code index
+            if bundle.has_code() {
+                let code_dir = bundle.bundle_dir.join("code");
+                if let Ok(results) = lance::search_code(&code_dir, query, fetch_limit) {
+                    for r in results {
+                        hits.push(UnifiedHit {
+                            package: pkg_name.clone(),
+                            origin: "code",
+                            path: r.path,
+                            start_line: r.start_line,
+                            end_line: r.end_line,
+                            snippet: r.snippet,
+                            symbol: r.symbol,
+                            kind: r.kind,
+                            signature: r.signature,
+                        });
+                    }
+                }
+            }
+
+            // Documentation index
+            if bundle.has_lance() {
+                let lance_dir = bundle.bundle_dir.join("lance");
+                if let Ok(results) = lance::search(&lance_dir, query, fetch_limit) {
+                    for r in results {
+                        hits.push(UnifiedHit {
+                            package: pkg_name.clone(),
+                            origin: "docs",
+                            path: r.path,
+                            start_line: r.start_line,
+                            end_line: r.end_line,
+                            snippet: r.snippet,
+                            symbol: r.symbol,
+                            kind: r.kind,
+                            signature: r.signature,
+                        });
+                    }
+                }
+            }
+
+            // CodeGraph symbol search
+            if bundle.is_indexed() {
+                if let Ok(raw) = codegraph::query(&bundle.bundle_dir, query, None, fetch_limit) {
+                    push_codegraph_hits(&mut hits, &pkg_name, &raw);
+                }
+            }
+        }
+
+        // ── Local packages ───────────────────────────────────────────────
+        for pkg in self.registry.list() {
+            let pkg_name = pkg.name.clone();
+
+            // Lance docs index at <pkg>/.sempkg/lance/
+            let lance_dir = pkg.abs_path().join(".sempkg").join("lance");
+            if lance_dir.is_dir() {
+                if let Ok(results) = lance::search(&lance_dir, query, fetch_limit) {
+                    for r in results {
+                        hits.push(UnifiedHit {
+                            package: pkg_name.clone(),
+                            origin: "docs",
+                            path: r.path,
+                            start_line: r.start_line,
+                            end_line: r.end_line,
+                            snippet: r.snippet,
+                            symbol: r.symbol,
+                            kind: r.kind,
+                            signature: r.signature,
+                        });
+                    }
+                }
+            }
+
+            // CodeGraph
+            if pkg.is_indexed() {
+                if let Ok(raw) = codegraph::query(&pkg.abs_path(), query, None, fetch_limit) {
+                    push_codegraph_hits(&mut hits, &pkg_name, &raw);
+                }
+            }
+        }
+
+        if hits.is_empty() {
+            return format!(
+                "No results found for: `{query}`\n\n\
+                 Make sure at least one package is indexed or a bundle with a code/docs \
+                 index is installed (`sempkg list`)."
+            );
+        }
+
+        // ── Rerank ───────────────────────────────────────────────────────
+        let candidates: Vec<reranker::RerankCandidate> = hits
+            .iter()
+            .enumerate()
+            .map(|(i, h)| reranker::RerankCandidate {
+                source: i.to_string(),
+                text: unified_hit_candidate_text(h),
+                origin: if h.origin == "codegraph" {
+                    reranker::RerankOrigin::Codegraph
+                } else {
+                    reranker::RerankOrigin::Docs
+                },
+            })
+            .collect();
+
+        let scored: Vec<(usize, f32)> = {
+            let mut guard = self.reranker.borrow_mut();
+            if let Some(ranker) = guard.as_mut() {
+                match ranker.rerank(query, candidates) {
+                    Ok(results) => results
+                        .into_iter()
+                        .take(limit)
+                        .filter_map(|r| r.source.parse::<usize>().ok().map(|i| (i, r.score)))
+                        .collect(),
+                    Err(e) => {
+                        eprintln!("sempkg: reranker error in query ({e}), returning first {limit} hits");
+                        hits.iter().enumerate().take(limit).map(|(i, _)| (i, 0.0)).collect()
+                    }
+                }
+            } else {
+                // No reranker — return top N in retrieval order with no score.
+                hits.iter().enumerate().take(limit).map(|(i, _)| (i, 0.0)).collect()
+            }
+        };
+
+        if scored.is_empty() {
+            return format!("No results for: `{query}`.");
+        }
+
+        // ── Format ───────────────────────────────────────────────────────
+        let has_scores = scored.iter().any(|(_, s)| *s > 0.0);
+        let sections: Vec<String> = scored
+            .iter()
+            .enumerate()
+            .map(|(rank, &(idx, score))| {
+                format_unified_hit(
+                    &hits[idx],
+                    rank + 1,
+                    if has_scores { Some(score) } else { None },
+                )
+            })
+            .collect();
+
+        format!(
+            "## Query results for: `{query}`\n\n{}\n",
+            sections.join("\n\n---\n\n")
+        )
     }
 
     fn tool_read_code(&self, package: &str, file: &str, line: u32) -> String {
@@ -1041,6 +1380,7 @@ impl McpContext {
                     .unwrap_or(0) as u32;
                 self.tool_read_code(str_arg("package"), str_arg("file"), line)
             }
+            "query" => self.tool_query(str_arg("query"), int_arg("limit", 10)),
             _ => format!("Unknown tool: {name}"),
         }
     }
