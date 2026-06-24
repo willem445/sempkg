@@ -486,20 +486,31 @@ fn kwic_windows(text: &str) -> Vec<String> {
     let mut windows: Vec<String> = Vec::new();
     let mut start = 0usize;
     loop {
-        // Snap end to a valid char boundary.
+        // Snap end forward to the next newline so windows never cut mid-line.
         let raw_end = (start + KWIC_WINDOW_CHARS).min(text.len());
-        let end = (raw_end..=text.len())
-            .find(|&i| text.is_char_boundary(i))
-            .unwrap_or(text.len());
+        let end = if raw_end == text.len() {
+            text.len()
+        } else {
+            // Find the next '\n' at or after raw_end; fall back to text.len().
+            text[raw_end..]
+                .find('\n')
+                .map(|rel| raw_end + rel + 1) // include the '\n'
+                .unwrap_or(text.len())
+        };
         windows.push(text[start..end].to_string());
         if end == text.len() {
             break;
         }
-        // Advance by stride, snapping to char boundary.
+        // Advance stride, snapping forward to the next newline boundary.
         let raw_next = start + KWIC_STRIDE_CHARS;
-        let next = (raw_next..=text.len())
-            .find(|&i| text.is_char_boundary(i))
-            .unwrap_or(text.len());
+        let next = if raw_next >= text.len() {
+            text.len()
+        } else {
+            text[raw_next..]
+                .find('\n')
+                .map(|rel| raw_next + rel + 1)
+                .unwrap_or(text.len())
+        };
         if next <= start {
             break; // safety: never loop if stride maps to zero advance
         }
