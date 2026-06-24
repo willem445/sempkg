@@ -1436,22 +1436,22 @@ impl McpContext {
                     })
                     .collect();
 
-                let p1_scored: Vec<(usize, f32)> = match ranker.rerank(query, p1_candidates) {
-                    Ok(results) => results
-                        .into_iter()
-                        .filter_map(|r| {
-                            r.source.parse::<usize>().ok().and_then(|pp| {
-                                pool_indices.get(pp).map(|&hi| (hi, r.score))
-                            })
-                        })
-                        .collect(),
-                    Err(e) => {
-                        eprintln!(
-                            "sempkg: reranker error in pass-1 ({e}), using RRF order"
-                        );
-                        pool_indices.iter().map(|&i| (i, hits[i].rrf_score)).collect()
-                    }
-                };
+                // Score every candidate with score_pair() directly — no
+                // top_k or output_n truncation, which rerank() applies
+                // internally and would cap p1_scored to output_n (= 5)
+                // regardless of how large pass2_budget or limit are.
+                let mut p1_scored: Vec<(usize, f32)> = p1_candidates
+                    .iter()
+                    .enumerate()
+                    .map(|(pp, c)| {
+                        let score = ranker.score_pair(query, &c.text).unwrap_or(0.0);
+                        let hi = pool_indices[pp];
+                        (hi, score)
+                    })
+                    .collect();
+                p1_scored.sort_by(|a, b| {
+                    b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+                });
 
                 // Promote the top `pass2_budget` hits to the expensive pass.
                 // Budget tracks `limit` so output is not capped at PASS1_K;
