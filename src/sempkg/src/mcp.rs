@@ -397,11 +397,12 @@ struct UnifiedHit {
     kind: Option<String>,
     /// Symbol signature, if applicable.
     signature: Option<String>,
-    /// Normalised retrieval score used to sort candidates from all packages
-    /// before the reranker's top_k cut.  Computed as reciprocal rank within
-    /// each source (1/(pos+1)) so that rank-1 hits from every package compete
-    /// equally for reranker slots regardless of collection order.
-    bm25_rank: f32,
+    /// Reciprocal Rank Fusion score: `1 / (k + rank)` where k=60 and rank is
+    /// the 1-based position within this source's own result list.  Applied
+    /// uniformly across all origins (code, docs, codegraph) so that no source
+    /// can dominate via a different score scale.  Used to sort globally before
+    /// the reranker pool is assembled.
+    rrf_score: f32,
 }
 
 /// Build the text string submitted to the reranker for a `UnifiedHit`.
@@ -857,13 +858,11 @@ impl McpContext {
                 } else {
                     format!("{kind} {label}")
                 };
-                // Use the envelope score when present (preserves relative ordering
-                // within this package); fall back to reciprocal rank.
-                let bm25_rank = v
-                    .get("score")
-                    .and_then(|s| s.as_f64())
-                    .map(|s| s as f32)
-                    .unwrap_or_else(|| 1.0 / (pos as f32 + 1.0));
+                // Uniform RRF — do NOT use the codegraph envelope score here.
+                // Codegraph BM25 and lance BM25 are on different scales; mixing
+                // them biases the global sort.  Rank position is the only
+                // comparable signal across heterogeneous sources.
+                let rrf_score = 1.0 / (60.0 + pos as f32 + 1.0);
                 hits.push(UnifiedHit {
                     package: pkg_name.to_string(),
                     origin: "codegraph",
@@ -874,7 +873,7 @@ impl McpContext {
                     symbol: Some(label),
                     kind: Some(kind),
                     signature: Some(sig),
-                    bm25_rank,
+                    rrf_score,
                 });
             }
         };
@@ -899,7 +898,7 @@ impl McpContext {
                             symbol: r.symbol,
                             kind: r.kind,
                             signature: r.signature,
-                            bm25_rank: 1.0 / (pos as f32 + 1.0),
+                            rrf_score: 1.0 / (60.0 + pos as f32 + 1.0),
                         });
                     }
                 }
@@ -920,7 +919,7 @@ impl McpContext {
                             symbol: r.symbol,
                             kind: r.kind,
                             signature: r.signature,
-                            bm25_rank: 1.0 / (pos as f32 + 1.0),
+                            rrf_score: 1.0 / (60.0 + pos as f32 + 1.0),
                         });
                     }
                 }
@@ -953,7 +952,7 @@ impl McpContext {
                             symbol: r.symbol,
                             kind: r.kind,
                             signature: r.signature,
-                            bm25_rank: 1.0 / (pos as f32 + 1.0),
+                            rrf_score: 1.0 / (60.0 + pos as f32 + 1.0),
                         });
                     }
                 }
@@ -975,25 +974,51 @@ impl McpContext {
             );
         }
 
-        // ── Sort by retrieval rank before reranking ───────────────────────
-        // Sorting globally by bm25_rank ensures that the top-scoring candidates
-        // from every package are interleaved at the front of the list.  The
-        // reranker's internal top_k cut then sees a fair cross-package pool
-        // instead of being dominated by whichever package was enumerated first.
+        // ── Global RRF sort ───────────────────────────────────────────────
+        // All sources used the same RRF formula so this sort is apples-to-apples.
+        // Rank-1 from every (package, origin) pair competes fairly.
         hits.sort_by(|a, b| {
-            b.bm25_rank
-                .partial_cmp(&a.bm25_rank)
+            b.rrf_score
+                .partial_cmp(&a.rrf_score)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        // ── Rerank ───────────────────────────────────────────────────────
-        let candidates: Vec<reranker::RerankCandidate> = hits
+        // ── Diversity selection ───────────────────────────────────────────
+        // Greedy pass over the RRF-sorted list: accept each hit until its
+        // (package, origin) bucket is full, stopping once the pool has
+        // `pool_size` items.  This prevents any single source (e.g. codegraph
+        // from one large package) from monopolising the reranker's top_k slots.
+        //
+        // max_per_bucket ≈ pool_size / 3 so the three origins (code, docs,
+        // codegraph) each get roughly equal representation.
+        let pool_size = fetch_limit;
+        let max_per_bucket = (pool_size / 3).max(3);
+        let mut bucket_counts: HashMap<(String, &'static str), usize> = HashMap::new();
+        let pool_indices: Vec<usize> = hits
             .iter()
             .enumerate()
-            .map(|(i, h)| reranker::RerankCandidate {
-                source: i.to_string(),
-                text: unified_hit_candidate_text(h),
-                origin: if h.origin == "codegraph" {
+            .filter_map(|(i, h)| {
+                let count = bucket_counts
+                    .entry((h.package.clone(), h.origin))
+                    .or_insert(0);
+                if *count < max_per_bucket {
+                    *count += 1;
+                    Some(i)
+                } else {
+                    None
+                }
+            })
+            .take(pool_size)
+            .collect();
+
+        // ── Rerank ───────────────────────────────────────────────────────
+        let candidates: Vec<reranker::RerankCandidate> = pool_indices
+            .iter()
+            .enumerate()
+            .map(|(pool_pos, &hit_idx)| reranker::RerankCandidate {
+                source: pool_pos.to_string(),
+                text: unified_hit_candidate_text(&hits[hit_idx]),
+                origin: if hits[hit_idx].origin == "codegraph" {
                     reranker::RerankOrigin::Codegraph
                 } else {
                     reranker::RerankOrigin::Docs
@@ -1008,16 +1033,20 @@ impl McpContext {
                     Ok(results) => results
                         .into_iter()
                         .take(limit)
-                        .filter_map(|r| r.source.parse::<usize>().ok().map(|i| (i, r.score)))
+                        .filter_map(|r| {
+                            r.source.parse::<usize>().ok().and_then(|pool_pos| {
+                                pool_indices.get(pool_pos).map(|&hit_idx| (hit_idx, r.score))
+                            })
+                        })
                         .collect(),
                     Err(e) => {
-                        eprintln!("sempkg: reranker error in query ({e}), returning first {limit} hits");
-                        hits.iter().enumerate().take(limit).map(|(i, _)| (i, 0.0)).collect()
+                        eprintln!("sempkg: reranker error in query ({e}), returning top {limit} RRF hits");
+                        pool_indices.iter().take(limit).map(|&i| (i, hits[i].rrf_score)).collect()
                     }
                 }
             } else {
-                // No reranker — return top N sorted by retrieval rank.
-                hits.iter().enumerate().take(limit).map(|(i, h)| (i, h.bm25_rank)).collect()
+                // No reranker — return top N from the diversity-selected pool, scored by RRF.
+                pool_indices.iter().take(limit).map(|&i| (i, hits[i].rrf_score)).collect()
             }
         };
 

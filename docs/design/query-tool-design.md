@@ -1,0 +1,139 @@
+# Query Tool Design Note
+
+**Date:** 2026-06-24
+**Status:** Implemented
+**Scope:** `src/sempkg/src/mcp.rs` — `tool_query` method and `UnifiedHit` type
+
+---
+
+## 1. Overview
+
+The `query` MCP tool is a single cross-package entry point for natural-language or keyword
+searches.  An agent submits a free-form question (e.g. *"Where does ADC sampling happen?"*) and
+receives ranked results drawn from every installed bundle and registered local package, without
+needing to know which package to target first.
+
+Internally the tool:
+1. fans out to all available retrieval backends across all packages,
+2. merges the heterogeneous result sets with Reciprocal Rank Fusion,
+3. applies a diversity cap to guarantee balanced source representation, then
+4. scores the resulting pool with the local Qwen3 reranker (when loaded) and
+5. returns rich markdown annotated with package provenance, score, file, lines, and a snippet.
+
+---
+
+## 2. Retrieval Fan-out
+
+For each installed bundle and local package the tool queries whichever backends that package
+exposes:
+
+| Backend | Condition | Description |
+|---------|-----------|-------------|
+| **Code index** (`lance/code`) | bundle built with `--include-source` | BM25 full-text search over symbol bodies; returns symbol, kind, signature, and a source snippet |
+| **Docs index** (`lance/docs`) | bundle built with `--include-lance` | BM25 full-text search over documentation chunks |
+| **CodeGraph** (`graph/codegraph.db`) | any indexed package or bundle | SQLite FTS symbol search returning name, kind, signature, and file location |
+
+Each backend is queried for `fetch_limit` candidates (`max(top_k, 20)` where `top_k` comes from
+`[reranker] top_k` in `sempkg.toml`).
+
+---
+
+## 3. Reciprocal Rank Fusion
+
+Results from the three backends arrive on incompatible score scales: CodeGraph uses SQLite FTS
+BM25, the LanceDB code index uses LanceDB BM25, and the docs index uses LanceDB BM25 with
+different corpus statistics.  Mixing raw scores would systematically favour whichever backend
+happens to return the highest absolute values.
+
+All hits are instead assigned a uniform **RRF score**:
+
+$$
+\text{rrf}(d) = \frac{1}{k + \text{rank}(d)}
+$$
+
+where $k = 60$ (the standard Cormack & Clarke constant) and $\text{rank}(d)$ is the 1-based
+position of the result within its own source's ranked list.  This maps every backend onto the
+same scale — rank-1 from code, docs, and codegraph are all equally valued at $1/61 \approx 0.016$.
+
+After scoring, all hits from all packages are sorted globally by `rrf_score` descending.
+
+---
+
+## 4. Diversity Selection
+
+A single large package with all three backends active could still fill the reranker's `top_k`
+pool before smaller packages or less-used origins contribute anything.
+
+After the RRF sort a **greedy diversity pass** enforces a per-`(package, origin)` bucket cap:
+
+```
+max_per_bucket = pool_size / 3   (minimum 3)
+```
+
+The pass iterates through the RRF-sorted list and accepts each hit into the pool unless its
+bucket is already full, stopping once `pool_size` candidates have been selected.  With three
+origins and a typical `pool_size` of 20 this gives each origin up to ~6 slots per package,
+preventing any single source from monopolising the pool the reranker will actually score.
+
+---
+
+## 5. Reranking
+
+The diversity-selected pool (up to `pool_size` candidates) is submitted to the local
+Qwen3-Reranker cross-encoder (see [`reranker-design.md`](reranker-design.md)).  The reranker
+scores each `(query, candidate_text)` pair and returns results sorted by descending relevance.
+The top `limit` results (default 10, configurable per call) are kept.
+
+When the reranker model is not loaded (feature disabled or model not yet downloaded) the tool
+falls back to returning the top `limit` hits from the diversity-selected pool, scored by RRF.
+
+---
+
+## 6. Output Format
+
+Each result is rendered as a markdown section containing:
+
+- **Heading** — rank number, symbol name or path, kind, and reranker score
+- **Metadata table** — package, origin (code / docs / codegraph), source file, line range
+- **Signature** — if present (code and codegraph hits)
+- **Snippet** — fenced code block with the relevant excerpt
+
+Results are separated by `---` dividers so agents can parse individual sections.
+
+---
+
+## 7. Pipeline Summary
+
+```
+query string
+     │
+     ├─► lance::search_code  (per package with code index)  ──┐
+     ├─► lance::search       (per package with docs index)  ──┤  RRF score
+     └─► codegraph::query    (per indexed package)          ──┤  1/(60+rank)
+                                                              │
+                                          global sort by rrf_score
+                                                              │
+                                   greedy diversity selection
+                                   per-(package,origin) cap = pool_size/3
+                                                              │
+                                        Qwen3-Reranker
+                                        score each (query, text) pair
+                                                              │
+                                       top limit results
+                                       formatted as markdown
+```
+
+---
+
+## 8. Future Directions
+
+The query tool is designed to be a stable insertion point for improved retrieval.  Planned
+enhancements (tracked in the roadmap):
+
+- **Query expansion** — a local LLM generates sub-queries or synonym expansions before fan-out
+- **Parallel vector search** — dense embedding search alongside BM25, merged via RRF before the
+  diversity step
+- **Parallel BM25 + vector per source** — for each backend, run both lexical and semantic search
+  and fuse within-source before the cross-source merge
+- **Configurable bucket caps** — expose `max_per_bucket` and `pool_size` in `sempkg.toml` under
+  a `[query]` section so operators can tune diversity vs. recall trade-offs per deployment
