@@ -167,6 +167,13 @@ BM25 retrieval (fine-grained)     ─► small candidate pool
 For each pool hit the expansion function (`McpContext::expand_pool_hits`) attempts two lookups
 in priority order:
 
+The code index directory is resolved via `resolve_code_path`, which must handle the
+`name@version` package identifiers that pool hits carry (e.g. `sempkg@0.2.0`).  Resolution goes
+through `store::resolve_bundle_spec`, which splits any `@version` suffix and looks the bundle up
+by exact `(name, version)` before falling back to the latest version for a bare name.  Using the
+plain `resolve_bundle` here would filter on `name == "sempkg@0.2.0"` and never match, leaving
+every bundle hit unexpanded.
+
 1. **Location-keyed lookup** — `lance::fetch_symbol_at_location(code_dir, path, start_line)`.
    Uses the file path and start line recorded in the hit to retrieve the exact `SymbolSource`
    row from the code index.  This is the primary path for `code` origin hits because the
@@ -195,10 +202,19 @@ one-liner whose signature _is_ the full body).
 ### 6.4 Display vs. reranker input
 
 The `snippet` field on `UnifiedHit` is **never mutated** during expansion.  The `expanded_text`
-field is stored separately and consumed only by `unified_hit_candidate_text` when building the
-reranker input string.  The output markdown always shows the original display snippet.  Agents
+field is stored separately and consumed only when building the reranker input string.  The
+output markdown always shows the original display snippet.  Agents
 that need the full body can call the `read_code` tool with the path and line numbers that are
 already present in every result.
+
+### 6.5 Debug tracing
+
+Because a silent expansion failure degrades every downstream stage (no `expanded_text` → a
+single KWIC window → always Tier 1), `expand_pool_hits` counts how many hits were *attempted*,
+*resolved* (code directory found), and *expanded* (body actually written).  When the
+`SEMPKG_DEBUG` environment variable is set these counts are printed to stderr.  A healthy run
+shows `resolved > 0` and `expanded > 0` for code hits; `resolved == 0` indicates a path
+resolution regression like the `name@version` bug fixed in §6.1.
 
 ---
 
@@ -216,15 +232,28 @@ Feeding entire expanded symbol bodies to the cross-encoder causes two problems:
 
 All `pool_size` diversity-selected hits are scored using their **display snippets** (already in
 memory, no DB access, typically ≤ 600 chars).  The reranker's `rerank()` method handles the full
-pool in one call.  The top `PASS1_K = 5` candidates are promoted to the expensive second pass;
-all other hits are discarded.
+pool in one call.  The pass-1 scores are retained for **every** hit (not just the survivors) so
+that hits beyond the pass-2 budget can still be ordered by their cheap score (see §7.2).
 
 Pass-1 is intentionally cheap: it exists only to filter obviously irrelevant hits before the
 costly expansion and windowing step.  Score accuracy at this stage is secondary.
 
 ### 7.2 Expensive second pass (pass-2)
 
-For each of the top-5 candidates:
+`PASS1_K = 5` bounds only the *expensive* pass-2 work — it must **not** cap the number of results
+returned.  The pass-2 budget therefore tracks the caller's `limit`:
+
+```
+pass2_budget = limit.max(PASS1_K)
+```
+
+The top `pass2_budget` pass-1 survivors are expanded, windowed, and re-scored.  Any hits beyond
+that budget (the *tail*) are appended in pass-1 score order via
+`p1_scored.iter().skip(pass2_budget)`, and the combined list is truncated to `limit`.  This
+decouples result count from the pass-2 work bound: a `limit = 20` query returns 20 results while
+still only paying for KWIC windowing on the top `max(20, 5)` candidates.
+
+For each of the top-`pass2_budget` candidates:
 
 1. **Expand**: fetch the full symbol body from the code index if not already done (small-to-big).
 2. **Window**: split the body into overlapping KWIC windows (`KWIC_WINDOW_CHARS = 1 500` chars,
@@ -259,12 +288,12 @@ provides a hard safety net even for pathological inputs.
 
 ```
 pass-1 calls:  pool_size  (≤ 20)  — scored in one rerank() batch
-pass-2 calls:  PASS1_K × N_windows  (typically 5 × 1–3 = 5–15)
+pass-2 calls:  pass2_budget × N_windows  (typically max(limit,5) × 1–3)
 ```
 
-For a function with no expansion (body ≤ 600 chars) `N_windows = 1`; pass-2 adds only 5 extra
-cross-encoder calls compared to the original single-pass approach, while correctly handling
-bodies that would otherwise overflow the context window.
+For a function with no expansion (body ≤ 600 chars) `N_windows = 1`; pass-2 adds only
+`pass2_budget` extra cross-encoder calls compared to the original single-pass approach, while
+correctly handling bodies that would otherwise overflow the context window.
 
 ### 7.5 Graceful degradation
 
@@ -290,18 +319,25 @@ exists.
 
 ## 9. Output Format — Tiered Display Snippet
 
-Instead of always showing the same truncated 600-char snippet, the display adapts to where the
-relevance was found:
+Instead of always showing the same truncated 600-char snippet, the display adapts to **where the
+query lexically matched** — not to how large the body happens to be:
 
 | Condition | What is shown |
 |-----------|---------------|
 | `best_window` is absent (no reranker, or fallback path) | Original display snippet verbatim |
-| `best_window_first == true` AND `kwic_count == 1` (compact body, match in opening) | **Signature only** — no snippet block; the heading + signature already capture the relevant information |
-| `best_window_first == true` AND `kwic_count > 1` (large body, opening region matched) | First KWIC window + `+N more lines` affordance |
-| `best_window_first == false` (match found deeper in the body) | Best KWIC window + `+N more lines` affordance |
+| Match is in the **name/signature** AND `best_window_first == true` | **Signature only** — no snippet block; the heading + signature already capture the relevant information |
+| Otherwise (match is in the **body**) | Best KWIC window + `+N more lines` affordance — shown even for single-window bodies |
+
+The name-vs-body attribution is computed by `query_matches_name_or_signature(query, hit)`: the
+query is tokenised into alphanumeric terms of length ≥ 3 and matched against the lowercased
+`symbol + signature` haystack; the match is attributed to the name/signature when a **majority**
+of query terms appear there (`matched * 2 >= terms.len()`).  This replaces the earlier size-based
+heuristic (`kwic_count <= 1`), which incorrectly collapsed a small function whose *body* matched
+into a signature-only display.
 
 The `+N more lines` affordance tells the agent how many lines of the full symbol are not shown
-and provides the exact `read_code` call to retrieve them:
+and provides the exact `read_code` call to retrieve them.  It is emitted when the body spans
+multiple KWIC windows (`kwic_count > 1`) or the line-range math shows unseen lines:
 
 ```
 *+42 more lines — call `read_code` with package `mylib@1.0`, file `src/adc.rs`, line `87`*

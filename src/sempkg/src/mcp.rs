@@ -16,7 +16,7 @@ use std::collections::HashMap;
 
 use crate::packages::PackageRegistry;
 use crate::reranker::{self, Reranker, RerankerConfig};
-use crate::store::{list_all_bundles, resolve_bundle};
+use crate::store::{list_all_bundles, resolve_bundle, resolve_bundle_spec};
 use crate::{codegraph, lance};
 
 // Minimum reranker score (P(yes) from the Qwen3 cross-encoder) a result must
@@ -472,30 +472,6 @@ fn hit_candidate_text_with_body(h: &UnifiedHit, body: &str) -> String {
     }
 }
 
-/// Build the text string submitted to the reranker for a `UnifiedHit`.
-///
-/// Prefers `expanded_text` (full symbol body from the small-to-big expansion
-/// pass) over the truncated `snippet`.  Falls back through signature → path
-/// when neither is available.  Used in the no-reranker fallback path and for
-/// pass-1 snippet scoring (before expansion).
-fn unified_hit_candidate_text(h: &UnifiedHit) -> String {
-    let sig = h.signature.as_deref().unwrap_or("");
-    let body = h
-        .expanded_text
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| {
-            if !h.snippet.is_empty() {
-                h.snippet.as_str()
-            } else if !sig.is_empty() {
-                sig
-            } else {
-                h.path.as_str()
-            }
-        });
-    hit_candidate_text_with_body(h, body)
-}
-
 /// Split `text` into overlapping KWIC windows of at most `KWIC_WINDOW_CHARS`
 /// characters with `KWIC_STRIDE_CHARS` stride (≈ 50 % overlap).
 ///
@@ -531,8 +507,52 @@ fn kwic_windows(text: &str) -> Vec<String> {
     windows
 }
 
+/// Decide whether the query matched lexically in the symbol's name or
+/// signature, as opposed to only in the body.  Drives the tiered display:
+/// a name/signature match can be shown as signature-only (the heading + the
+/// `Signature:` line already carry the matched text), whereas a body match
+/// must show the relevant code window.
+///
+/// The match is attribution-based, not size-based: a one-window body that the
+/// query hit *in the body* still shows the window, while a large body whose
+/// name the query hit can collapse to the signature.
+fn query_matches_name_or_signature(query: &str, h: &UnifiedHit) -> bool {
+    let mut haystack = String::new();
+    if let Some(s) = h.symbol.as_deref() {
+        haystack.push_str(s);
+        haystack.push(' ');
+    }
+    if let Some(s) = h.signature.as_deref() {
+        haystack.push_str(s);
+    }
+    let haystack = haystack.to_lowercase();
+    if haystack.trim().is_empty() {
+        return false;
+    }
+
+    // Meaningful query terms: alphanumeric tokens of length >= 3 (drops "the",
+    // "of", "to", and punctuation).
+    let terms: Vec<String> = query
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| t.len() >= 3)
+        .map(|t| t.to_lowercase())
+        .collect();
+    if terms.is_empty() {
+        return false;
+    }
+
+    // Name match when at least half of the meaningful terms appear in the
+    // name/signature.  Requiring a majority avoids treating an incidental
+    // single-term overlap as a full name match.
+    let matched = terms
+        .iter()
+        .filter(|t| haystack.contains(t.as_str()))
+        .count();
+    matched * 2 >= terms.len()
+}
+
 /// Format a `UnifiedHit` as a markdown section for the `query` tool output.
-fn format_unified_hit(h: &UnifiedHit, rank: usize, score: Option<f32>) -> String {
+fn format_unified_hit(h: &UnifiedHit, query: &str, rank: usize, score: Option<f32>) -> String {
     // ── Header line ──────────────────────────────────────────────────────
     let score_str = match score {
         Some(s) => format!(" · score {s:.3}"),
@@ -583,25 +603,24 @@ fn format_unified_hit(h: &UnifiedHit, rank: usize, score: Option<f32>) -> String
         .unwrap_or_default();
 
     // ── Snippet block (tiered display) ───────────────────────────────────
-    // Three tiers, in priority order:
+    // Tier is chosen by *where the query matched*, not by body size:
     //
-    // 1. Name/signature match (compact body, best window is the only window):
-    //    The function is short enough to fit in a single KWIC window and the
-    //    match is in the opening region.  The signature line already shown
-    //    above captures the relevant information; skip the snippet block to
-    //    avoid redundancy.
+    // 1. Name/signature match (`query_matches_name_or_signature`) whose best
+    //    window is the opening region: the heading + `Signature:` line already
+    //    show the matched text, so the code block is omitted as redundant.
     //
-    // 2. Body match with KWIC window:
-    //    The best-scoring window is not the first (match deep in the body) OR
-    //    the body spans multiple windows.  Show the best window with a
-    //    "+N more lines → read_code" affordance so agents can retrieve the
-    //    full implementation when needed.
+    // 2. Body match (query did not hit the name/signature, or the best window
+    //    is deeper in the body): show the best KWIC window with a
+    //    "+N more lines → read_code" affordance.  This fires even for
+    //    single-window bodies — a one-window body matched in its body still
+    //    deserves to show that body.
     //
-    // 3. Default: show the original display snippet verbatim.
+    // 3. No pass-2 window available (no reranker / fallback path): show the
+    //    original display snippet verbatim.
     let snippet_block = if let Some(ref window) = h.best_window {
-        let single_window = h.kwic_count <= 1;
-        if h.best_window_first && single_window {
-            // Tier 1: name/signature match on a compact body.
+        let name_match = query_matches_name_or_signature(query, h);
+        if name_match && h.best_window_first {
+            // Tier 1: lexical name/signature match in the opening region.
             // Signature block already rendered above — no snippet needed.
             String::new()
         } else {
@@ -609,7 +628,9 @@ fn format_unified_hit(h: &UnifiedHit, rank: usize, score: Option<f32>) -> String
             let affordance = if h.start_line > 0 && h.end_line > h.start_line {
                 let total_lines = (h.end_line - h.start_line + 1) as usize;
                 let window_lines = window.lines().count();
-                if total_lines > window_lines + 2 {
+                // A multi-window body always has unseen content; otherwise fall
+                // back to the line-range estimate.
+                if h.kwic_count > 1 || total_lines > window_lines + 2 {
                     let more = total_lines.saturating_sub(window_lines);
                     format!(
                         "\n*+{more} more lines — call `read_code` with \
@@ -1056,6 +1077,10 @@ impl McpContext {
     /// strictly longer than the existing snippet, so truncated snippets are
     /// always replaced by something richer.
     fn expand_pool_hits(&self, hits: &mut Vec<UnifiedHit>, pool_indices: &[usize]) {
+        let debug = std::env::var("SEMPKG_DEBUG").is_ok();
+        let mut attempted = 0usize;
+        let mut resolved = 0usize;
+        let mut expanded = 0usize;
         for &hit_idx in pool_indices {
             // Extract the fields we need before taking any mutable reference.
             let (origin, pkg, path, start_line, symbol) = {
@@ -1066,11 +1091,13 @@ impl McpContext {
             if origin == "docs" {
                 continue;
             }
+            attempted += 1;
 
             let code_dir = match self.resolve_code_path(&pkg) {
                 Ok(d) => d,
                 Err(_) => continue, // no code index for this package
             };
+            resolved += 1;
 
             // Primary: location-keyed lookup (path + start_line).
             let mut full_body: Option<String> = if start_line > 0 {
@@ -1098,8 +1125,18 @@ impl McpContext {
                 let current_len = hits[hit_idx].snippet.len();
                 if body.len() > current_len {
                     hits[hit_idx].expanded_text = Some(body);
+                    expanded += 1;
                 }
             }
+        }
+        if debug {
+            eprintln!(
+                "sempkg: expand_pool_hits — pool={} expandable={} code_dir_resolved={} expanded={}",
+                pool_indices.len(),
+                attempted,
+                resolved,
+                expanded
+            );
         }
     }
 
@@ -1362,17 +1399,18 @@ impl McpContext {
         // Pass 1 (cheap): score every pool hit using its display snippet.
         //   The snippets are already in memory and small enough that the
         //   reranker can process the whole pool in one call.  Output is a
-        //   ranked list; we keep the top PASS1_K entries for the expensive
-        //   second pass.
+        //   ranked list used both to choose pass-2 candidates and to order any
+        //   tail beyond the pass-2 budget.
         //
-        // Pass 2 (expensive): for each pass-1 top-k hit:
+        // Pass 2 (expensive): for each promoted hit:
         //   1. Use the expanded full body (from small-to-big) if available.
         //   2. Split the body into overlapping KWIC windows.
         //   3. Score every (query, window) pair and take the max.
         //   4. Record which window scored best for tiered display.
         //
-        // This means at most PASS1_K × N_windows reranker evaluations on
-        // full bodies, instead of pool_size evaluations.
+        // The pass-2 budget tracks the output `limit` (with PASS1_K as a floor)
+        // so the result count is never capped at PASS1_K.  Hits beyond the
+        // budget keep their cheap pass-1 score and are appended as a tail.
         let mut reranker_was_active = false;
         let scored: Vec<(usize, f32)> = {
             let mut guard = self.reranker.borrow_mut();
@@ -1415,9 +1453,13 @@ impl McpContext {
                     }
                 };
 
-                // Select top PASS1_K for expansion pass.
+                // Promote the top `pass2_budget` hits to the expensive pass.
+                // Budget tracks `limit` so output is not capped at PASS1_K;
+                // PASS1_K is only a floor (small limits still expand a few
+                // candidates so the best of them can be picked accurately).
+                let pass2_budget = limit.max(PASS1_K);
                 let top_indices: Vec<usize> =
-                    p1_scored.iter().take(PASS1_K).map(|&(i, _)| i).collect();
+                    p1_scored.iter().take(pass2_budget).map(|&(i, _)| i).collect();
 
                 // ── Pass 2: KWIC-windowed scoring on expanded bodies ──────
                 // Call score_pair() directly per window instead of going through
@@ -1426,9 +1468,9 @@ impl McpContext {
                 // both would drop valid windows when total windows > top_k.
                 //
                 // By calling score_pair() ourselves we score every window of
-                // every top-k hit, regardless of how many windows a large body
-                // produces, and we accumulate the maximum per hit without losing
-                // any candidates to internal caps.
+                // every promoted hit, regardless of how many windows a large
+                // body produces, and accumulate the maximum per hit without
+                // losing any candidates to internal caps.
                 reranker_was_active = true;
                 let mut best: HashMap<usize, (f32, usize)> = HashMap::new();
 
@@ -1481,7 +1523,7 @@ impl McpContext {
                     }
                 }
 
-                // Final ranking: sort top_indices by their best pass-2 score.
+                // Final ranking: promoted hits sorted by their pass-2 score…
                 let mut final_scored: Vec<(usize, f32)> = top_indices
                     .iter()
                     .enumerate()
@@ -1490,6 +1532,10 @@ impl McpContext {
                 final_scored.sort_by(|a, b| {
                     b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
                 });
+                // …then the cheap pass-1 tail (hits beyond the budget), in
+                // pass-1 order, appended after the expanded set.  This backfills
+                // the output if expanded hits are later dropped by the floor.
+                final_scored.extend(p1_scored.iter().skip(pass2_budget).copied());
                 final_scored.into_iter().take(limit).collect()
             } else {
                 // No reranker — return top N from the diversity-selected pool, scored by RRF.
@@ -1531,6 +1577,7 @@ impl McpContext {
             .map(|(rank, &(idx, score))| {
                 format_unified_hit(
                     &hits[idx],
+                    query,
                     rank + 1,
                     if has_scores { Some(score) } else { None },
                 )
@@ -1797,12 +1844,13 @@ impl McpContext {
 
     /// Resolve a package/bundle name to its code-index directory (`code/`).
     fn resolve_code_path(&self, name: &str) -> Result<PathBuf, String> {
-        if let Some(bundle) = resolve_bundle(name, self.workspace().map(|p| p.as_path())) {
+        // Accept both "name" and "name@version" — query hits carry the version.
+        if let Some(bundle) = resolve_bundle_spec(name, self.workspace().map(|p| p.as_path())) {
             if !bundle.has_code() {
                 return Err(format!(
-                    "Bundle '{name}@{}' does not have a source-code index. \
+                    "Bundle '{}@{}' does not have a source-code index. \
                      Rebuild with 'sembundle build --include-source'.",
-                    bundle.version
+                    bundle.name, bundle.version
                 ));
             }
             return Ok(bundle.bundle_dir.join("code"));

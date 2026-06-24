@@ -502,3 +502,29 @@ pub fn resolve_bundle(name: &str, workspace_dir: Option<&Path>) -> Option<Bundle
     }
     BundleStore::global().get(name)
 }
+
+/// Resolve a bundle from a spec that may be either `name` or `name@version`.
+///
+/// Query results identify packages as `name@version`, so any path that takes a
+/// package identifier from a query hit (e.g. small-to-big expansion, the
+/// `read_code` affordance) must accept the versioned form.  When a version is
+/// present it is matched exactly, falling back to the latest installed version
+/// of `name` if that exact version is not installed.
+pub fn resolve_bundle_spec(spec: &str, workspace_dir: Option<&Path>) -> Option<BundleInfo> {
+    if let Some((name, version)) = spec.rsplit_once('@') {
+        if !name.is_empty() && !version.is_empty() {
+            if let Some(dir) = workspace_dir {
+                if let Some(b) = BundleStore::workspace(dir).get_version(name, version) {
+                    return Some(b);
+                }
+            }
+            if let Some(b) = BundleStore::global().get_version(name, version) {
+                return Some(b);
+            }
+            // Exact version not installed — fall back to name-only resolution.
+            return resolve_bundle(name, workspace_dir);
+        }
+    }
+    resolve_bundle(spec, workspace_dir)
+}
+
