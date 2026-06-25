@@ -352,7 +352,7 @@ impl Reranker {
     pub fn load(config: &RerankerConfig) -> Result<Self> {
         use llama_cpp_2::llama_backend::LlamaBackend;
         use llama_cpp_2::model::{params::LlamaModelParams, LlamaModel};
-        use llama_cpp_2::{send_logs_to_tracing, LogOptions};
+        use llama_cpp_2::{send_logs_to_tracing, LlamaCppError, LogOptions};
 
         // Silence llama.cpp's extremely verbose stderr logging. Routing logs to
         // `tracing` with logging disabled drops them entirely (sempkg installs
@@ -370,8 +370,12 @@ impl Reranker {
             );
         }
 
-        let backend =
-            LlamaBackend::init().map_err(|e| anyhow::anyhow!("llama backend init: {e}"))?;
+        // Backend init is process-global and idempotent.
+        let backend = match LlamaBackend::init() {
+            Ok(b) => b,
+            Err(LlamaCppError::BackendAlreadyInitialized) => LlamaBackend {},
+            Err(e) => return Err(anyhow::anyhow!("llama backend init: {e}")),
+        };
 
         let model_params = LlamaModelParams::default();
         let model = LlamaModel::load_from_file(&backend, &model_path, &model_params)

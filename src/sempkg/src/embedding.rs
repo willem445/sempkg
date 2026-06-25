@@ -181,7 +181,7 @@ impl Embedder {
     pub fn load(config: &EmbeddingConfig) -> Result<Self> {
         use llama_cpp_2::llama_backend::LlamaBackend;
         use llama_cpp_2::model::{params::LlamaModelParams, LlamaModel};
-        use llama_cpp_2::{send_logs_to_tracing, LogOptions};
+        use llama_cpp_2::{send_logs_to_tracing, LlamaCppError, LogOptions};
 
         // Silence llama.cpp's verbose stderr logging (see reranker.rs).
         static LOG_INIT: std::sync::Once = std::sync::Once::new();
@@ -197,8 +197,14 @@ impl Embedder {
             );
         }
 
-        let backend =
-            LlamaBackend::init().map_err(|e| anyhow::anyhow!("llama backend init: {e}"))?;
+        // llama.cpp backend init is process-global; repeated init attempts
+        // return BackendAlreadyInitialized. Treat that as success so multiple
+        // model components (reranker/embedder/expander) can coexist.
+        let backend = match LlamaBackend::init() {
+            Ok(b) => b,
+            Err(LlamaCppError::BackendAlreadyInitialized) => LlamaBackend {},
+            Err(e) => return Err(anyhow::anyhow!("llama backend init: {e}")),
+        };
 
         let model_params = LlamaModelParams::default().with_n_gpu_layers(config.gpu_layers);
         let model = LlamaModel::load_from_file(&backend, &model_path, &model_params)

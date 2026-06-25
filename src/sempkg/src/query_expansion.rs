@@ -260,7 +260,7 @@ impl QueryExpander {
     pub fn load(config: &QueryExpansionConfig) -> Result<Self> {
         use llama_cpp_2::llama_backend::LlamaBackend;
         use llama_cpp_2::model::{params::LlamaModelParams, LlamaModel};
-        use llama_cpp_2::{send_logs_to_tracing, LogOptions};
+        use llama_cpp_2::{send_logs_to_tracing, LlamaCppError, LogOptions};
 
         static LOG_INIT: std::sync::Once = std::sync::Once::new();
         LOG_INIT.call_once(|| {
@@ -275,8 +275,13 @@ impl QueryExpander {
             );
         }
 
-        let backend =
-            LlamaBackend::init().map_err(|e| anyhow::anyhow!("llama backend init: {e}"))?;
+        // Backend init is process-global. If another model already initialized
+        // it, reuse the initialized backend proof token.
+        let backend = match LlamaBackend::init() {
+            Ok(b) => b,
+            Err(LlamaCppError::BackendAlreadyInitialized) => LlamaBackend {},
+            Err(e) => return Err(anyhow::anyhow!("llama backend init: {e}")),
+        };
 
         let model_params = LlamaModelParams::default().with_n_gpu_layers(config.gpu_layers);
         let model = LlamaModel::load_from_file(&backend, &model_path, &model_params)

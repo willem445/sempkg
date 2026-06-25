@@ -470,6 +470,77 @@ struct UnifiedHit {
     kwic_count: usize,
 }
 
+/// Retrieval counters for one `tool_query` run (original or expanded query).
+#[derive(Debug, Default, Clone)]
+struct QueryRunStats {
+    /// Number of hits added by BM25 code-index search.
+    lex_code_hits: usize,
+    /// Number of hits added by BM25 docs search.
+    lex_docs_hits: usize,
+    /// Number of hits added by lexical CodeGraph search.
+    lex_codegraph_hits: usize,
+    /// Number of hits added by vector code-index search.
+    vec_code_hits: usize,
+    /// Number of hits added by vector docs search.
+    vec_docs_hits: usize,
+    /// Number of tables checked for vector compatibility.
+    vec_tables_checked: usize,
+    /// Number of tables deemed vector-compatible.
+    vec_tables_compatible: usize,
+}
+
+impl QueryRunStats {
+    fn total_added(&self) -> usize {
+        self.lex_code_hits
+            + self.lex_docs_hits
+            + self.lex_codegraph_hits
+            + self.vec_code_hits
+            + self.vec_docs_hits
+    }
+}
+
+/// Max items to print per stage when SEMPKG_DEBUG is enabled.
+/// Override with `SEMPKG_DEBUG_LIST_LIMIT=<N>`.
+fn debug_hit_list_limit() -> usize {
+    std::env::var("SEMPKG_DEBUG_LIST_LIMIT")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(25)
+}
+
+fn debug_hit_preview(h: &UnifiedHit) -> String {
+    let loc = if h.start_line > 0 {
+        format!("{}:{}-{}", h.path, h.start_line, h.end_line)
+    } else {
+        h.path.clone()
+    };
+    let symbol = h.symbol.as_deref().unwrap_or("-");
+    let kind = h.kind.as_deref().unwrap_or("-");
+    let mut snip = h.snippet.replace('\n', " ").replace('\r', " ");
+    if snip.len() > 110 {
+        snip.truncate(110);
+        snip.push_str("...");
+    }
+    format!(
+        "pkg={} origin={} kind={} symbol={} loc={} rrf={:.4} snip={:?}",
+        h.package, h.origin, kind, symbol, loc, h.rrf_score, snip
+    )
+}
+
+fn debug_print_stage_hits(stage: &str, hits: &[UnifiedHit], max_items: usize) {
+    eprintln!("sempkg: {stage} count={}", hits.len());
+    for (i, h) in hits.iter().take(max_items).enumerate() {
+        eprintln!("sempkg:   [{i}] {}", debug_hit_preview(h));
+    }
+    if hits.len() > max_items {
+        eprintln!(
+            "sempkg:   ... {} more hit(s) omitted (set SEMPKG_DEBUG_LIST_LIMIT to change)",
+            hits.len() - max_items
+        );
+    }
+}
+
 /// Build the kind+symbol prefix used in all reranker candidate strings.
 /// Returns an empty string when neither field is set.
 fn hit_kind_symbol_prefix(h: &UnifiedHit) -> String {
@@ -1268,7 +1339,8 @@ impl McpContext {
         do_vec: bool,
         fetch_limit: usize,
         hits: &mut Vec<UnifiedHit>,
-    ) {
+    ) -> QueryRunStats {
+        let mut stats = QueryRunStats::default();
         // Embed the query once (reused across every table) when vector search
         // is requested and an embedder is loaded. `None` => vector search is
         // silently skipped and the run degrades to BM25 only.
@@ -1317,9 +1389,12 @@ impl McpContext {
         };
 
         // ── Helper: push codegraph JSON nodes into hits ──────────────────
-        let push_codegraph_hits = |hits: &mut Vec<UnifiedHit>, pkg_name: &str, raw_json: &str| {
+        let push_codegraph_hits = |hits: &mut Vec<UnifiedHit>,
+                                  pkg_name: &str,
+                                  raw_json: &str|
+         -> usize {
             let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(raw_json) else {
-                return;
+                return 0;
             };
             for (pos, v) in arr.iter().enumerate() {
                 let node = v.get("node").unwrap_or(v);
@@ -1368,6 +1443,7 @@ impl McpContext {
                     kwic_count: 0,
                 });
             }
+            arr.len()
         };
 
         // ── Installed bundles ────────────────────────────────────────────
@@ -1380,12 +1456,16 @@ impl McpContext {
                 let code_dir = bundle.bundle_dir.join("code");
                 if do_lex {
                     if let Ok(results) = lance::search_code(&code_dir, query, fetch_limit) {
+                        stats.lex_code_hits += results.len();
                         push_results(hits, &pkg_name, "code", results);
                     }
                 }
                 if let Some(qv) = &query_vec {
+                    stats.vec_tables_checked += 1;
                     if vectors_compatible(&code_dir, qv.len()) {
+                        stats.vec_tables_compatible += 1;
                         if let Ok(results) = lance::search_code_vector(&code_dir, qv, fetch_limit) {
+                            stats.vec_code_hits += results.len();
                             push_results(hits, &pkg_name, "code", results);
                         }
                     }
@@ -1397,12 +1477,16 @@ impl McpContext {
                 let lance_dir = bundle.bundle_dir.join("lance");
                 if do_lex {
                     if let Ok(results) = lance::search(&lance_dir, query, fetch_limit) {
+                        stats.lex_docs_hits += results.len();
                         push_results(hits, &pkg_name, "docs", results);
                     }
                 }
                 if let Some(qv) = &query_vec {
+                    stats.vec_tables_checked += 1;
                     if vectors_compatible(&lance_dir, qv.len()) {
+                        stats.vec_tables_compatible += 1;
                         if let Ok(results) = lance::search_vector(&lance_dir, qv, fetch_limit) {
+                            stats.vec_docs_hits += results.len();
                             push_results(hits, &pkg_name, "docs", results);
                         }
                     }
@@ -1412,7 +1496,7 @@ impl McpContext {
             // CodeGraph symbol search (lexical only).
             if do_lex && bundle.is_indexed() {
                 if let Ok(raw) = codegraph::query(&bundle.bundle_dir, query, None, fetch_limit) {
-                    push_codegraph_hits(hits, &pkg_name, &raw);
+                    stats.lex_codegraph_hits += push_codegraph_hits(hits, &pkg_name, &raw);
                 }
             }
         }
@@ -1426,12 +1510,16 @@ impl McpContext {
             if lance_dir.is_dir() {
                 if do_lex {
                     if let Ok(results) = lance::search(&lance_dir, query, fetch_limit) {
+                        stats.lex_docs_hits += results.len();
                         push_results(hits, &pkg_name, "docs", results);
                     }
                 }
                 if let Some(qv) = &query_vec {
+                    stats.vec_tables_checked += 1;
                     if vectors_compatible(&lance_dir, qv.len()) {
+                        stats.vec_tables_compatible += 1;
                         if let Ok(results) = lance::search_vector(&lance_dir, qv, fetch_limit) {
+                            stats.vec_docs_hits += results.len();
                             push_results(hits, &pkg_name, "docs", results);
                         }
                     }
@@ -1441,13 +1529,17 @@ impl McpContext {
             // CodeGraph (lexical only).
             if do_lex && pkg.is_indexed() {
                 if let Ok(raw) = codegraph::query(&pkg.abs_path(), query, None, fetch_limit) {
-                    push_codegraph_hits(hits, &pkg_name, &raw);
+                    stats.lex_codegraph_hits += push_codegraph_hits(hits, &pkg_name, &raw);
                 }
             }
         }
+
+        stats
     }
 
     fn tool_query(&self, query: &str, limit: usize) -> String {
+        let debug = std::env::var("SEMPKG_DEBUG").is_ok();
+        let debug_list_limit = debug_hit_list_limit();
         let fetch_limit = self.reranker_fetch_limit(limit).max(20);
         let mut hits: Vec<UnifiedHit> = Vec::new();
 
@@ -1459,8 +1551,10 @@ impl McpContext {
         // original run still drives full BM25 + vector search.
         let mut runs: Vec<(String, f32, bool, bool)> = vec![(query.to_string(), 2.0, true, true)];
 
+        let mut expanded_variants = 0usize;
         if let Some(expander) = self.expander.as_ref() {
             for variant in expander.expand(query) {
+                expanded_variants += 1;
                 match variant.kind {
                     ExpansionKind::Lexical => runs.push((variant.text, 1.0, true, false)),
                     ExpansionKind::Vector => runs.push((variant.text, 1.0, false, true)),
@@ -1468,8 +1562,45 @@ impl McpContext {
             }
         }
 
-        for (q, weight, do_lex, do_vec) in &runs {
-            self.collect_query_hits(q, *weight, *do_lex, *do_vec, fetch_limit, &mut hits);
+        if debug {
+            eprintln!(
+                "sempkg: query debug — runs={} (original=1 expanded={}) fetch_limit={} limit={} expander_loaded={} embedder_loaded={}",
+                runs.len(),
+                expanded_variants,
+                fetch_limit,
+                limit,
+                self.expander.is_some(),
+                self.embedder.is_some()
+            );
+            for (i, (q, weight, do_lex, do_vec)) in runs.iter().enumerate() {
+                eprintln!(
+                    "sempkg: run-plan[{i}] route={{lex:{do_lex}, vec:{do_vec}}} weight={weight:.1} q={q:?}"
+                );
+            }
+        }
+
+        for (run_idx, (q, weight, do_lex, do_vec)) in runs.iter().enumerate() {
+            let before = hits.len();
+            let stats = self.collect_query_hits(q, *weight, *do_lex, *do_vec, fetch_limit, &mut hits);
+            if debug {
+                eprintln!(
+                    "sempkg: query run[{run_idx}] route={{lex:{do_lex}, vec:{do_vec}}} weight={weight:.1} q={q:?} added={} lex(code/docs/codegraph)={}/{}/{} vec(code/docs)={}/{} vec_tables(compatible/checked)={}/{}",
+                    stats.total_added(),
+                    stats.lex_code_hits,
+                    stats.lex_docs_hits,
+                    stats.lex_codegraph_hits,
+                    stats.vec_code_hits,
+                    stats.vec_docs_hits,
+                    stats.vec_tables_compatible,
+                    stats.vec_tables_checked
+                );
+                eprintln!("sempkg: query run[{run_idx}] cumulative_raw_hits={}", hits.len());
+                debug_print_stage_hits(
+                    &format!("query run[{run_idx}] raw hits"),
+                    &hits[before..],
+                    debug_list_limit,
+                );
+            }
         }
 
         if hits.is_empty() {
@@ -1489,6 +1620,7 @@ impl McpContext {
         let mut hits: Vec<UnifiedHit> = {
             let mut key_map: HashMap<String, usize> = HashMap::with_capacity(hits.len());
             let mut deduped: Vec<UnifiedHit> = Vec::with_capacity(hits.len());
+            let mut duplicate_logs: Vec<String> = Vec::new();
             for hit in hits {
                 let key = dedup_key(&hit);
                 if let Some(&idx) = key_map.get(&key) {
@@ -1499,11 +1631,27 @@ impl McpContext {
                             && hit.snippet.len() > deduped[idx].snippet.len());
                     if should_replace {
                         let old = std::mem::replace(&mut deduped[idx], hit);
+                        if debug {
+                            duplicate_logs.push(format!(
+                                "duplicate key={} action=replace kept=[{}] dropped=[{}]",
+                                key,
+                                debug_hit_preview(&deduped[idx]),
+                                debug_hit_preview(&old)
+                            ));
+                        }
                         merge_complementary(&mut deduped[idx], &old);
                         // RRF fusion: a hit found by multiple runs/sources
                         // accumulates their reciprocal-rank contributions.
                         deduped[idx].rrf_score += old.rrf_score;
                     } else {
+                        if debug {
+                            duplicate_logs.push(format!(
+                                "duplicate key={} action=drop kept=[{}] dropped=[{}]",
+                                key,
+                                debug_hit_preview(&deduped[idx]),
+                                debug_hit_preview(&hit)
+                            ));
+                        }
                         // Existing wins; harvest complementary fields and add
                         // this run's RRF contribution to the running total.
                         let new_rrf = hit.rrf_score;
@@ -1515,8 +1663,32 @@ impl McpContext {
                     deduped.push(hit);
                 }
             }
+            if debug {
+                eprintln!(
+                    "sempkg: dedup decisions count={} (showing up to {})",
+                    duplicate_logs.len(),
+                    debug_list_limit
+                );
+                for (i, line) in duplicate_logs.iter().take(debug_list_limit).enumerate() {
+                    eprintln!("sempkg:   dedup[{i}] {line}");
+                }
+                if duplicate_logs.len() > debug_list_limit {
+                    eprintln!(
+                        "sempkg:   ... {} more dedup decision(s) omitted",
+                        duplicate_logs.len() - debug_list_limit
+                    );
+                }
+            }
             deduped
         };
+
+        if debug {
+            eprintln!(
+                "sempkg: query fusion — deduped_hits={} (post-run pre-dedup can be inferred from last cumulative_raw_hits)",
+                hits.len()
+            );
+            debug_print_stage_hits("query post-dedup hits", &hits, debug_list_limit);
+        }
 
         // ── Global RRF sort ───────────────────────────────────────────────
         // All sources used the same RRF formula so this sort is apples-to-apples.
@@ -1526,6 +1698,9 @@ impl McpContext {
                 .partial_cmp(&a.rrf_score)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
+        if debug {
+            debug_print_stage_hits("query post-rrf-sort hits", &hits, debug_list_limit);
+        }
 
         // ── Diversity selection ───────────────────────────────────────────
         // Greedy pass over the RRF-sorted list: accept each hit until its
@@ -1554,6 +1729,21 @@ impl McpContext {
             })
             .take(pool_size)
             .collect();
+        if debug {
+            eprintln!(
+                "sempkg: query diversity-selected pool count={}",
+                pool_indices.len()
+            );
+            for (i, hi) in pool_indices.iter().take(debug_list_limit).enumerate() {
+                eprintln!("sempkg:   [pool:{i}] {}", debug_hit_preview(&hits[*hi]));
+            }
+            if pool_indices.len() > debug_list_limit {
+                eprintln!(
+                    "sempkg:   ... {} more pool hit(s) omitted",
+                    pool_indices.len() - debug_list_limit
+                );
+            }
+        }
 
         // ── Small-to-big expansion ────────────────────────────────────────
         // Fetch the full symbol body for each code/codegraph hit in the pool.

@@ -4,10 +4,24 @@
 [dependencies]
 codegraph = { version = "0.9.7", git = "github:colbymchenry/codegraph", git_ref = "v0.9.7", full = true, include_source = true, source_dirs = ['.\src\'], docs_dirs = ['.\docs\'] }
 lancedb = { version = "0.30.0", git = "github:lancedb/lancedb", git_ref = "v0.30.0", full = true, include_source = true, source_dirs = ['.\rust\lancedb\src'], docs_dirs = ['.\docs\src\'] }
+llama-cpp-rs = { version = "0.1.150", git = "github:utilityai/llama-cpp-rs", git_ref = "0.1.150", full = true, include_source = true, source_dirs = ["llama-cpp-2/src"] }
 qmd = { version = "2.5.2", git = "github:tobi/qmd", git_ref = "v2.5.2", full = true, include_source = true, source_dirs = ['.\src\'], docs_dirs = ['.\docs\'] }
 sempkg = { version = "0.3.0-beta-30-gcfcfdefb0b81", local = ".", include_source = true, source_dirs = ['.\src\'], docs_dirs = ['.\docs\'] }
 
+[embedding]
+enabled    = true
+# model    = "~/.sempkg/models/qwen3-embedding-0.6b-q8_0.gguf"  # default path
+n_ctx      = 2048
+gpu_layers = 0    # >0 offloads layers to GPU (needs a GPU llama.cpp build)
+
+[query_expansion]
+enabled      = true
+# model      = "~/.sempkg/models/qmd-query-expansion-1.7b-q4_k_m.gguf"
+max_variants = 4
+gpu_layers   = 0
+
 [reranker]
-enabled = true
-top_k = 20
-output_n = 5
+enabled  = true
+# model  = "~/.sempkg/models/Qwen3-Reranker-0.6B-Q8_0.gguf"  # default path
+top_k    = 20   # BM25 candidates fed into the reranker
+output_n = 5    # final results returned after reranking
