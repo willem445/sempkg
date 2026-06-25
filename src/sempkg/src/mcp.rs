@@ -6,7 +6,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::io::{self, BufRead, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -17,7 +17,10 @@ use std::cell::RefCell;
 use crate::packages::PackageRegistry;
 use crate::reranker::{self, Reranker, RerankerConfig};
 use crate::store::{list_all_bundles, resolve_bundle, resolve_bundle_spec};
-use crate::{codegraph, lance};
+use crate::{codegraph, embedding, lance, query_expansion};
+
+use crate::embedding::Embedder;
+use crate::query_expansion::{ExpansionKind, QueryExpander};
 
 // Minimum reranker score (P(yes) from the Qwen3 cross-encoder) a result must
 // reach to be returned to the agent.  Results below this threshold are
@@ -784,6 +787,12 @@ struct McpContext {
     /// can mutably borrow it through an immutable &McpContext reference.
     reranker: RefCell<Option<Reranker>>,
     reranker_cfg: Option<RerankerConfig>,
+    /// Optionally-loaded vector embedder for semantic search.
+    embedder: Option<Embedder>,
+    /// Identifier of the loaded embedding model (for bundle compatibility checks).
+    embed_model_id: Option<String>,
+    /// Optionally-loaded generative query expander.
+    expander: Option<QueryExpander>,
 }
 
 impl McpContext {
@@ -817,11 +826,63 @@ impl McpContext {
             }
         });
 
+        // Embedding config + lazy model load (semantic search).
+        let embed_cfg: embedding::EmbeddingConfig = workspace_dir
+            .as_deref()
+            .and_then(|d| crate::manifest::load_manifest(d).ok())
+            .and_then(|mf| mf.embedding)
+            .unwrap_or_default();
+
+        let (embedder, embed_model_id) =
+            if embed_cfg.enabled && embedding::model_is_present(&embed_cfg) {
+                match Embedder::load(&embed_cfg) {
+                    Ok(e) => {
+                        eprintln!(
+                            "sempkg: embedder loaded ({}, dim {})",
+                            embedding::EMBED_MODEL_ID,
+                            e.dim()
+                        );
+                        (Some(e), Some(embedding::EMBED_MODEL_ID.to_string()))
+                    }
+                    Err(e) => {
+                        eprintln!("sempkg: embedder load error (vector search disabled): {e}");
+                        (None, None)
+                    }
+                }
+            } else {
+                (None, None)
+            };
+
+        // Query-expansion config + lazy model load.
+        let qe_cfg: query_expansion::QueryExpansionConfig = workspace_dir
+            .as_deref()
+            .and_then(|d| crate::manifest::load_manifest(d).ok())
+            .and_then(|mf| mf.query_expansion)
+            .unwrap_or_default();
+
+        let expander = if qe_cfg.enabled && query_expansion::model_is_present(&qe_cfg) {
+            match QueryExpander::load(&qe_cfg) {
+                Ok(e) => {
+                    eprintln!("sempkg: query expander loaded");
+                    Some(e)
+                }
+                Err(e) => {
+                    eprintln!("sempkg: query expander load error (expansion disabled): {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         Self {
             workspace_dir,
             registry,
             reranker: RefCell::new(reranker),
             reranker_cfg,
+            embedder,
+            embed_model_id,
+            expander,
         }
     }
 
@@ -1191,9 +1252,69 @@ impl McpContext {
 
     /// Unified cross-package search: queries code, docs, and codegraph across
     /// all installed bundles and local packages, then reranks everything together.
-    fn tool_query(&self, query: &str, limit: usize) -> String {
-        let fetch_limit = self.reranker_fetch_limit(limit).max(20);
-        let mut hits: Vec<UnifiedHit> = Vec::new();
+    /// Retrieve BM25 (+ optional vector) hits for a single (possibly expanded)
+    /// query, scaling each hit's RRF contribution by `weight`. Lexical sources
+    /// (BM25 + codegraph) run when `do_lex`; vector search runs when `do_vec`
+    /// and a compatible embedder + stored vectors are available.
+    ///
+    /// Hits are appended to `hits`; the caller fuses duplicates across runs by
+    /// summing their RRF scores (Reciprocal Rank Fusion).
+    #[allow(clippy::too_many_arguments)]
+    fn collect_query_hits(
+        &self,
+        query: &str,
+        weight: f32,
+        do_lex: bool,
+        do_vec: bool,
+        fetch_limit: usize,
+        hits: &mut Vec<UnifiedHit>,
+    ) {
+        // Embed the query once (reused across every table) when vector search
+        // is requested and an embedder is loaded. `None` => vector search is
+        // silently skipped and the run degrades to BM25 only.
+        let query_vec: Option<Vec<f32>> = if do_vec {
+            match (self.embedder.as_ref(), self.embed_model_id.as_ref()) {
+                (Some(e), Some(_)) => e.embed_query(query).ok(),
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        // Whether `dir`'s table was embedded with the model we'd query with.
+        let vectors_compatible = |dir: &Path, qlen: usize| -> bool {
+            match lance::read_embedding_info(dir) {
+                Some((model, dim)) => {
+                    self.embed_model_id.as_deref() == Some(model.as_str()) && dim as usize == qlen
+                }
+                None => false,
+            }
+        };
+
+        // ── Helper: push lance SearchResults with weighted RRF ───────────
+        let push_results = |hits: &mut Vec<UnifiedHit>,
+                            pkg: &str,
+                            origin: &'static str,
+                            rs: Vec<lance::SearchResult>| {
+            for (pos, r) in rs.into_iter().enumerate() {
+                hits.push(UnifiedHit {
+                    package: pkg.to_string(),
+                    origin,
+                    path: r.path,
+                    start_line: r.start_line,
+                    end_line: r.end_line,
+                    snippet: r.snippet,
+                    symbol: r.symbol,
+                    kind: r.kind,
+                    signature: r.signature,
+                    rrf_score: weight / (60.0 + pos as f32 + 1.0),
+                    expanded_text: None,
+                    best_window: None,
+                    best_window_first: false,
+                    kwic_count: 0,
+                });
+            }
+        };
 
         // ── Helper: push codegraph JSON nodes into hits ──────────────────
         let push_codegraph_hits = |hits: &mut Vec<UnifiedHit>, pkg_name: &str, raw_json: &str| {
@@ -1229,7 +1350,7 @@ impl McpContext {
                 // Codegraph BM25 and lance BM25 are on different scales; mixing
                 // them biases the global sort.  Rank position is the only
                 // comparable signal across heterogeneous sources.
-                let rrf_score = 1.0 / (60.0 + pos as f32 + 1.0);
+                let rrf_score = weight / (60.0 + pos as f32 + 1.0);
                 hits.push(UnifiedHit {
                     package: pkg_name.to_string(),
                     origin: "codegraph",
@@ -1257,24 +1378,16 @@ impl McpContext {
             // Source-code index
             if bundle.has_code() {
                 let code_dir = bundle.bundle_dir.join("code");
-                if let Ok(results) = lance::search_code(&code_dir, query, fetch_limit) {
-                    for (pos, r) in results.into_iter().enumerate() {
-                        hits.push(UnifiedHit {
-                            package: pkg_name.clone(),
-                            origin: "code",
-                            path: r.path,
-                            start_line: r.start_line,
-                            end_line: r.end_line,
-                            snippet: r.snippet,
-                            symbol: r.symbol,
-                            kind: r.kind,
-                            signature: r.signature,
-                            rrf_score: 1.0 / (60.0 + pos as f32 + 1.0),
-                            expanded_text: None,
-                            best_window: None,
-                            best_window_first: false,
-                            kwic_count: 0,
-                        });
+                if do_lex {
+                    if let Ok(results) = lance::search_code(&code_dir, query, fetch_limit) {
+                        push_results(hits, &pkg_name, "code", results);
+                    }
+                }
+                if let Some(qv) = &query_vec {
+                    if vectors_compatible(&code_dir, qv.len()) {
+                        if let Ok(results) = lance::search_code_vector(&code_dir, qv, fetch_limit) {
+                            push_results(hits, &pkg_name, "code", results);
+                        }
                     }
                 }
             }
@@ -1282,32 +1395,24 @@ impl McpContext {
             // Documentation index
             if bundle.has_lance() {
                 let lance_dir = bundle.bundle_dir.join("lance");
-                if let Ok(results) = lance::search(&lance_dir, query, fetch_limit) {
-                    for (pos, r) in results.into_iter().enumerate() {
-                        hits.push(UnifiedHit {
-                            package: pkg_name.clone(),
-                            origin: "docs",
-                            path: r.path,
-                            start_line: r.start_line,
-                            end_line: r.end_line,
-                            snippet: r.snippet,
-                            symbol: r.symbol,
-                            kind: r.kind,
-                            signature: r.signature,
-                            rrf_score: 1.0 / (60.0 + pos as f32 + 1.0),
-                            expanded_text: None,
-                            best_window: None,
-                            best_window_first: false,
-                            kwic_count: 0,
-                        });
+                if do_lex {
+                    if let Ok(results) = lance::search(&lance_dir, query, fetch_limit) {
+                        push_results(hits, &pkg_name, "docs", results);
+                    }
+                }
+                if let Some(qv) = &query_vec {
+                    if vectors_compatible(&lance_dir, qv.len()) {
+                        if let Ok(results) = lance::search_vector(&lance_dir, qv, fetch_limit) {
+                            push_results(hits, &pkg_name, "docs", results);
+                        }
                     }
                 }
             }
 
-            // CodeGraph symbol search
-            if bundle.is_indexed() {
+            // CodeGraph symbol search (lexical only).
+            if do_lex && bundle.is_indexed() {
                 if let Ok(raw) = codegraph::query(&bundle.bundle_dir, query, None, fetch_limit) {
-                    push_codegraph_hits(&mut hits, &pkg_name, &raw);
+                    push_codegraph_hits(hits, &pkg_name, &raw);
                 }
             }
         }
@@ -1319,34 +1424,52 @@ impl McpContext {
             // Lance docs index at <pkg>/.sempkg/lance/
             let lance_dir = pkg.abs_path().join(".sempkg").join("lance");
             if lance_dir.is_dir() {
-                if let Ok(results) = lance::search(&lance_dir, query, fetch_limit) {
-                    for (pos, r) in results.into_iter().enumerate() {
-                        hits.push(UnifiedHit {
-                            package: pkg_name.clone(),
-                            origin: "docs",
-                            path: r.path,
-                            start_line: r.start_line,
-                            end_line: r.end_line,
-                            snippet: r.snippet,
-                            symbol: r.symbol,
-                            kind: r.kind,
-                            signature: r.signature,
-                            rrf_score: 1.0 / (60.0 + pos as f32 + 1.0),
-                            expanded_text: None,
-                            best_window: None,
-                            best_window_first: false,
-                            kwic_count: 0,
-                        });
+                if do_lex {
+                    if let Ok(results) = lance::search(&lance_dir, query, fetch_limit) {
+                        push_results(hits, &pkg_name, "docs", results);
+                    }
+                }
+                if let Some(qv) = &query_vec {
+                    if vectors_compatible(&lance_dir, qv.len()) {
+                        if let Ok(results) = lance::search_vector(&lance_dir, qv, fetch_limit) {
+                            push_results(hits, &pkg_name, "docs", results);
+                        }
                     }
                 }
             }
 
-            // CodeGraph
-            if pkg.is_indexed() {
+            // CodeGraph (lexical only).
+            if do_lex && pkg.is_indexed() {
                 if let Ok(raw) = codegraph::query(&pkg.abs_path(), query, None, fetch_limit) {
-                    push_codegraph_hits(&mut hits, &pkg_name, &raw);
+                    push_codegraph_hits(hits, &pkg_name, &raw);
                 }
             }
+        }
+    }
+
+    fn tool_query(&self, query: &str, limit: usize) -> String {
+        let fetch_limit = self.reranker_fetch_limit(limit).max(20);
+        let mut hits: Vec<UnifiedHit> = Vec::new();
+
+        // ── Query expansion → retrieval runs ─────────────────────────────
+        // The original query always runs against BOTH backends with double
+        // weight (it is the most trustworthy signal — matches QMD). Expanded
+        // variants are routed by type: `lex` → BM25, `vec`/`hyde` → vector.
+        // When no expander is loaded (model missing / feature off), the single
+        // original run still drives full BM25 + vector search.
+        let mut runs: Vec<(String, f32, bool, bool)> = vec![(query.to_string(), 2.0, true, true)];
+
+        if let Some(expander) = self.expander.as_ref() {
+            for variant in expander.expand(query) {
+                match variant.kind {
+                    ExpansionKind::Lexical => runs.push((variant.text, 1.0, true, false)),
+                    ExpansionKind::Vector => runs.push((variant.text, 1.0, false, true)),
+                }
+            }
+        }
+
+        for (q, weight, do_lex, do_vec) in &runs {
+            self.collect_query_hits(q, *weight, *do_lex, *do_vec, fetch_limit, &mut hits);
         }
 
         if hits.is_empty() {
@@ -1377,16 +1500,15 @@ impl McpContext {
                     if should_replace {
                         let old = std::mem::replace(&mut deduped[idx], hit);
                         merge_complementary(&mut deduped[idx], &old);
-                        // Preserve the stronger fusion signal: if the loser
-                        // ranked higher in its own source list, carry that
-                        // score forward so pool selection isn't penalised.
-                        deduped[idx].rrf_score = deduped[idx].rrf_score.max(old.rrf_score);
+                        // RRF fusion: a hit found by multiple runs/sources
+                        // accumulates their reciprocal-rank contributions.
+                        deduped[idx].rrf_score += old.rrf_score;
                     } else {
-                        // Existing wins; harvest complementary fields and keep
-                        // the better RRF score regardless of which side won.
+                        // Existing wins; harvest complementary fields and add
+                        // this run's RRF contribution to the running total.
                         let new_rrf = hit.rrf_score;
                         merge_complementary(&mut deduped[idx], &hit);
-                        deduped[idx].rrf_score = deduped[idx].rrf_score.max(new_rrf);
+                        deduped[idx].rrf_score += new_rrf;
                     }
                 } else {
                     key_map.insert(key, deduped.len());

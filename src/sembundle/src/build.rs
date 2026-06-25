@@ -388,6 +388,8 @@ async fn run_lance_inner(
             .collect(),
         fts_enabled: fts_ok,
         created_at: String::new(), // stamped by pack()
+        embedding_model: None,
+        embedding_dim: None,
     };
     std::fs::write(
         out_dir.join("metadata.json"),
@@ -967,6 +969,8 @@ async fn run_source_inner(
         indexed_paths: source_dirs.iter().map(|p| p.to_string_lossy().into_owned()).collect(),
         fts_enabled: fts_ok,
         created_at: String::new(), // stamped by pack()
+        embedding_model: None,
+        embedding_dim: None,
     };
     std::fs::write(out_dir.join("metadata.json"), serde_json::to_vec_pretty(&metadata)?)?;
 

@@ -55,6 +55,13 @@ pub struct LanceMetadata {
     pub fts_enabled: bool,
     /// Stamped by the packer to match `manifest.json` `created_at`.
     pub created_at: String,
+    /// Identifier of the embedding model used to populate the `vector` column,
+    /// if vectors are present. `None` means the table has no embeddings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_model: Option<String>,
+    /// Dimension of the stored vectors, if present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_dim: Option<u32>,
 }
 
 /// Source-code LanceDB index metadata (`code/metadata.json`).
@@ -70,4 +77,11 @@ pub struct CodeMetadata {
     pub fts_enabled: bool,
     /// Stamped by the packer to match `manifest.json` `created_at`.
     pub created_at: String,
+    /// Identifier of the embedding model used to populate the `vector` column,
+    /// if vectors are present. `None` means the table has no embeddings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_model: Option<String>,
+    /// Dimension of the stored vectors, if present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_dim: Option<u32>,
 }

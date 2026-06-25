@@ -120,6 +120,10 @@ pub struct WorkspaceManifest {
     pub packages: BTreeMap<String, PackageEntry>,
     /// Optional local LLM reranker configuration.
     pub reranker: Option<crate::reranker::RerankerConfig>,
+    /// Optional vector-embedding configuration (semantic search).
+    pub embedding: Option<crate::embedding::EmbeddingConfig>,
+    /// Optional generative query-expansion configuration.
+    pub query_expansion: Option<crate::query_expansion::QueryExpansionConfig>,
 }
 
 impl WorkspaceManifest {

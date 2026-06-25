@@ -1,11 +1,13 @@
 mod cli;
 mod codegraph;
+mod embedding;
 mod error;
 mod github;
 mod lance;
 mod manifest;
 mod mcp;
 mod packages;
+mod query_expansion;
 mod registry;
 mod reranker;
 mod store;
@@ -16,7 +18,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use clap::Parser;
 
-use crate::cli::{Cli, Commands, PkgCommands, RerankerCommands};
+use crate::cli::{
+    Cli, Commands, EmbeddingCommands, PkgCommands, QueryExpansionCommands, RerankerCommands,
+};
 use crate::manifest::{DependencyEntry, RegistryEntry};
 use crate::packages::PackageRegistry;
 use crate::registry::{download_from_url, RegistryClient};
@@ -858,6 +862,13 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
         // Reranker management
         // -----------------------------------------------------------------------
         Commands::Reranker(sub) => run_reranker(sub, workspace),
+
+        // -----------------------------------------------------------------------
+        // Embedding / query-expansion management
+        // -----------------------------------------------------------------------
+        Commands::Embed { package, force } => run_embed(package.as_deref(), force, workspace),
+        Commands::Embedding(sub) => run_embedding(sub, workspace),
+        Commands::QueryExpansion(sub) => run_query_expansion(sub, workspace),
     }
 }
 
@@ -1161,6 +1172,197 @@ fn run_reranker(cmd: RerankerCommands, workspace: Option<&Path>) -> Result<()> {
                 )
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// embedding management
+// ---------------------------------------------------------------------------
+
+/// Load the embedding config from the workspace manifest, or defaults.
+fn load_embedding_cfg(workspace: Option<&Path>) -> embedding::EmbeddingConfig {
+    workspace
+        .and_then(|d| manifest::load_manifest(d).ok())
+        .and_then(|mf| mf.embedding)
+        .unwrap_or_default()
+}
+
+/// Load the query-expansion config from the workspace manifest, or defaults.
+fn load_query_expansion_cfg(workspace: Option<&Path>) -> query_expansion::QueryExpansionConfig {
+    workspace
+        .and_then(|d| manifest::load_manifest(d).ok())
+        .and_then(|mf| mf.query_expansion)
+        .unwrap_or_default()
+}
+
+fn run_embedding(cmd: EmbeddingCommands, workspace: Option<&Path>) -> Result<()> {
+    let cfg = load_embedding_cfg(workspace);
+
+    match cmd {
+        EmbeddingCommands::Pull { gguf_url, hf_token } => {
+            println!("Pulling Qwen3-Embedding-0.6B GGUF model...");
+            embedding::pull_model(&cfg, hf_token.as_deref(), gguf_url.as_deref())?;
+            println!();
+            println!("Model ready. Run `sempkg embed` to build vector indexes for your bundles.");
+            Ok(())
+        }
+        EmbeddingCommands::Status => {
+            embedding::print_status(&cfg);
+            Ok(())
+        }
+    }
+}
+
+fn run_query_expansion(cmd: QueryExpansionCommands, workspace: Option<&Path>) -> Result<()> {
+    let cfg = load_query_expansion_cfg(workspace);
+
+    match cmd {
+        QueryExpansionCommands::Pull { gguf_url, hf_token } => {
+            println!("Pulling query-expansion GGUF model...");
+            query_expansion::pull_model(&cfg, hf_token.as_deref(), gguf_url.as_deref())?;
+            println!();
+            println!("Model ready. The MCP `query` tool will expand queries automatically.");
+            Ok(())
+        }
+        QueryExpansionCommands::Status => {
+            query_expansion::print_status(&cfg);
+            Ok(())
+        }
+        QueryExpansionCommands::Test { query } => {
+            #[cfg(feature = "embeddings")]
+            {
+                if !query_expansion::model_is_present(&cfg) {
+                    anyhow::bail!("Model not found. Run `sempkg query-expansion pull` first.");
+                }
+                println!("Loading query-expansion model...");
+                let expander = query_expansion::QueryExpander::load(&cfg)?;
+                let variants = expander.expand(&query);
+                if variants.is_empty() {
+                    println!("(no variants produced — falling back to the original query)");
+                } else {
+                    println!("Original: {query}");
+                    for v in &variants {
+                        let route = match v.kind {
+                            query_expansion::ExpansionKind::Lexical => "lex",
+                            query_expansion::ExpansionKind::Vector => "vec",
+                        };
+                        println!("  [{route}] {}", v.text);
+                    }
+                }
+                Ok(())
+            }
+            #[cfg(not(feature = "embeddings"))]
+            {
+                let _ = query;
+                anyhow::bail!(
+                    "Query expansion is not compiled into this binary. \
+                     Rebuild with `cargo build --features embeddings`."
+                )
+            }
+        }
+    }
+}
+
+/// Run `sempkg embed`: generate vector embeddings for installed bundles and
+/// local packages so the MCP `query` tool can run semantic search.
+fn run_embed(package: Option<&str>, force: bool, workspace: Option<&Path>) -> Result<()> {
+    #[cfg(feature = "embeddings")]
+    {
+        let cfg = load_embedding_cfg(workspace);
+        if !embedding::model_is_present(&cfg) {
+            anyhow::bail!("Embedding model not found. Run `sempkg embedding pull` to download it.");
+        }
+
+        println!("Loading embedding model ({})...", embedding::EMBED_MODEL_ID);
+        let embedder = embedding::Embedder::load(&cfg)?;
+        let model_id = embedding::EMBED_MODEL_ID;
+
+        // Collect (label, table_dir, table_name) targets.
+        let mut targets: Vec<(String, PathBuf, &'static str)> = Vec::new();
+
+        // Local registered packages (docs index only).
+        let reg = PackageRegistry::load()?;
+        for pkg in reg.list() {
+            if let Some(name) = package {
+                if pkg.name != name {
+                    continue;
+                }
+            }
+            let lance_dir = pkg.abs_path().join(".sempkg").join("lance");
+            if lance_dir.is_dir() {
+                targets.push((format!("{} (docs)", pkg.name), lance_dir, "docs"));
+            }
+        }
+
+        // Installed bundles (docs and/or code).
+        for bundle in list_all_bundles(workspace) {
+            if let Some(name) = package {
+                if bundle.name != name && format!("{}@{}", bundle.name, bundle.version) != name {
+                    continue;
+                }
+            }
+            if bundle.has_lance() {
+                targets.push((
+                    format!("{}@{} (docs)", bundle.name, bundle.version),
+                    bundle.bundle_dir.join("lance"),
+                    "docs",
+                ));
+            }
+            if bundle.has_code() {
+                targets.push((
+                    format!("{}@{} (code)", bundle.name, bundle.version),
+                    bundle.bundle_dir.join("code"),
+                    "code",
+                ));
+            }
+        }
+
+        if targets.is_empty() {
+            if let Some(name) = package {
+                anyhow::bail!("No indexed docs/code tables found for '{name}'.");
+            }
+            println!("No indexed docs/code tables found to embed.");
+            return Ok(());
+        }
+
+        let mut total_rows: u64 = 0;
+        for (label, dir, table) in &targets {
+            // Skip tables already embedded with this model unless --force.
+            if !force {
+                if let Some((existing_model, existing_dim)) = lance::read_embedding_info(dir) {
+                    if existing_model == model_id && existing_dim as usize == embedder.dim() {
+                        println!("  ✓ {label}: already embedded (skipping; use --force to redo)");
+                        continue;
+                    }
+                }
+            }
+
+            print!("  • {label}: embedding... ");
+            use std::io::Write;
+            let _ = std::io::stdout().flush();
+            match lance::embed_table(dir, table, &embedder, model_id) {
+                Ok(n) => {
+                    total_rows += n;
+                    println!("{n} rows");
+                }
+                Err(e) => println!("failed: {e}"),
+            }
+        }
+
+        println!();
+        println!(
+            "Done. Embedded {total_rows} rows across {} table(s).",
+            targets.len()
+        );
+        Ok(())
+    }
+    #[cfg(not(feature = "embeddings"))]
+    {
+        let _ = (package, force, workspace);
+        anyhow::bail!(
+            "The `embed` command requires embedding support. \
+             Rebuild with `cargo build --features embeddings`."
+        )
     }
 }
 

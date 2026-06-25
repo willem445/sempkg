@@ -5,11 +5,12 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use arrow_array::{RecordBatch, StringArray, UInt32Array};
+use arrow_array::{Array, FixedSizeListArray, Float32Array, RecordBatch, StringArray, UInt32Array};
 use arrow_schema::{DataType, Field, Schema};
 use futures::TryStreamExt;
 use lancedb::index::scalar::FullTextSearchQuery;
 use lancedb::query::{ExecutableQuery, QueryBase};
+use lancedb::DistanceType;
 use serde::Deserialize;
 
 use crate::error::SempkgError;
@@ -42,12 +43,31 @@ pub struct LanceMetadata {
     pub fts_enabled: Option<bool>,
     pub indexed_paths: Option<Vec<String>>,
     pub created_at: Option<String>,
+    /// Identifier of the embedding model used to populate the `vector` column,
+    /// if vectors are present. Written by `sempkg embed`.
+    #[serde(default)]
+    pub embedding_model: Option<String>,
+    /// Dimension of the stored vectors, if present.
+    #[serde(default)]
+    pub embedding_dim: Option<u32>,
 }
 
 pub fn load_metadata(lance_dir: &Path) -> Option<LanceMetadata> {
     let path = lance_dir.join("metadata.json");
     let text = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&text).ok()
+}
+
+/// Read the embedding model id + dimension recorded in a table's
+/// `metadata.json` (works for both `lance/` and `code/` directories).
+///
+/// Returns `None` when the directory has no metadata or no embeddings.
+pub fn read_embedding_info(table_dir: &Path) -> Option<(String, u32)> {
+    let meta = load_metadata(table_dir)?;
+    match (meta.embedding_model, meta.embedding_dim) {
+        (Some(model), Some(dim)) => Some((model, dim)),
+        _ => None,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -175,76 +195,340 @@ fn search_table(
             .await
             .map_err(|e| SempkgError::LanceError(e.to_string()))?;
 
-        let mut out = Vec::new();
-        for batch in &batches {
-            let paths = batch
-                .column_by_name("path")
-                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
-            let contents = batch
-                .column_by_name("content")
-                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
-
-            let start_lines = batch
-                .column_by_name("start_line")
-                .and_then(|col| col.as_any().downcast_ref::<UInt32Array>());
-            let end_lines = batch
-                .column_by_name("end_line")
-                .and_then(|col| col.as_any().downcast_ref::<UInt32Array>());
-            let start_bytes = batch
-                .column_by_name("start_byte")
-                .and_then(|col| col.as_any().downcast_ref::<UInt32Array>());
-            let end_bytes = batch
-                .column_by_name("end_byte")
-                .and_then(|col| col.as_any().downcast_ref::<UInt32Array>());
-
-            let symbols = if is_code {
-                batch
-                    .column_by_name("symbol")
-                    .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-            } else {
-                None
-            };
-            let kinds = if is_code {
-                batch
-                    .column_by_name("kind")
-                    .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-            } else {
-                None
-            };
-            let signatures = if is_code {
-                batch
-                    .column_by_name("signature")
-                    .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-            } else {
-                None
-            };
-
-            if let (Some(p), Some(c)) = (paths, contents) {
-                for i in 0..batch.num_rows() {
-                    let raw_path = p.value(i);
-                    let path = match raw_path.split_once('#') {
-                        Some((f, _)) => f.to_string(),
-                        None => raw_path.to_string(),
-                    };
-                    let snippet_len = if is_code { 600 } else { 400 };
-                    out.push(SearchResult {
-                        path,
-                        snippet: c.value(i).chars().take(snippet_len).collect(),
-                        start_line: start_lines.map_or(0, |a| a.value(i)),
-                        end_line: end_lines.map_or(0, |a| a.value(i)),
-                        start_byte: start_bytes.map_or(0, |a| a.value(i)),
-                        end_byte: end_bytes.map_or(0, |a| a.value(i)),
-                        symbol: symbols.map(|a| a.value(i).to_string()),
-                        kind: kinds.map(|a| a.value(i).to_string()),
-                        signature: signatures.map(|a| a.value(i).to_string()),
-                    });
-                }
-            }
-        }
-        Ok::<Vec<SearchResult>, SempkgError>(out)
+        Ok::<Vec<SearchResult>, SempkgError>(extract_results(&batches, is_code))
     })?;
 
     Ok(results)
+}
+
+/// Internal: convert LanceDB result batches into `SearchResult`s. Shared by the
+/// BM25 (`search_table`) and vector (`search_vector_table`) search paths.
+fn extract_results(batches: &[RecordBatch], is_code: bool) -> Vec<SearchResult> {
+    let mut out = Vec::new();
+    for batch in batches {
+        let paths = batch
+            .column_by_name("path")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+        let contents = batch
+            .column_by_name("content")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+
+        let start_lines = batch
+            .column_by_name("start_line")
+            .and_then(|col| col.as_any().downcast_ref::<UInt32Array>());
+        let end_lines = batch
+            .column_by_name("end_line")
+            .and_then(|col| col.as_any().downcast_ref::<UInt32Array>());
+        let start_bytes = batch
+            .column_by_name("start_byte")
+            .and_then(|col| col.as_any().downcast_ref::<UInt32Array>());
+        let end_bytes = batch
+            .column_by_name("end_byte")
+            .and_then(|col| col.as_any().downcast_ref::<UInt32Array>());
+
+        let symbols = if is_code {
+            batch
+                .column_by_name("symbol")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+        } else {
+            None
+        };
+        let kinds = if is_code {
+            batch
+                .column_by_name("kind")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+        } else {
+            None
+        };
+        let signatures = if is_code {
+            batch
+                .column_by_name("signature")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+        } else {
+            None
+        };
+
+        if let (Some(p), Some(c)) = (paths, contents) {
+            for i in 0..batch.num_rows() {
+                let raw_path = p.value(i);
+                let path = match raw_path.split_once('#') {
+                    Some((f, _)) => f.to_string(),
+                    None => raw_path.to_string(),
+                };
+                let snippet_len = if is_code { 600 } else { 400 };
+                out.push(SearchResult {
+                    path,
+                    snippet: c.value(i).chars().take(snippet_len).collect(),
+                    start_line: start_lines.map_or(0, |a| a.value(i)),
+                    end_line: end_lines.map_or(0, |a| a.value(i)),
+                    start_byte: start_bytes.map_or(0, |a| a.value(i)),
+                    end_byte: end_bytes.map_or(0, |a| a.value(i)),
+                    symbol: symbols.map(|a| a.value(i).to_string()),
+                    kind: kinds.map(|a| a.value(i).to_string()),
+                    signature: signatures.map(|a| a.value(i).to_string()),
+                });
+            }
+        }
+    }
+    out
+}
+
+/// Vector (semantic) search against the docs LanceDB table.
+pub fn search_vector(
+    lance_dir: &Path,
+    query_vec: &[f32],
+    limit: usize,
+) -> crate::error::Result<Vec<SearchResult>> {
+    search_vector_table(lance_dir, "docs", query_vec, limit, false)
+}
+
+/// Vector (semantic) search against the code LanceDB table.
+pub fn search_code_vector(
+    code_dir: &Path,
+    query_vec: &[f32],
+    limit: usize,
+) -> crate::error::Result<Vec<SearchResult>> {
+    search_vector_table(code_dir, "code", query_vec, limit, true)
+}
+
+/// Internal: cosine vector search against a named LanceDB table that has a
+/// `vector` column. Returns an empty result set (not an error) when the table
+/// has no `vector` column so callers degrade gracefully to BM25-only.
+fn search_vector_table(
+    dir: &Path,
+    table_name: &str,
+    query_vec: &[f32],
+    limit: usize,
+    is_code: bool,
+) -> crate::error::Result<Vec<SearchResult>> {
+    if !dir.is_dir() {
+        return Err(SempkgError::NoLanceIndex(dir.to_string_lossy().to_string()));
+    }
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(SempkgError::Io)?;
+
+    let query_vec = query_vec.to_vec();
+    let results = rt.block_on(async {
+        let db = lancedb::connect(dir.to_str().unwrap_or("."))
+            .execute()
+            .await
+            .map_err(|e| SempkgError::LanceError(e.to_string()))?;
+
+        let tbl = db
+            .open_table(table_name)
+            .execute()
+            .await
+            .map_err(|e| SempkgError::LanceError(e.to_string()))?;
+
+        // If the table has no `vector` column, there are no embeddings to query.
+        let schema = tbl
+            .schema()
+            .await
+            .map_err(|e| SempkgError::LanceError(e.to_string()))?;
+        if schema.column_with_name("vector").is_none() {
+            return Ok::<Vec<SearchResult>, SempkgError>(Vec::new());
+        }
+
+        let batches: Vec<RecordBatch> = tbl
+            .query()
+            .nearest_to(query_vec)
+            .map_err(|e| SempkgError::LanceError(e.to_string()))?
+            .column("vector")
+            .distance_type(DistanceType::Cosine)
+            .limit(limit)
+            .execute()
+            .await
+            .map_err(|e| SempkgError::LanceError(e.to_string()))?
+            .try_collect()
+            .await
+            .map_err(|e| SempkgError::LanceError(e.to_string()))?;
+
+        Ok::<Vec<SearchResult>, SempkgError>(extract_results(&batches, is_code))
+    })?;
+
+    Ok(results)
+}
+
+/// Embed every row's `content` in a LanceDB table and rewrite the table with an
+/// added `vector` column, then stamp the embedding model id + dimension into the
+/// table's `metadata.json`.
+///
+/// Works for both the `docs` and `code` tables: all existing columns are
+/// preserved and a `vector` `FixedSizeList<Float32, dim>` column is appended.
+/// Vector search uses LanceDB's brute-force kNN (no ANN index is built, which
+/// keeps bundle-sized tables exact and avoids "not enough rows to train"
+/// failures).
+pub fn embed_table(
+    dir: &Path,
+    table_name: &str,
+    embedder: &crate::embedding::Embedder,
+    model_id: &str,
+) -> crate::error::Result<u64> {
+    if !dir.is_dir() {
+        return Err(SempkgError::NoLanceIndex(dir.to_string_lossy().to_string()));
+    }
+
+    let dim = embedder.dim();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(SempkgError::Io)?;
+
+    let row_count = rt.block_on(async {
+        let db = lancedb::connect(dir.to_str().unwrap_or("."))
+            .execute()
+            .await
+            .map_err(|e| SempkgError::LanceError(e.to_string()))?;
+
+        let tbl = db
+            .open_table(table_name)
+            .execute()
+            .await
+            .map_err(|e| SempkgError::LanceError(e.to_string()))?;
+
+        // Full scan of the existing table (a plain query with no limit returns
+        // every row).
+        let batches: Vec<RecordBatch> = tbl
+            .query()
+            .execute()
+            .await
+            .map_err(|e| SempkgError::LanceError(e.to_string()))?
+            .try_collect()
+            .await
+            .map_err(|e| SempkgError::LanceError(e.to_string()))?;
+
+        if batches.is_empty() {
+            return Ok::<u64, SempkgError>(0);
+        }
+
+        // Build the augmented schema (original fields + `vector`).
+        let original_schema = batches[0].schema();
+        let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let vector_field = Field::new(
+            "vector",
+            DataType::FixedSizeList(item_field.clone(), dim as i32),
+            true,
+        );
+        let mut fields: Vec<Arc<Field>> = original_schema.fields().iter().cloned().collect();
+        fields.push(Arc::new(vector_field));
+        let new_schema = Arc::new(Schema::new(fields));
+
+        // Collect every content string from all Arrow batches so we can embed
+        // them all in one batched call (one context creation, multi-seq decode).
+        let all_texts: Vec<String> = batches
+            .iter()
+            .flat_map(|b| {
+                let col = b
+                    .column_by_name("content")
+                    .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+                (0..b.num_rows())
+                    .map(move |i| col.map(|c| c.value(i).to_owned()).unwrap_or_default())
+            })
+            .collect();
+
+        let total_rows = all_texts.len() as u64;
+        println!("    embedding {total_rows} rows...");
+
+        // Validate content column exists in the first non-empty batch.
+        if batches.iter().any(|b| b.column_by_name("content").is_none()) {
+            return Err(SempkgError::LanceError(format!(
+                "table `{table_name}` has no `content` column to embed"
+            )));
+        }
+
+        // Embed all rows in one batched pass (context created once inside).
+        let all_vecs = embedder
+            .embed_documents_batch(&all_texts)
+            .map_err(|e| SempkgError::LanceError(format!("batch embedding: {e}")))?;
+
+        // Verify dim on the first result.
+        if let Some(v) = all_vecs.first() {
+            if v.len() != dim {
+                return Err(SempkgError::LanceError(format!(
+                    "embedding dim mismatch: got {} expected {dim}",
+                    v.len()
+                )));
+            }
+        }
+
+        // Distribute embeddings back into per-Arrow-batch flat arrays and
+        // rebuild each RecordBatch with the new `vector` column appended.
+        let mut embed_iter = all_vecs.into_iter();
+        let mut new_batches: Vec<RecordBatch> = Vec::with_capacity(batches.len());
+
+        for batch in &batches {
+            let n = batch.num_rows();
+            let mut flat: Vec<f32> = Vec::with_capacity(n * dim);
+            for _ in 0..n {
+                let vec = embed_iter.next().unwrap_or_default();
+                flat.extend_from_slice(&vec);
+            }
+
+            let values = Float32Array::from(flat);
+            let list =
+                FixedSizeListArray::new(item_field.clone(), dim as i32, Arc::new(values), None);
+
+            let mut columns = batch.columns().to_vec();
+            columns.push(Arc::new(list));
+            let new_batch = RecordBatch::try_new(new_schema.clone(), columns)
+                .map_err(|e| SempkgError::LanceError(e.to_string()))?;
+            new_batches.push(new_batch);
+        }
+
+        // Replace the table with the embedded version.
+        let _ = db.drop_table(table_name, &[]).await;
+        let tbl = db
+            .create_table(table_name, new_batches)
+            .execute()
+            .await
+            .map_err(|e| SempkgError::LanceError(e.to_string()))?;
+
+        // Recreate the FTS index on `content` (best effort).
+        let _ = tbl
+            .create_index(
+                &["content"],
+                lancedb::index::Index::FTS(lancedb::index::scalar::FtsIndexBuilder::default()),
+            )
+            .execute()
+            .await;
+
+        Ok::<u64, SempkgError>(total_rows)
+    })?;
+
+    // Stamp embedding metadata into the table's metadata.json.
+    stamp_embedding_metadata(dir, model_id, dim as u32)?;
+
+    Ok(row_count)
+}
+
+/// Update (or create) `<dir>/metadata.json` with the embedding model id and
+/// dimension, preserving any existing fields.
+fn stamp_embedding_metadata(dir: &Path, model_id: &str, dim: u32) -> crate::error::Result<()> {
+    let meta_path = dir.join("metadata.json");
+    let mut value: serde_json::Value = std::fs::read_to_string(&meta_path)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert(
+            "embedding_model".to_string(),
+            serde_json::Value::String(model_id.to_string()),
+        );
+        obj.insert(
+            "embedding_dim".to_string(),
+            serde_json::Value::Number(dim.into()),
+        );
+    }
+
+    std::fs::write(
+        &meta_path,
+        serde_json::to_vec_pretty(&value).map_err(SempkgError::Json)?,
+    )?;
+    Ok(())
 }
 
 /// Fetch the full source body for a symbol from the `code` table.
