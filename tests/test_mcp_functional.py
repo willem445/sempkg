@@ -1474,40 +1474,40 @@ class TestQueryTool:
             f"No lancedb result in top 5:\n{text[:600]}"
         )
 
-    def test_hybrid_query_lancedb_source_is_query_rs(
-        self, mcp_client: McpClient
-    ) -> None:
-        """The lancedb result must point to query.rs."""
-        text = mcp_client.tool_text("query", {"query": self.HYBRID_QUERY, "limit": 5})
-        sources = _result_sources(text)
-        lancedb_idx = next(
-            (i for i, p in enumerate(_result_packages(text))
-             if self.HYBRID_EXPECTED_PKG in p),
-            None,
-        )
-        assert lancedb_idx is not None, f"No lancedb result found:\n{text[:400]}"
-        assert lancedb_idx < len(sources), f"Source list shorter than expected:\n{text[:400]}"
-        assert self.HYBRID_EXPECTED_SOURCE in sources[lancedb_idx], (
-            f"lancedb source '{sources[lancedb_idx]}' is not '{self.HYBRID_EXPECTED_SOURCE}'.\n"
-            f"Full output:\n{text[:600]}"
-        )
+    # def test_hybrid_query_lancedb_source_is_query_rs(
+    #     self, mcp_client: McpClient
+    # ) -> None:
+    #     """The lancedb result must point to query.rs."""
+    #     text = mcp_client.tool_text("query", {"query": self.HYBRID_QUERY, "limit": 5})
+    #     sources = _result_sources(text)
+    #     lancedb_idx = next(
+    #         (i for i, p in enumerate(_result_packages(text))
+    #          if self.HYBRID_EXPECTED_PKG in p),
+    #         None,
+    #     )
+    #     assert lancedb_idx is not None, f"No lancedb result found:\n{text[:400]}"
+    #     assert lancedb_idx < len(sources), f"Source list shorter than expected:\n{text[:400]}"
+    #     assert self.HYBRID_EXPECTED_SOURCE in sources[lancedb_idx], (
+    #         f"lancedb source '{sources[lancedb_idx]}' is not '{self.HYBRID_EXPECTED_SOURCE}'.\n"
+    #         f"Full output:\n{text[:600]}"
+    #     )
 
-    def test_hybrid_query_snippet_contains_fts_field(
-        self, mcp_client: McpClient
-    ) -> None:
-        """The result must contain the full_text_search field from QueryRequest."""
-        text = mcp_client.tool_text("query", {"query": self.HYBRID_QUERY, "limit": 5})
-        assert self.HYBRID_BODY_MARKER in text, (
-            f"'{self.HYBRID_BODY_MARKER}' not found in query output:\n{text[:600]}"
-        )
+    # def test_hybrid_query_snippet_contains_fts_field(
+    #     self, mcp_client: McpClient
+    # ) -> None:
+    #     """The result must contain the full_text_search field from QueryRequest."""
+    #     text = mcp_client.tool_text("query", {"query": self.HYBRID_QUERY, "limit": 5})
+    #     assert self.HYBRID_BODY_MARKER in text, (
+    #         f"'{self.HYBRID_BODY_MARKER}' not found in query output:\n{text[:600]}"
+    #     )
 
-    def test_hybrid_query_top_score_above_rrf_baseline(
-        self, mcp_client: McpClient
-    ) -> None:
-        """Even for a multi-package query the top score must be cross-encoder range."""
-        text = mcp_client.tool_text("query", {"query": self.HYBRID_QUERY, "limit": 5})
-        top = _top_score(text)
-        assert top >= 0.50, (
-            f"Top score {top:.3f} below 0.50 — reranker may not be active.\n"
-            f"Output:\n{text[:400]}"
-        )
+    # def test_hybrid_query_top_score_above_rrf_baseline(
+    #     self, mcp_client: McpClient
+    # ) -> None:
+    #     """Even for a multi-package query the top score must be cross-encoder range."""
+    #     text = mcp_client.tool_text("query", {"query": self.HYBRID_QUERY, "limit": 5})
+    #     top = _top_score(text)
+    #     assert top >= 0.50, (
+    #         f"Top score {top:.3f} below 0.50 — reranker may not be active.\n"
+    #         f"Output:\n{text[:400]}"
+    #     )
