@@ -201,7 +201,7 @@ jobs:
           key: functional-rust-ubuntu
 
       - name: Build sempkg release binary
-        run: cargo build --release --manifest-path src/sempkg/Cargo.toml
+        run: cargo build --release --manifest-path src/sempkg/Cargo.toml --features reranker
         env:
           LIBCLANG_PATH: /usr/lib/llvm-14/lib
 
