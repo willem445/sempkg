@@ -40,7 +40,7 @@ jobs:
         run: python -m pytest --cov=src/sempkg_registry --cov-report=term-missing
 
       - name: Upload coverage reports
-        uses: codecov/codecov-action@v3
+        uses: codecov/codecov-action@v7
         if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11'
         with:
           files: ./coverage.xml
