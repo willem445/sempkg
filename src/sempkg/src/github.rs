@@ -1214,9 +1214,9 @@ mod tests {
     fn test_parse_release_asset_url_rejects_non_release_url() {
         assert!(parse_release_asset_url("https://github.com/org/repo/archive/v1.tar.gz").is_none());
         assert!(parse_release_asset_url("https://example.com/pkg.sembundle").is_none());
-        assert!(parse_release_asset_url(
-            "https://github.com/org/repo/releases/download/v1.0.0"
-        )
-        .is_none());
+        assert!(
+            parse_release_asset_url("https://github.com/org/repo/releases/download/v1.0.0")
+                .is_none()
+        );
     }
 }

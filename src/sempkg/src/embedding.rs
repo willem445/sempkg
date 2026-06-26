@@ -226,9 +226,7 @@ impl Embedder {
     }
 
     /// Create an embedding context configured for this embedder.
-    fn make_ctx(
-        &self,
-    ) -> Result<llama_cpp_2::context::LlamaContext<'_>> {
+    fn make_ctx(&self) -> Result<llama_cpp_2::context::LlamaContext<'_>> {
         use llama_cpp_2::context::params::{LlamaContextParams, LlamaPoolingType};
         // Mirror the (working) reranker context setup: only n_ctx + embeddings.
         // Qwen3-Embedding uses last-token pooling, so request it explicitly

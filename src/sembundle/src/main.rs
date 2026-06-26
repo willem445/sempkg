@@ -316,14 +316,12 @@ fn main() {
         })
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error>),
 
-        Commands::KeyGen { output_dir } => {
-            keygen::keygen(KeygenOptions { output_dir })
-                .map(|(private_path, public_path)| {
-                    println!("Private key: {}", private_path.display());
-                    println!("Public key: {}", public_path.display());
-                })
-                .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
-        }
+        Commands::KeyGen { output_dir } => keygen::keygen(KeygenOptions { output_dir })
+            .map(|(private_path, public_path)| {
+                println!("Private key: {}", private_path.display());
+                println!("Public key: {}", public_path.display());
+            })
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error>),
 
         Commands::Sign {
             bundle_path,

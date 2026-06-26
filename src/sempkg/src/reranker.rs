@@ -200,9 +200,7 @@ pub fn download_file(url: &str, dest: &Path, hf_token: Option<&str>) -> Result<(
         let resp = match resp {
             Ok(r) => r,
             Err(e) if attempt < max_attempts => {
-                println!(
-                    "  download attempt {attempt}/{max_attempts} failed: {e}; retrying..."
-                );
+                println!("  download attempt {attempt}/{max_attempts} failed: {e}; retrying...");
                 std::thread::sleep(Duration::from_secs(attempt as u64 * 2));
                 continue;
             }
@@ -229,9 +227,7 @@ pub fn download_file(url: &str, dest: &Path, hf_token: Option<&str>) -> Result<(
         let mut resp = match resp.error_for_status() {
             Ok(r) => r,
             Err(e) if attempt < max_attempts => {
-                println!(
-                    "  download attempt {attempt}/{max_attempts} failed: {e}; retrying..."
-                );
+                println!("  download attempt {attempt}/{max_attempts} failed: {e}; retrying...");
                 std::thread::sleep(Duration::from_secs(attempt as u64 * 2));
                 continue;
             }
@@ -243,25 +239,27 @@ pub fn download_file(url: &str, dest: &Path, hf_token: Option<&str>) -> Result<(
         let mut file = std::fs::File::create(&tmp_dest)
             .with_context(|| format!("creating {}", tmp_dest.display()))?;
 
-        let copied = std::io::copy(&mut resp, &mut file)
-            .with_context(|| format!("reading body of {url}"));
+        let copied =
+            std::io::copy(&mut resp, &mut file).with_context(|| format!("reading body of {url}"));
 
         match copied {
             Ok(n) => {
                 file.flush()
                     .with_context(|| format!("flushing {}", tmp_dest.display()))?;
-                std::fs::rename(&tmp_dest, dest)
-                    .with_context(|| format!("moving {} to {}", tmp_dest.display(), dest.display()))?;
+                std::fs::rename(&tmp_dest, dest).with_context(|| {
+                    format!("moving {} to {}", tmp_dest.display(), dest.display())
+                })?;
 
                 let bytes_to_report = total.unwrap_or(n);
-                println!("  downloaded {:.1} MiB", bytes_to_report as f64 / 1_048_576.0);
+                println!(
+                    "  downloaded {:.1} MiB",
+                    bytes_to_report as f64 / 1_048_576.0
+                );
                 return Ok(());
             }
             Err(e) if attempt < max_attempts => {
                 let _ = std::fs::remove_file(&tmp_dest);
-                println!(
-                    "  download attempt {attempt}/{max_attempts} failed: {e}; retrying..."
-                );
+                println!("  download attempt {attempt}/{max_attempts} failed: {e}; retrying...");
                 std::thread::sleep(Duration::from_secs(attempt as u64 * 2));
             }
             Err(e) => {

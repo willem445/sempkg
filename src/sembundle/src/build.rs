@@ -1,4 +1,4 @@
-﻿//! Build pipeline: run codegraph and LanceDB against source / docs directories,
+//! Build pipeline: run codegraph and LanceDB against source / docs directories,
 //! then pack the results into a `.sembundle` archive.
 //!
 //! This is the implementation behind the `SemBundle build` subcommand.
@@ -115,9 +115,19 @@ pub fn build(opts: BuildOptions) -> Result<PathBuf, PackError> {
             .unwrap_or("**/*.rs,**/*.py,**/*.ts,**/*.tsx,**/*.js,**/*.jsx,**/*.go,**/*.java,**/*.cpp,**/*.cc,**/*.cxx,**/*.c,**/*.h,**/*.hpp");
         // Prefer the codegraph.db that run_codegraph just produced.
         let cg_db = cg_out.join("graph").join("codegraph.db");
-        let cg_db_opt = if cg_db.exists() { Some(cg_db.as_path()) } else { None };
+        let cg_db_opt = if cg_db.exists() {
+            Some(cg_db.as_path())
+        } else {
+            None
+        };
         eprintln!("[sembundle] Building LanceDB source-code index ...");
-        match run_source_index(&opts.source_dirs, &code_dir, glob, &opts.exclude_dirs, cg_db_opt) {
+        match run_source_index(
+            &opts.source_dirs,
+            &code_dir,
+            glob,
+            &opts.exclude_dirs,
+            cg_db_opt,
+        ) {
             Ok(()) => Some(code_dir),
             Err(PackError::InvalidField { ref field, .. }) if field == "source_dirs" => {
                 eprintln!(
@@ -204,7 +214,10 @@ fn run_codegraph(source_dirs: &[PathBuf], out_dir: &Path, exclude_dirs: &[PathBu
     for source_dir in source_dirs {
         // Skip source_dirs that are themselves excluded.
         if !exclude_dirs.is_empty() && is_excluded(source_dir, source_dir, exclude_dirs) {
-            eprintln!("[sembundle]   codegraph: skipping excluded dir {} ...", source_dir.display());
+            eprintln!(
+                "[sembundle]   codegraph: skipping excluded dir {} ...",
+                source_dir.display()
+            );
             continue;
         }
         eprintln!(
@@ -285,7 +298,12 @@ fn run_lance(
         .enable_all()
         .build()
         .map_err(PackError::Io)?;
-    rt.block_on(run_lance_inner(docs_dirs, out_dir, glob_pattern, exclude_dirs))
+    rt.block_on(run_lance_inner(
+        docs_dirs,
+        out_dir,
+        glob_pattern,
+        exclude_dirs,
+    ))
 }
 
 async fn run_lance_inner(
@@ -298,6 +316,10 @@ async fn run_lance_inner(
 
     let mut row_paths: Vec<String> = Vec::new();
     let mut row_contents: Vec<String> = Vec::new();
+    let mut row_start_lines: Vec<u32> = Vec::new();
+    let mut row_end_lines: Vec<u32> = Vec::new();
+    let mut row_start_bytes: Vec<u32> = Vec::new();
+    let mut row_end_bytes: Vec<u32> = Vec::new();
     let mut doc_count: u64 = 0;
 
     let patterns: Vec<&str> = glob_pattern.split(',').map(str::trim).collect();
@@ -337,7 +359,11 @@ async fn run_lance_inner(
             doc_count += 1;
             for (i, chunk) in chunk_text(&text, 800).into_iter().enumerate() {
                 row_paths.push(format!("{rel_str}#{i}"));
-                row_contents.push(chunk);
+                row_contents.push(chunk.text);
+                row_start_lines.push(chunk.start_line);
+                row_end_lines.push(chunk.end_line);
+                row_start_bytes.push(chunk.start_byte);
+                row_end_bytes.push(chunk.end_byte);
             }
         }
     }
@@ -355,12 +381,20 @@ async fn run_lance_inner(
     let schema = Arc::new(Schema::new(vec![
         Field::new("path", DataType::Utf8, false),
         Field::new("content", DataType::Utf8, false),
+        Field::new("start_line", DataType::UInt32, false),
+        Field::new("end_line", DataType::UInt32, false),
+        Field::new("start_byte", DataType::UInt32, false),
+        Field::new("end_byte", DataType::UInt32, false),
     ]));
     let batch = RecordBatch::try_new(
         schema.clone(),
         vec![
             Arc::new(StringArray::from(row_paths)),
             Arc::new(StringArray::from(row_contents)),
+            Arc::new(UInt32Array::from(row_start_lines)),
+            Arc::new(UInt32Array::from(row_end_lines)),
+            Arc::new(UInt32Array::from(row_start_bytes)),
+            Arc::new(UInt32Array::from(row_end_bytes)),
         ],
     )
     .map_err(|e| PackError::InvalidField {
@@ -390,18 +424,14 @@ async fn run_lance_inner(
     let fts_ok = tbl
         .create_index(
             &["content"],
-            lancedb::index::Index::FTS(
-                lancedb::index::scalar::FtsIndexBuilder::default(),
-            ),
+            lancedb::index::Index::FTS(lancedb::index::scalar::FtsIndexBuilder::default()),
         )
         .execute()
         .await
         .is_ok();
 
     if !fts_ok {
-        eprintln!(
-            "[sembundle] Warning: FTS index creation failed — search will use full scan."
-        );
+        eprintln!("[sembundle] Warning: FTS index creation failed — search will use full scan.");
     }
 
     let metadata = LanceMetadata {
@@ -650,7 +680,7 @@ fn extract_chunks_from_codegraph_db(
             // own boundaries so that read_symbol / read_code location lookups
             // (which filter by path + start_line) are completely unaffected.
             let ctx_start = collect_leading_comment_start(&text_lines, start_idx);
-            let ctx_end   = collect_trailing_comment_end(&text_lines, end_idx);
+            let ctx_end = collect_trailing_comment_end(&text_lines, end_idx);
             let body: String = text_lines[ctx_start..=ctx_end].join("\n");
 
             // Signature comes from the first non-empty line of the symbol
@@ -681,7 +711,11 @@ fn extract_chunks_from_codegraph_db(
                         path: file_path.clone(),
                         symbol: format!("{}#{}", sym_name, sub_idx),
                         kind: row.kind.clone(),
-                        signature: if sub_idx == 0 { sig.clone() } else { String::new() },
+                        signature: if sub_idx == 0 {
+                            sig.clone()
+                        } else {
+                            String::new()
+                        },
                         content: sub,
                         start_line: row.start_line,
                         end_line: row.end_line,
@@ -713,51 +747,100 @@ fn extract_chunks_from_codegraph_db(
 /// Used as a fallback when no `codegraph.db` is available.
 fn extract_symbol_chunks(rel_path: &str, text: &str, max_chunk_bytes: usize) -> Vec<SymbolChunk> {
     const KW: &[(&str, &str)] = &[
-        ("fn ", "function"), ("async fn ", "function"), ("const fn ", "function"),
-        ("unsafe fn ", "function"), ("extern \"C\" fn ", "function"),
-        ("struct ", "struct"), ("enum ", "enum"), ("trait ", "trait"),
-        ("impl ", "impl"), ("type ", "type"), ("mod ", "module"),
-        ("def ", "function"), ("async def ", "function"), ("class ", "class"),
-        ("function ", "function"), ("function* ", "function"),
-        ("async function ", "function"), ("interface ", "interface"),
-        ("func ", "function"), ("record ", "class"),
+        ("fn ", "function"),
+        ("async fn ", "function"),
+        ("const fn ", "function"),
+        ("unsafe fn ", "function"),
+        ("extern \"C\" fn ", "function"),
+        ("struct ", "struct"),
+        ("enum ", "enum"),
+        ("trait ", "trait"),
+        ("impl ", "impl"),
+        ("type ", "type"),
+        ("mod ", "module"),
+        ("def ", "function"),
+        ("async def ", "function"),
+        ("class ", "class"),
+        ("function ", "function"),
+        ("function* ", "function"),
+        ("async function ", "function"),
+        ("interface ", "interface"),
+        ("func ", "function"),
+        ("record ", "class"),
     ];
     const MODS: &[&str] = &[
-        "pub(crate) ", "pub(super) ", "pub(in ", "pub ", "private ", "protected ",
-        "public ", "static ", "abstract ", "final ", "override ", "export default ",
-        "export ", "extern ", "inline ", "virtual ", "async ",
+        "pub(crate) ",
+        "pub(super) ",
+        "pub(in ",
+        "pub ",
+        "private ",
+        "protected ",
+        "public ",
+        "static ",
+        "abstract ",
+        "final ",
+        "override ",
+        "export default ",
+        "export ",
+        "extern ",
+        "inline ",
+        "virtual ",
+        "async ",
     ];
 
     fn strip_mods<'a>(line: &'a str, mods: &[&str]) -> &'a str {
         let mut s = line;
         loop {
             let before = s;
-            for m in mods { if let Some(r) = s.strip_prefix(m) { s = r; break; } }
-            if s == before { break; }
+            for m in mods {
+                if let Some(r) = s.strip_prefix(m) {
+                    s = r;
+                    break;
+                }
+            }
+            if s == before {
+                break;
+            }
         }
         s
     }
 
     fn extract_name(stripped: &str, keyword: &str) -> String {
-        stripped.strip_prefix(keyword).unwrap_or(stripped)
+        stripped
+            .strip_prefix(keyword)
+            .unwrap_or(stripped)
             .split(|c: char| !c.is_alphanumeric() && c != '_')
-            .next().unwrap_or("").to_string()
+            .next()
+            .unwrap_or("")
+            .to_string()
     }
 
     let lines: Vec<&str> = text.lines().collect();
-    struct Boundary { kind: String, name: String, line_idx: usize }
+    struct Boundary {
+        kind: String,
+        name: String,
+        line_idx: usize,
+    }
     let mut boundaries: Vec<Boundary> = Vec::new();
 
     for (i, line) in lines.iter().enumerate() {
-        if line.starts_with(|c: char| c.is_whitespace()) { continue; }
+        if line.starts_with(|c: char| c.is_whitespace()) {
+            continue;
+        }
         let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('/') || trimmed.starts_with('#') { continue; }
+        if trimmed.is_empty() || trimmed.starts_with('/') || trimmed.starts_with('#') {
+            continue;
+        }
         let stripped = strip_mods(line, MODS);
         for &(kw, kind_str) in KW {
             if stripped.starts_with(kw) {
                 let name = extract_name(stripped, kw);
                 if !name.is_empty() {
-                    boundaries.push(Boundary { kind: kind_str.to_string(), name, line_idx: i });
+                    boundaries.push(Boundary {
+                        kind: kind_str.to_string(),
+                        name,
+                        line_idx: i,
+                    });
                     break;
                 }
             }
@@ -765,13 +848,23 @@ fn extract_symbol_chunks(rel_path: &str, text: &str, max_chunk_bytes: usize) -> 
     }
 
     if boundaries.is_empty() {
-        if text.is_empty() { return Vec::new(); }
+        if text.is_empty() {
+            return Vec::new();
+        }
         let content: String = text.chars().take(max_chunk_bytes).collect();
-        let sig = content.lines().find(|l| !l.trim().is_empty()).unwrap_or("").to_string();
+        let sig = content
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("")
+            .to_string();
         return vec![SymbolChunk {
-            path: rel_path.to_string(), symbol: rel_path.to_string(),
-            kind: "file".to_string(), signature: sig, content,
-            start_line: 1, end_line: lines.len() as u32,
+            path: rel_path.to_string(),
+            symbol: rel_path.to_string(),
+            kind: "file".to_string(),
+            signature: sig,
+            content,
+            start_line: 1,
+            end_line: lines.len() as u32,
         }];
     }
 
@@ -805,20 +898,33 @@ fn extract_symbol_chunks(rel_path: &str, text: &str, max_chunk_bytes: usize) -> 
         let end_line = (end + 1) as u32;
 
         if body.len() > max_chunk_bytes {
-            for (sub_idx, sub) in split_body_into_windows(&body, max_chunk_bytes).into_iter().enumerate() {
+            for (sub_idx, sub) in split_body_into_windows(&body, max_chunk_bytes)
+                .into_iter()
+                .enumerate()
+            {
                 chunks.push(SymbolChunk {
                     path: rel_path.to_string(),
                     symbol: format!("{}#{}", b.name, sub_idx),
                     kind: b.kind.clone(),
-                    signature: if sub_idx == 0 { sig.to_string() } else { String::new() },
-                    content: sub, start_line, end_line,
+                    signature: if sub_idx == 0 {
+                        sig.to_string()
+                    } else {
+                        String::new()
+                    },
+                    content: sub,
+                    start_line,
+                    end_line,
                 });
             }
         } else {
             chunks.push(SymbolChunk {
-                path: rel_path.to_string(), symbol: b.name.clone(),
-                kind: b.kind.clone(), signature: sig.to_string(), content: body,
-                start_line, end_line,
+                path: rel_path.to_string(),
+                symbol: b.name.clone(),
+                kind: b.kind.clone(),
+                signature: sig.to_string(),
+                content: body,
+                start_line,
+                end_line,
             });
         }
     }
@@ -833,7 +939,9 @@ fn split_body_into_windows(body: &str, max_bytes: usize) -> Vec<String> {
     while start < bytes.len() {
         let end = (start + max_bytes).min(bytes.len());
         let mut boundary = end;
-        while boundary > start && !body.is_char_boundary(boundary) { boundary -= 1; }
+        while boundary > start && !body.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
         out.push(body[start..boundary].to_string());
         start = boundary;
     }
@@ -862,7 +970,13 @@ fn run_source_index(
         .enable_all()
         .build()
         .map_err(PackError::Io)?;
-    rt.block_on(run_source_inner(source_dirs, out_dir, glob_pattern, exclude_dirs, codegraph_db))
+    rt.block_on(run_source_inner(
+        source_dirs,
+        out_dir,
+        glob_pattern,
+        exclude_dirs,
+        codegraph_db,
+    ))
 }
 
 async fn run_source_inner(
@@ -873,7 +987,7 @@ async fn run_source_inner(
     codegraph_db: Option<&Path>,
 ) -> Result<(), PackError> {
     const MAX_CHUNK_BYTES: usize = 8 * 1024; // 8 KiB per symbol chunk
-    const BATCH_SIZE: usize = 500;            // rows per LanceDB write batch
+    const BATCH_SIZE: usize = 500; // rows per LanceDB write batch
 
     std::fs::create_dir_all(out_dir)?;
 
@@ -889,19 +1003,33 @@ async fn run_source_inner(
         let mut acc: Vec<SymbolChunk> = Vec::new();
         let patterns: Vec<&str> = glob_pattern.split(',').map(str::trim).collect();
         for source_dir in source_dirs {
-            for entry in WalkDir::new(source_dir).min_depth(1).into_iter()
-                .filter_map(|e| e.ok()).filter(|e| e.file_type().is_file())
+            for entry in WalkDir::new(source_dir)
+                .min_depth(1)
+                .into_iter()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_type().is_file())
             {
                 let path = entry.path();
-                if !exclude_dirs.is_empty() && is_excluded(path, source_dir, exclude_dirs) { continue; }
-                let rel = path.strip_prefix(source_dir).unwrap_or(path);
-                let rel_str = rel.components()
-                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
-                    .collect::<Vec<_>>().join("/");
-                if !patterns.iter().any(|pat| glob::Pattern::new(pat).map(|p| p.matches(&rel_str)).unwrap_or(false)) {
+                if !exclude_dirs.is_empty() && is_excluded(path, source_dir, exclude_dirs) {
                     continue;
                 }
-                let text = match std::fs::read_to_string(path) { Ok(t) => t, Err(_) => continue };
+                let rel = path.strip_prefix(source_dir).unwrap_or(path);
+                let rel_str = rel
+                    .components()
+                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+                    .join("/");
+                if !patterns.iter().any(|pat| {
+                    glob::Pattern::new(pat)
+                        .map(|p| p.matches(&rel_str))
+                        .unwrap_or(false)
+                }) {
+                    continue;
+                }
+                let text = match std::fs::read_to_string(path) {
+                    Ok(t) => t,
+                    Err(_) => continue,
+                };
                 acc.extend(extract_symbol_chunks(&rel_str, &text, MAX_CHUNK_BYTES));
             }
         }
@@ -912,7 +1040,8 @@ async fn run_source_inner(
     if chunk_count == 0 {
         return Err(PackError::InvalidField {
             field: "source_dirs".to_string(),
-            reason: "no source files/symbols found — check --source-dir and --source-glob".to_string(),
+            reason: "no source files/symbols found — check --source-dir and --source-glob"
+                .to_string(),
         });
     }
 
@@ -923,13 +1052,13 @@ async fn run_source_inner(
     // Schema — drop start_byte/end_byte (reader treats them as optional/0)
     // -----------------------------------------------------------------------
     let schema = Arc::new(Schema::new(vec![
-        Field::new("path",       DataType::Utf8,   false),
-        Field::new("symbol",     DataType::Utf8,   false),
-        Field::new("kind",       DataType::Utf8,   false),
-        Field::new("signature",  DataType::Utf8,   false),
-        Field::new("content",    DataType::Utf8,   false),
+        Field::new("path", DataType::Utf8, false),
+        Field::new("symbol", DataType::Utf8, false),
+        Field::new("kind", DataType::Utf8, false),
+        Field::new("signature", DataType::Utf8, false),
+        Field::new("content", DataType::Utf8, false),
         Field::new("start_line", DataType::UInt32, false),
-        Field::new("end_line",   DataType::UInt32, false),
+        Field::new("end_line", DataType::UInt32, false),
     ]));
 
     // -----------------------------------------------------------------------
@@ -938,40 +1067,71 @@ async fn run_source_inner(
     let db = lancedb::connect(out_dir.to_str().unwrap_or("."))
         .execute()
         .await
-        .map_err(|e| PackError::InvalidField { field: "lancedb_connect".to_string(), reason: e.to_string() })?;
+        .map_err(|e| PackError::InvalidField {
+            field: "lancedb_connect".to_string(),
+            reason: e.to_string(),
+        })?;
 
     let make_batch = |slice: &[SymbolChunk]| -> Result<RecordBatch, PackError> {
         RecordBatch::try_new(
             schema.clone(),
             vec![
-                Arc::new(StringArray::from(slice.iter().map(|c| c.path.as_str()).collect::<Vec<_>>())),
-                Arc::new(StringArray::from(slice.iter().map(|c| c.symbol.as_str()).collect::<Vec<_>>())),
-                Arc::new(StringArray::from(slice.iter().map(|c| c.kind.as_str()).collect::<Vec<_>>())),
-                Arc::new(StringArray::from(slice.iter().map(|c| c.signature.as_str()).collect::<Vec<_>>())),
-                Arc::new(StringArray::from(slice.iter().map(|c| c.content.as_str()).collect::<Vec<_>>())),
-                Arc::new(UInt32Array::from(slice.iter().map(|c| c.start_line).collect::<Vec<_>>())),
-                Arc::new(UInt32Array::from(slice.iter().map(|c| c.end_line).collect::<Vec<_>>())),
+                Arc::new(StringArray::from(
+                    slice.iter().map(|c| c.path.as_str()).collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(
+                    slice.iter().map(|c| c.symbol.as_str()).collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(
+                    slice.iter().map(|c| c.kind.as_str()).collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(
+                    slice
+                        .iter()
+                        .map(|c| c.signature.as_str())
+                        .collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(
+                    slice.iter().map(|c| c.content.as_str()).collect::<Vec<_>>(),
+                )),
+                Arc::new(UInt32Array::from(
+                    slice.iter().map(|c| c.start_line).collect::<Vec<_>>(),
+                )),
+                Arc::new(UInt32Array::from(
+                    slice.iter().map(|c| c.end_line).collect::<Vec<_>>(),
+                )),
             ],
         )
-        .map_err(|e| PackError::InvalidField { field: "code_batch".to_string(), reason: e.to_string() })
+        .map_err(|e| PackError::InvalidField {
+            field: "code_batch".to_string(),
+            reason: e.to_string(),
+        })
     };
 
     let mut batches = chunks.chunks(BATCH_SIZE);
 
     // First batch creates the table.
-    let first = batches.next().expect("chunk_count > 0 guarantees at least one batch");
+    let first = batches
+        .next()
+        .expect("chunk_count > 0 guarantees at least one batch");
     let tbl = db
         .create_table("code", vec![make_batch(first)?])
         .execute()
         .await
-        .map_err(|e| PackError::InvalidField { field: "lancedb_create_table".to_string(), reason: e.to_string() })?;
+        .map_err(|e| PackError::InvalidField {
+            field: "lancedb_create_table".to_string(),
+            reason: e.to_string(),
+        })?;
 
     // Subsequent batches are appended.
     for batch_slice in batches {
         tbl.add(vec![make_batch(batch_slice)?])
             .execute()
             .await
-            .map_err(|e| PackError::InvalidField { field: "lancedb_add".to_string(), reason: e.to_string() })?;
+            .map_err(|e| PackError::InvalidField {
+                field: "lancedb_add".to_string(),
+                reason: e.to_string(),
+            })?;
     }
 
     // FTS index on the content column.
@@ -985,25 +1145,37 @@ async fn run_source_inner(
         .is_ok();
 
     if !fts_ok {
-        eprintln!("[sembundle] Warning: code FTS index creation failed — search will use full scan.");
+        eprintln!(
+            "[sembundle] Warning: code FTS index creation failed — search will use full scan."
+        );
     }
 
     let metadata = CodeMetadata {
         table_name: "code".to_string(),
         symbol_count,
         chunk_count,
-        indexed_paths: source_dirs.iter().map(|p| p.to_string_lossy().into_owned()).collect(),
+        indexed_paths: source_dirs
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect(),
         fts_enabled: fts_ok,
         created_at: String::new(), // stamped by pack()
         embedding_model: None,
         embedding_dim: None,
     };
-    std::fs::write(out_dir.join("metadata.json"), serde_json::to_vec_pretty(&metadata)?)?;
+    std::fs::write(
+        out_dir.join("metadata.json"),
+        serde_json::to_vec_pretty(&metadata)?,
+    )?;
 
     eprintln!(
         "[sembundle]   code: indexed {symbol_count} symbols, {chunk_count} chunks{} (source: {}).",
         if fts_ok { " (FTS enabled)" } else { "" },
-        if used_db { "codegraph.db" } else { "line-scanner" },
+        if used_db {
+            "codegraph.db"
+        } else {
+            "line-scanner"
+        },
     );
 
     Ok(())
@@ -1014,38 +1186,166 @@ async fn run_source_inner(
 // ---------------------------------------------------------------------------
 
 /// Split `text` into chunks of at most `max_chars` characters on paragraph boundaries.
-fn chunk_text(text: &str, max_chars: usize) -> Vec<String> {
-    let mut chunks: Vec<String> = Vec::new();
-    let mut current = String::new();
+/// A documentation chunk plus its 1-based line range and byte offsets within
+/// the source file. The line/byte metadata is what powers the `read_docs` MCP
+/// tool, which serves wider raw context than the search snippet.
+struct DocChunk {
+    text: String,
+    /// 1-based line number of the first line of this chunk.
+    start_line: u32,
+    /// 1-based line number of the last line of this chunk.
+    end_line: u32,
+    /// Byte offset of the chunk's start within the source file.
+    start_byte: u32,
+    /// Byte offset of the chunk's end (exclusive) within the source file.
+    end_byte: u32,
+}
 
-    for para in text.split("\n\n") {
-        let para = para.trim();
-        if para.is_empty() {
+/// Map a byte offset to its 1-based line number within `text`.
+///
+/// Snaps `byte_offset` back to the nearest valid UTF-8 char boundary so
+/// callers do not need to worry about multi-byte codepoints.
+fn byte_to_line(text: &str, byte_offset: usize) -> u32 {
+    let mut boundary = byte_offset.min(text.len());
+    while boundary > 0 && !text.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    text[..boundary].bytes().filter(|&b| b == b'\n').count() as u32 + 1
+}
+
+/// Push the exact source slice `text[start..end]` as a chunk.
+///
+/// Storing the verbatim slice (rather than a re-joined copy) is what makes line
+/// resolution exact downstream: splitting the stored text on `'\n'` maps line
+/// `i` back to source line `start_line + i`. A trailing newline is trimmed so
+/// the slice ends on real content and `end_line` is the line of the last byte.
+fn push_chunk(text: &str, start: usize, mut end: usize, chunks: &mut Vec<DocChunk>) {
+    let bytes = text.as_bytes();
+    while end > start && (bytes[end - 1] == b'\n' || bytes[end - 1] == b'\r') {
+        end -= 1;
+    }
+    if end <= start {
+        return;
+    }
+    chunks.push(DocChunk {
+        text: text[start..end].to_string(),
+        start_line: byte_to_line(text, start),
+        end_line: byte_to_line(text, end - 1),
+        start_byte: start as u32,
+        end_byte: end as u32,
+    });
+}
+
+/// Split the oversized paragraph at `[start, end)` into chunks that never begin
+/// or end mid-line. Whole lines are accumulated until the next line would
+/// overflow `max_chars`; a single line longer than `max_chars` is hard-split on
+/// char boundaries as a last resort.
+fn push_oversized_on_lines(
+    text: &str,
+    start: usize,
+    end: usize,
+    max_chars: usize,
+    chunks: &mut Vec<DocChunk>,
+) {
+    // Absolute byte offsets where each line begins within [start, end).
+    let bytes = text.as_bytes();
+    let mut line_starts = vec![start];
+    for (offset, &b) in bytes[start..end].iter().enumerate() {
+        if b == b'\n' && start + offset + 1 < end {
+            line_starts.push(start + offset + 1);
+        }
+    }
+    line_starts.push(end); // sentinel: one past the last line
+
+    let mut win_start = start;
+    for w in 1..line_starts.len() {
+        let line_lo = line_starts[w - 1];
+        let line_hi = line_starts[w];
+        // Adding this line would overflow a non-empty window: flush whole lines
+        // accumulated so far first.
+        if line_hi - win_start > max_chars && line_lo > win_start {
+            push_chunk(text, win_start, line_lo, chunks);
+            win_start = line_lo;
+        }
+        // A single line longer than the budget: hard-split it on char
+        // boundaries (the one unavoidable mid-line case).
+        if line_hi - line_lo > max_chars {
+            let mut off = line_lo;
+            while off < line_hi {
+                let mut stop = (off + max_chars).min(line_hi);
+                while stop > off && !text.is_char_boundary(stop) {
+                    stop -= 1;
+                }
+                if stop == off {
+                    stop = line_hi;
+                }
+                push_chunk(text, off, stop, chunks);
+                off = stop;
+            }
+            win_start = line_hi;
+        }
+    }
+    if end > win_start {
+        push_chunk(text, win_start, end, chunks);
+    }
+}
+
+fn chunk_text(text: &str, max_chars: usize) -> Vec<DocChunk> {
+    // Collect paragraphs (split on \n\n) as byte ranges in `text`. `str::split`
+    // returns subslices of the original, so pointer arithmetic gives us each
+    // paragraph's byte offset.
+    let mut paras: Vec<(usize, usize)> = Vec::new();
+    for raw in text.split("\n\n") {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
             continue;
         }
-        if current.len() + para.len() + 2 <= max_chars {
-            if !current.is_empty() {
-                current.push_str("\n\n");
-            }
-            current.push_str(para);
+        let raw_start = raw.as_ptr() as usize - text.as_ptr() as usize;
+        let trim_lead = raw.len() - raw.trim_start().len();
+        let start = raw_start + trim_lead;
+        paras.push((start, start + trimmed.len()));
+    }
+
+    let mut chunks: Vec<DocChunk> = Vec::new();
+    // Accumulate consecutive paragraphs as a single source span so the stored
+    // chunk is the exact substring `text[cur_start..cur_end]`.
+    let mut cur_start: Option<usize> = None;
+    let mut cur_end = 0usize;
+
+    for &(p_start, p_end) in &paras {
+        // Measure the prospective chunk on its original byte span — that is the
+        // slice we will actually store.
+        let fits = match cur_start {
+            None => p_end - p_start <= max_chars,
+            Some(s) => p_end - s <= max_chars,
+        };
+
+        if fits {
+            cur_start.get_or_insert(p_start);
+            cur_end = p_end;
+            continue;
+        }
+
+        // Flush what we have, then restart with this paragraph.
+        if let Some(s) = cur_start.take() {
+            push_chunk(text, s, cur_end, &mut chunks);
+        }
+        if p_end - p_start <= max_chars {
+            cur_start = Some(p_start);
+            cur_end = p_end;
         } else {
-            if !current.is_empty() {
-                chunks.push(std::mem::take(&mut current));
-            }
-            if para.len() <= max_chars {
-                current.push_str(para);
-            } else {
-                for window in para.as_bytes().chunks(max_chars) {
-                    chunks.push(String::from_utf8_lossy(window).into_owned());
-                }
-            }
+            push_oversized_on_lines(text, p_start, p_end, max_chars, &mut chunks);
+            cur_start = None;
         }
     }
-    if !current.is_empty() {
-        chunks.push(current);
+    if let Some(s) = cur_start {
+        push_chunk(text, s, cur_end, &mut chunks);
     }
+
     if chunks.is_empty() && !text.is_empty() {
-        chunks.push(text.chars().take(max_chars).collect());
+        // No paragraph breaks at all: fall back to line-aware windowing over the
+        // whole text so we still avoid mid-line cuts where possible.
+        push_oversized_on_lines(text, 0, text.len(), max_chars, &mut chunks);
     }
     chunks
 }
@@ -1173,9 +1473,15 @@ mod tests {
         let text = "para one\n\npara two\n\npara three";
         let chunks = chunk_text(text, 200);
         assert!(!chunks.is_empty());
-        let joined = chunks.join(" ");
+        let joined = chunks
+            .iter()
+            .map(|c| c.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
         assert!(joined.contains("para one"));
         assert!(joined.contains("para three"));
+        // First chunk starts on line 1 of the source.
+        assert_eq!(chunks[0].start_line, 1);
     }
 
     #[test]
@@ -1184,7 +1490,7 @@ mod tests {
         let chunks = chunk_text(&text, 800);
         assert!(chunks.len() >= 2);
         for c in &chunks {
-            assert!(c.len() <= 800);
+            assert!(c.text.len() <= 800);
         }
     }
 }

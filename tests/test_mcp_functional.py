@@ -1511,3 +1511,131 @@ class TestQueryTool:
     #         f"Top score {top:.3f} below 0.50 — reranker may not be active.\n"
     #         f"Output:\n{text[:400]}"
     #     )
+
+
+# ---------------------------------------------------------------------------
+# MCP — read_docs (raw documentation reader)
+# ---------------------------------------------------------------------------
+#
+# read_docs follows up a search_docs hit: the agent passes the returned file
+# path (and optionally the reported line range) and gets the full surrounding
+# raw content instead of the truncated search snippet.
+
+DOC_CANDIDATE_PKGS = ["llama-cpp-rs", "lancedb", "sempkg", "codegraph"]
+DOC_DISCOVERY_QUERIES = ["install", "example", "usage", "function", "the"]
+
+# A search_docs hit header looks like ``[0.92] README.md:10-20`` or, on bundles
+# without line metadata, just ``README.md``.
+_DOC_HIT_RE = _re.compile(
+    r"(?m)^(?:\[[0-9.]+\]\s*)?"
+    r"([^\n:`*]+?\.(?:md|rst|txt|markdown))"
+    r"(?::(\d+)-(\d+))?\s*$"
+)
+
+
+def _discover_doc_hit(client: McpClient):
+    """Find the first usable docs hit across the candidate bundles.
+
+    Returns ``(package, path, start_line, end_line, snippet)`` or ``None`` when
+    no installed bundle exposes a documentation index.
+    """
+    for pkg in DOC_CANDIDATE_PKGS:
+        for query in DOC_DISCOVERY_QUERIES:
+            resp = client.call_tool(
+                "search_docs", {"package": pkg, "query": query, "limit": 1}
+            )
+            if "error" in resp or "result" not in resp:
+                break  # package not present / no docs index — try next package
+            content = resp["result"].get("content", [])
+            if not content:
+                break
+            text = content[0]["text"]
+            m = _DOC_HIT_RE.search(text)
+            if not m:
+                continue
+            path = m.group(1).strip()
+            sl = int(m.group(2)) if m.group(2) else None
+            el = int(m.group(3)) if m.group(3) else None
+            # The snippet is whatever follows the matched header, up to the next
+            # result separator — this is the <=400-char excerpt search returns.
+            snippet = text[m.end():].split("\n---\n", 1)[0].strip()
+            return pkg, path, sl, el, snippet
+    return None
+
+
+def _fenced_body(text: str) -> str:
+    """Return the content inside the first ``` fenced block, or ''."""
+    parts = text.split("```")
+    return parts[1] if len(parts) >= 3 else ""
+
+
+@pytest.mark.functional
+class TestReadDocs:
+    """read_docs returns full, untruncated documentation content."""
+
+    def test_read_docs_in_tools_list(self, mcp_client: McpClient) -> None:
+        resp = mcp_client.send("tools/list", {})
+        tools = [t["name"] for t in resp["result"]["tools"]]
+        assert "read_docs" in tools, f"read_docs missing from tools/list: {tools}"
+
+    def test_read_docs_returns_at_least_the_snippet(
+        self, mcp_client: McpClient
+    ) -> None:
+        """The full-file read must contain at least as much as the search snippet."""
+        hit = _discover_doc_hit(mcp_client)
+        if hit is None:
+            pytest.skip("no installed bundle exposes a documentation index")
+        pkg, path, _sl, _el, snippet = hit
+
+        text = mcp_client.tool_text("read_docs", {"package": pkg, "file": path})
+        assert "No documentation content found" not in text, (
+            f"read_docs could not resolve a path search_docs returned:\n{text[:300]}"
+        )
+        body = _fenced_body(text)
+        assert body, f"read_docs output had no fenced content block:\n{text[:300]}"
+        # read_docs serves the whole chunk(s); the snippet was truncated, so the
+        # full body must be at least as long.
+        assert len(body) >= len(snippet), (
+            f"read_docs body ({len(body)} chars) shorter than the search snippet "
+            f"({len(snippet)} chars) for {pkg}:{path}"
+        )
+
+    def test_read_docs_unknown_file_is_graceful(self, mcp_client: McpClient) -> None:
+        hit = _discover_doc_hit(mcp_client)
+        if hit is None:
+            pytest.skip("no installed bundle exposes a documentation index")
+        pkg = hit[0]
+        text = mcp_client.tool_text(
+            "read_docs",
+            {"package": pkg, "file": "this_file_does_not_exist_zzz.md"},
+        )
+        assert "No documentation content found" in text, (
+            f"Expected a not-found message, got:\n{text[:300]}"
+        )
+        assert "```" not in text, (
+            f"Not-found response must not contain a content block:\n{text[:300]}"
+        )
+
+    def test_read_docs_line_range_is_subset_of_full_file(
+        self, mcp_client: McpClient
+    ) -> None:
+        """A line-bounded read must not exceed the full-file read."""
+        hit = _discover_doc_hit(mcp_client)
+        if hit is None:
+            pytest.skip("no installed bundle exposes a documentation index")
+        pkg, path, sl, el, _snippet = hit
+        if sl is None or el is None:
+            pytest.skip("docs index has no line metadata (older bundle)")
+
+        full = mcp_client.tool_text("read_docs", {"package": pkg, "file": path})
+        ranged = mcp_client.tool_text(
+            "read_docs",
+            {"package": pkg, "file": path, "start_line": sl, "end_line": el},
+        )
+        assert "No documentation content found" not in ranged, (
+            f"Ranged read failed for {pkg}:{path}:{sl}-{el}:\n{ranged[:300]}"
+        )
+        assert _fenced_body(ranged), f"ranged read had no content block:\n{ranged[:300]}"
+        assert len(_fenced_body(ranged)) <= len(_fenced_body(full)), (
+            "Line-bounded read returned more content than the whole file"
+        )

@@ -221,6 +221,22 @@ fn all_tools() -> Value {
             &["package", "query"]
         ),
         tool_schema(
+            "read_docs",
+            "Read the raw documentation content of a file from a bundle's docs index, \
+             optionally narrowed to a line range. Use this after search_docs returns a \
+             file path and line range — pass the path here to retrieve the full surrounding \
+             context the search snippet truncates. Omit start_line/end_line to read the whole \
+             file, or supply them (as reported by search_docs) to read just that region. \
+             Only available for bundles with a documentation index.",
+            json!({
+                "package":    { "type": "string", "description": "Bundle name" },
+                "file":       { "type": "string", "description": "Doc file path as returned by search_docs (e.g. README.md)" },
+                "start_line": { "type": "integer", "description": "Optional 1-based first line to read (inclusive)" },
+                "end_line":   { "type": "integer", "description": "Optional 1-based last line to read (inclusive)" }
+            }),
+            &["package", "file"]
+        ),
+        tool_schema(
             "docs_metadata",
             "Show LanceDB metadata (table name, document count, chunk count, FTS status) for a bundle.",
             json!({
@@ -1211,6 +1227,47 @@ impl McpContext {
         }
     }
 
+    fn tool_read_docs(
+        &self,
+        package: &str,
+        file: &str,
+        start_line: Option<u32>,
+        end_line: Option<u32>,
+    ) -> String {
+        match self.resolve_lance_path(package) {
+            Err(e) => e,
+            Ok(lance_dir) => match lance::fetch_doc_lines(&lance_dir, file, start_line, end_line) {
+                Err(e) => format!("Error reading docs: {e}"),
+                Ok(None) => format!(
+                    "No documentation content found for `{file}` in '{package}'. \
+                     Verify the file path against a search_docs result for this bundle."
+                ),
+                Ok(Some(slice)) => {
+                    let loc = if slice.start_line > 0 {
+                        format!("{}:{}-{}", slice.path, slice.start_line, slice.end_line)
+                    } else {
+                        slice.path.clone()
+                    };
+                    let mut note = String::new();
+                    if slice.line_meta_missing && (start_line.is_some() || end_line.is_some()) {
+                        note.push_str(
+                            "\n_(This bundle's docs index has no line metadata; \
+                             returning the full file instead of the requested range.)_\n",
+                        );
+                    }
+                    format!(
+                        "**{}** ({} chunk{}){}\n\n```\n{}\n```",
+                        loc,
+                        slice.chunk_count,
+                        if slice.chunk_count == 1 { "" } else { "s" },
+                        note,
+                        slice.content
+                    )
+                }
+            },
+        }
+    }
+
     fn tool_search_code(
         &self,
         package: &str,
@@ -1389,62 +1446,60 @@ impl McpContext {
         };
 
         // ── Helper: push codegraph JSON nodes into hits ──────────────────
-        let push_codegraph_hits = |hits: &mut Vec<UnifiedHit>,
-                                  pkg_name: &str,
-                                  raw_json: &str|
-         -> usize {
-            let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(raw_json) else {
-                return 0;
+        let push_codegraph_hits =
+            |hits: &mut Vec<UnifiedHit>, pkg_name: &str, raw_json: &str| -> usize {
+                let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(raw_json) else {
+                    return 0;
+                };
+                for (pos, v) in arr.iter().enumerate() {
+                    let node = v.get("node").unwrap_or(v);
+                    let get_str = |k: &str| {
+                        node.get(k)
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("")
+                            .to_string()
+                    };
+                    let qualified = get_str("qualifiedName");
+                    let name = get_str("name");
+                    let label = if !qualified.is_empty() {
+                        qualified
+                    } else {
+                        name
+                    };
+                    let kind = get_str("kind");
+                    let sig = get_str("signature");
+                    let file = get_str("filePath");
+                    let start = node.get("startLine").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+                    let end = node.get("endLine").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+                    let snippet = if !sig.is_empty() {
+                        sig.clone()
+                    } else {
+                        format!("{kind} {label}")
+                    };
+                    // Uniform RRF — do NOT use the codegraph envelope score here.
+                    // Codegraph BM25 and lance BM25 are on different scales; mixing
+                    // them biases the global sort.  Rank position is the only
+                    // comparable signal across heterogeneous sources.
+                    let rrf_score = weight / (60.0 + pos as f32 + 1.0);
+                    hits.push(UnifiedHit {
+                        package: pkg_name.to_string(),
+                        origin: "codegraph",
+                        path: file,
+                        start_line: start,
+                        end_line: end,
+                        snippet,
+                        symbol: Some(label),
+                        kind: Some(kind),
+                        signature: Some(sig),
+                        rrf_score,
+                        expanded_text: None,
+                        best_window: None,
+                        best_window_first: false,
+                        kwic_count: 0,
+                    });
+                }
+                arr.len()
             };
-            for (pos, v) in arr.iter().enumerate() {
-                let node = v.get("node").unwrap_or(v);
-                let get_str = |k: &str| {
-                    node.get(k)
-                        .and_then(|x| x.as_str())
-                        .unwrap_or("")
-                        .to_string()
-                };
-                let qualified = get_str("qualifiedName");
-                let name = get_str("name");
-                let label = if !qualified.is_empty() {
-                    qualified
-                } else {
-                    name
-                };
-                let kind = get_str("kind");
-                let sig = get_str("signature");
-                let file = get_str("filePath");
-                let start = node.get("startLine").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
-                let end = node.get("endLine").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
-                let snippet = if !sig.is_empty() {
-                    sig.clone()
-                } else {
-                    format!("{kind} {label}")
-                };
-                // Uniform RRF — do NOT use the codegraph envelope score here.
-                // Codegraph BM25 and lance BM25 are on different scales; mixing
-                // them biases the global sort.  Rank position is the only
-                // comparable signal across heterogeneous sources.
-                let rrf_score = weight / (60.0 + pos as f32 + 1.0);
-                hits.push(UnifiedHit {
-                    package: pkg_name.to_string(),
-                    origin: "codegraph",
-                    path: file,
-                    start_line: start,
-                    end_line: end,
-                    snippet,
-                    symbol: Some(label),
-                    kind: Some(kind),
-                    signature: Some(sig),
-                    rrf_score,
-                    expanded_text: None,
-                    best_window: None,
-                    best_window_first: false,
-                    kwic_count: 0,
-                });
-            }
-            arr.len()
-        };
 
         // ── Installed bundles ────────────────────────────────────────────
         let bundles = list_all_bundles(self.workspace().map(|p| p.as_path()));
@@ -1581,7 +1636,8 @@ impl McpContext {
 
         for (run_idx, (q, weight, do_lex, do_vec)) in runs.iter().enumerate() {
             let before = hits.len();
-            let stats = self.collect_query_hits(q, *weight, *do_lex, *do_vec, fetch_limit, &mut hits);
+            let stats =
+                self.collect_query_hits(q, *weight, *do_lex, *do_vec, fetch_limit, &mut hits);
             if debug {
                 eprintln!(
                     "sempkg: query run[{run_idx}] route={{lex:{do_lex}, vec:{do_vec}}} weight={weight:.1} q={q:?} added={} lex(code/docs/codegraph)={}/{}/{} vec(code/docs)={}/{} vec_tables(compatible/checked)={}/{}",
@@ -1594,7 +1650,10 @@ impl McpContext {
                     stats.vec_tables_compatible,
                     stats.vec_tables_checked
                 );
-                eprintln!("sempkg: query run[{run_idx}] cumulative_raw_hits={}", hits.len());
+                eprintln!(
+                    "sempkg: query run[{run_idx}] cumulative_raw_hits={}",
+                    hits.len()
+                );
                 debug_print_stage_hits(
                     &format!("query run[{run_idx}] raw hits"),
                     &hits[before..],
@@ -2380,6 +2439,15 @@ impl McpContext {
             }
             "search_docs" => {
                 self.tool_search_docs(str_arg("package"), str_arg("query"), int_arg("limit", 10))
+            }
+            "read_docs" => {
+                let opt_line = |key: &str| args.get(key).and_then(|v| v.as_u64()).map(|v| v as u32);
+                self.tool_read_docs(
+                    str_arg("package"),
+                    str_arg("file"),
+                    opt_line("start_line"),
+                    opt_line("end_line"),
+                )
             }
             "docs_metadata" => self.tool_docs_metadata(str_arg("package")),
             "search_code" => self.tool_search_code(
