@@ -481,6 +481,7 @@ falling back to global bundles. Omit `-C` to use only the global bundle store.
 | Tool | Required params | Optional params | Description |
 |------|-----------------|-----------------|-------------|
 | `list_packages` | — | — | List all local packages and installed bundles with index and docs status |
+| `query` | `query` | `package`, `limit` | Unified hybrid search (BM25 + vector + CodeGraph, RRF-fused, reranked). Searches every installed package by default; pass `package` (name or `name@version`) to focus the whole pipeline on one package for a deeper, less-diluted search |
 | `search_symbols` | `package`, `query` | `kind`, `limit` | FTS symbol search via CodeGraph |
 | `get_context` | `package`, `task` | — | AI-optimised code context for a natural-language task |
 | `get_callers` | `package`, `symbol` | `limit` | Find all callers of a symbol |

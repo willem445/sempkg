@@ -291,11 +291,15 @@ fn all_tools() -> Value {
              all candidates together with the local reranker (when available). \
              Returns rich markdown with package provenance, relevance score, source file, \
              line range, and a source snippet for each hit. \
+             Optionally restrict the search to a single package with `package` when you \
+             already know where to look — this focuses the whole retrieval+reranking pipeline \
+             on that package for a deeper, less diluted search. \
              Use the other MCP tools (read_code, read_symbol, search_symbols, …) to drill \
              into specific results.",
             json!({
-                "query": { "type": "string", "description": "Natural-language or keyword search query" },
-                "limit": { "type": "integer", "description": "Max results to return after reranking (default 10)" }
+                "query":   { "type": "string", "description": "Natural-language or keyword search query" },
+                "package": { "type": "string", "description": "Optional. Restrict the search to a single package or bundle, by name (e.g. 'lancedb') or exact 'name@version'. Omit to search every installed package. Use list_packages to see available names." },
+                "limit":   { "type": "integer", "description": "Max results to return after reranking (default 10)" }
             }),
             &["query"]
         ),
@@ -788,6 +792,26 @@ fn format_unified_hit(h: &UnifiedHit, query: &str, rank: usize, score: Option<f3
 // ---------------------------------------------------------------------------
 // Dedup helpers for tool_query
 // ---------------------------------------------------------------------------
+
+/// Returns `true` when an optional `query` package scope selects the package
+/// identified by `name` (a local package) or `name`/`version` (a bundle).
+///
+/// A `None` scope selects everything. A bundle matches either its bare name
+/// (`lancedb`) or its exact versioned form (`lancedb@0.5.0`); a local package
+/// matches its name only. Matching is case-insensitive so it tolerates the
+/// casing an agent copies from `list_packages` output.
+fn scope_selects(scope: Option<&str>, name: &str, version: Option<&str>) -> bool {
+    let Some(scope) = scope else {
+        return true;
+    };
+    if scope.eq_ignore_ascii_case(name) {
+        return true;
+    }
+    match version {
+        Some(v) => scope.eq_ignore_ascii_case(&format!("{name}@{v}")),
+        None => false,
+    }
+}
 
 /// Normalise a file path to a canonical dedup key component:
 /// lowercase + forward-slash separators so that Windows codegraph paths
@@ -1405,6 +1429,7 @@ impl McpContext {
         do_lex: bool,
         do_vec: bool,
         is_original: bool,
+        scope: Option<&str>,
         fetch_limit: usize,
         hits: &mut Vec<UnifiedHit>,
     ) -> QueryRunStats {
@@ -1517,6 +1542,9 @@ impl McpContext {
         // ── Installed bundles ────────────────────────────────────────────
         let bundles = list_all_bundles(self.workspace().map(|p| p.as_path()));
         for bundle in &bundles {
+            if !scope_selects(scope, &bundle.name, Some(&bundle.version)) {
+                continue;
+            }
             let pkg_name = format!("{}@{}", bundle.name, bundle.version);
 
             // Source-code index
@@ -1571,6 +1599,9 @@ impl McpContext {
 
         // ── Local packages ───────────────────────────────────────────────
         for pkg in self.registry.list() {
+            if !scope_selects(scope, &pkg.name, None) {
+                continue;
+            }
             let pkg_name = pkg.name.clone();
 
             // Lance docs index at <pkg>/.sempkg/lance/
@@ -1605,11 +1636,35 @@ impl McpContext {
         stats
     }
 
-    fn tool_query(&self, query: &str, limit: usize) -> String {
+    fn tool_query(&self, query: &str, scope: Option<&str>, limit: usize) -> String {
         let debug = std::env::var("SEMPKG_DEBUG").is_ok();
         let debug_list_limit = debug_hit_list_limit();
         let fetch_limit = self.reranker_fetch_limit(limit).max(20);
         let mut hits: Vec<UnifiedHit> = Vec::new();
+
+        // ── Optional package scope ────────────────────────────────────────
+        // When the agent restricts the search to a single package, validate the
+        // name up front so a typo fails loudly with the available names rather
+        // than silently returning "no results".
+        if let Some(s) = scope {
+            let matches_any = self
+                .registry
+                .list()
+                .iter()
+                .any(|p| scope_selects(scope, &p.name, None))
+                || list_all_bundles(self.workspace().map(|p| p.as_path()))
+                    .iter()
+                    .any(|b| scope_selects(scope, &b.name, Some(&b.version)));
+            if !matches_any {
+                let available = self.available_names();
+                let hint = if available.is_empty() {
+                    " No packages or bundles installed yet.".to_string()
+                } else {
+                    format!(" Available: {}", available.join(", "))
+                };
+                return format!("Package scope '{s}' not found.{hint}");
+            }
+        }
 
         // ── Query expansion → retrieval runs ─────────────────────────────
         // The original query always runs against BOTH backends with double
@@ -1657,6 +1712,7 @@ impl McpContext {
                 *do_lex,
                 *do_vec,
                 is_original,
+                scope,
                 fetch_limit,
                 &mut hits,
             );
@@ -1685,11 +1741,18 @@ impl McpContext {
         }
 
         if hits.is_empty() {
-            return format!(
-                "No results found for: `{query}`\n\n\
-                 Make sure at least one package is indexed or a bundle with a code/docs \
-                 index is installed (`sempkg list`)."
-            );
+            return match scope {
+                Some(s) => format!(
+                    "No results found for: `{query}` in package `{s}`\n\n\
+                     The package is installed but its index returned nothing for this query. \
+                     Try a broader query, or omit `package` to search every installed package."
+                ),
+                None => format!(
+                    "No results found for: `{query}`\n\n\
+                     Make sure at least one package is indexed or a bundle with a code/docs \
+                     index is installed (`sempkg list`)."
+                ),
+            };
         }
 
         // ── Dedup ────────────────────────────────────────────────────────
@@ -2558,7 +2621,7 @@ impl McpContext {
                 let line = args.get("line").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
                 self.tool_read_code(str_arg("package"), str_arg("file"), line)
             }
-            "query" => self.tool_query(str_arg("query"), int_arg("limit", 10)),
+            "query" => self.tool_query(str_arg("query"), opt_str("package"), int_arg("limit", 10)),
             _ => format!("Unknown tool: {name}"),
         }
     }
@@ -2660,5 +2723,53 @@ fn handle_message(ctx: &McpContext, line: &str) -> Option<RpcResponse> {
             -32601,
             format!("Method not found: {}", req.method),
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scope_none_selects_everything() {
+        assert!(scope_selects(None, "lancedb", Some("0.5.0")));
+        assert!(scope_selects(None, "local-pkg", None));
+    }
+
+    #[test]
+    fn scope_matches_bare_name_for_bundle_and_local() {
+        assert!(scope_selects(Some("lancedb"), "lancedb", Some("0.5.0")));
+        assert!(scope_selects(Some("local-pkg"), "local-pkg", None));
+    }
+
+    #[test]
+    fn scope_matches_exact_versioned_bundle() {
+        assert!(scope_selects(
+            Some("lancedb@0.5.0"),
+            "lancedb",
+            Some("0.5.0")
+        ));
+    }
+
+    #[test]
+    fn scope_rejects_wrong_name_or_version() {
+        assert!(!scope_selects(Some("qmd"), "lancedb", Some("0.5.0")));
+        assert!(!scope_selects(
+            Some("lancedb@9.9.9"),
+            "lancedb",
+            Some("0.5.0")
+        ));
+        // A versioned scope never matches a local package (which has no version).
+        assert!(!scope_selects(Some("local-pkg@1.0.0"), "local-pkg", None));
+    }
+
+    #[test]
+    fn scope_matching_is_case_insensitive() {
+        assert!(scope_selects(Some("LanceDB"), "lancedb", Some("0.5.0")));
+        assert!(scope_selects(
+            Some("lancedb@0.5.0"),
+            "LanceDB",
+            Some("0.5.0")
+        ));
     }
 }
