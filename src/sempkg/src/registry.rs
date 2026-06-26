@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-use crate::error::SempkgError;
+use crate::{error::SempkgError, github};
 
 // ---------------------------------------------------------------------------
 // Registry index schema
@@ -191,29 +191,38 @@ impl RegistryClient {
 ///
 /// Use this when a dependency specifies a `url` directly (e.g. a GitHub release
 /// asset) rather than going through a registry.
+///
+/// GitHub does **not** honor a PAT `Authorization` header on the public
+/// `browser_download_url` of a **private** repository — it returns `404`. When
+/// the URL is a GitHub release asset and a token is configured, the bytes are
+/// resolved and fetched through the authenticated REST API instead; otherwise
+/// we fall back to a plain download (which works for public release assets and
+/// arbitrary URLs).
 pub fn download_from_url(url: &str, expected_sha256: Option<&str>) -> Result<Vec<u8>> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
-        .build()
-        .context("Failed to build HTTP client")?;
+    let bytes = if let Some(bytes) = github::download_release_asset_authenticated(url)? {
+        bytes
+    } else {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(120))
+            .build()
+            .context("Failed to build HTTP client")?;
 
-    let resp = client
-        .get(url)
-        .send()
-        .with_context(|| format!("Failed to connect to {url}"))?;
+        let resp = direct_download_request(&client, url)
+            .send()
+            .with_context(|| format!("Failed to connect to {url}"))?;
 
-    if !resp.status().is_success() {
-        return Err(SempkgError::RegistryError {
-            url: url.to_string(),
-            message: format!("HTTP {}", resp.status()),
+        if !resp.status().is_success() {
+            return Err(SempkgError::RegistryError {
+                url: url.to_string(),
+                message: format!("HTTP {}", resp.status()),
+            }
+            .into());
         }
-        .into());
-    }
 
-    let bytes = resp
-        .bytes()
-        .context("Failed to read response body")?
-        .to_vec();
+        resp.bytes()
+            .context("Failed to read response body")?
+            .to_vec()
+    };
 
     if let Some(expected) = expected_sha256 {
         let actual = hex::encode(Sha256::digest(&bytes));
@@ -228,4 +237,81 @@ pub fn download_from_url(url: &str, expected_sha256: Option<&str>) -> Result<Vec
     }
 
     Ok(bytes)
+}
+
+fn direct_download_request(
+    client: &reqwest::blocking::Client,
+    url: &str,
+) -> reqwest::blocking::RequestBuilder {
+    let mut req = client.get(url);
+    if let Some(token) = github::github_token_for_url(url) {
+        req = req.header("Authorization", format!("token {token}"));
+    }
+    req
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct EnvGuard {
+        key: &'static str,
+        old: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let old = std::env::var(key).ok();
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, old }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            if let Some(old) = self.old.as_deref() {
+                unsafe {
+                    std::env::set_var(self.key, old);
+                }
+            } else {
+                unsafe {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_direct_download_request_adds_github_auth_header() {
+        let _guard = EnvGuard::set("GITHUB_TOKEN_GITHUB_COMPANY_COM", "secret-token");
+        let client = reqwest::blocking::Client::new();
+
+        let request = direct_download_request(
+            &client,
+            "https://github.company.com/org/repo/releases/download/v1/pkg.sembundle",
+        )
+        .build()
+        .expect("request should build");
+
+        assert_eq!(
+            request
+                .headers()
+                .get("Authorization")
+                .and_then(|v| v.to_str().ok()),
+            Some("token secret-token")
+        );
+    }
+
+    #[test]
+    fn test_direct_download_request_skips_auth_for_non_github_url() {
+        let client = reqwest::blocking::Client::new();
+
+        let request = direct_download_request(&client, "https://example.com/pkg.sembundle")
+            .build()
+            .expect("request should build");
+
+        assert!(request.headers().get("Authorization").is_none());
+    }
 }

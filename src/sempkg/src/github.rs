@@ -432,6 +432,122 @@ pub fn find_release_bundle_asset(
 }
 
 // ---------------------------------------------------------------------------
+// Private release-asset download
+// ---------------------------------------------------------------------------
+
+/// A GitHub release-asset `browser_download_url` decomposed into its parts.
+#[derive(Debug, PartialEq)]
+struct ReleaseAssetRef {
+    host: String,
+    owner: String,
+    repo: String,
+    tag: String,
+    asset_name: String,
+}
+
+/// Parse a GitHub release-asset download URL of the form
+/// `https://{host}/{owner}/{repo}/releases/download/{tag}/{asset_name}`.
+///
+/// Returns `None` when `url` is not a GitHub release-asset download URL.
+fn parse_release_asset_url(url: &str) -> Option<ReleaseAssetRef> {
+    let parsed = reqwest::Url::parse(url).ok()?;
+    let host = parsed.host_str()?.to_ascii_lowercase();
+    if !is_github_host(&host) {
+        return None;
+    }
+
+    let segments: Vec<&str> = parsed.path().trim_start_matches('/').split('/').collect();
+    // owner / repo / releases / download / <tag...> / asset_name
+    if segments.len() < 6 || segments[2] != "releases" || segments[3] != "download" {
+        return None;
+    }
+
+    let asset_name = (*segments.last()?).to_owned();
+    // A tag may itself contain `/` (e.g. `release/1.0`); rejoin everything
+    // between `download/` and the trailing asset name.
+    let tag = segments[4..segments.len() - 1].join("/");
+    if asset_name.is_empty() || tag.is_empty() {
+        return None;
+    }
+
+    Some(ReleaseAssetRef {
+        host,
+        owner: segments[0].to_owned(),
+        repo: segments[1].to_owned(),
+        tag,
+        asset_name,
+    })
+}
+
+/// Download a GitHub release asset through the authenticated REST API.
+///
+/// GitHub does **not** honor a PAT `Authorization` header on the public
+/// `browser_download_url` of a **private** repository — it responds with
+/// `404 Not Found`. The supported way to download a private release asset
+/// programmatically is to resolve the asset's API URL and request it with
+/// `Accept: application/octet-stream`, which 302-redirects to a short-lived
+/// signed download URL (reqwest follows the redirect and strips the
+/// `Authorization` header on the cross-origin hop).
+///
+/// Returns:
+/// - `Ok(Some(bytes))` when `url` is a GitHub release asset and a token is
+///   configured for the host (the authoritative path for private repos).
+/// - `Ok(None)` when `url` is not a GitHub release-asset download URL, or when
+///   no token is configured — the caller should fall back to a plain download,
+///   which works for public release assets and arbitrary URLs.
+pub fn download_release_asset_authenticated(url: &str) -> Result<Option<Vec<u8>>> {
+    let Some(asset_ref) = parse_release_asset_url(url) else {
+        return Ok(None);
+    };
+    let Some(token) = github_token_for_host(&asset_ref.host) else {
+        return Ok(None);
+    };
+
+    let client = GhClient::new(Some(&token))?;
+
+    // Resolve the asset's API URL by listing the release's assets for the tag.
+    let release_url = format!(
+        "{}/repos/{}/{}/releases/tags/{}",
+        api_base(&asset_ref.host),
+        asset_ref.owner,
+        asset_ref.repo,
+        asset_ref.tag
+    );
+    let release: ReleaseResponse = api_get(&client, &release_url)?;
+
+    let Some(asset_api_url) = release
+        .assets
+        .iter()
+        .find(|a| a.name == asset_ref.asset_name)
+        .map(|a| a.url.clone())
+    else {
+        // The asset is not present on the resolved release; let the caller fall
+        // back to a plain download rather than failing outright.
+        return Ok(None);
+    };
+
+    let resp = client
+        .get(&asset_api_url)
+        .header("Accept", "application/octet-stream")
+        .send()
+        .with_context(|| format!("Failed to download release asset from {asset_api_url}"))?;
+
+    if !resp.status().is_success() {
+        bail!(
+            "Failed to download release asset {} (HTTP {})",
+            asset_ref.asset_name,
+            resp.status()
+        );
+    }
+
+    let bytes = resp
+        .bytes()
+        .context("Failed to read release asset body")?
+        .to_vec();
+    Ok(Some(bytes))
+}
+
+// ---------------------------------------------------------------------------
 // Archive URL + download / extract
 // ---------------------------------------------------------------------------
 
@@ -701,6 +817,28 @@ pub fn github_token() -> Option<String> {
     github_token_for_host("github.com")
 }
 
+/// Resolve which host should be used for GitHub PAT lookup for a URL.
+///
+/// This normalizes GitHub API hosts like `api.github.com` back to `github.com`
+/// so direct artifact downloads can reuse the same token environment variables
+/// as the source-build path.
+pub fn github_auth_host_for_url(url: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(url).ok()?;
+    let host = parsed.host_str()?.to_ascii_lowercase();
+
+    match host.as_str() {
+        "api.github.com" | "uploads.github.com" => Some("github.com".to_owned()),
+        _ if is_github_host(&host) => Some(host),
+        _ => None,
+    }
+}
+
+/// Read a GitHub token appropriate for a URL, if the URL points at GitHub or
+/// GitHub Enterprise.
+pub fn github_token_for_url(url: &str) -> Option<String> {
+    github_auth_host_for_url(url).and_then(|host| github_token_for_host(&host))
+}
+
 /// Read a GitHub token for a specific host.
 ///
 /// Resolution order (first match wins):
@@ -813,6 +951,10 @@ struct ReleaseResponse {
 struct ReleaseAssetEntry {
     name: String,
     browser_download_url: String,
+    /// API URL for the asset (`.../releases/assets/{id}`). Requesting this with
+    /// `Accept: application/octet-stream` is the supported way to download a
+    /// release asset from a private repository with a PAT.
+    url: String,
 }
 
 fn api_get<T: serde::de::DeserializeOwned>(client: &GhClient, url: &str) -> Result<T> {
@@ -912,6 +1054,37 @@ mod tests {
     }
 
     #[test]
+    fn test_github_auth_host_for_url_github_web() {
+        assert_eq!(
+            github_auth_host_for_url(
+                "https://github.com/owner/repo/releases/download/v1/pkg.sembundle"
+            )
+            .as_deref(),
+            Some("github.com")
+        );
+    }
+
+    #[test]
+    fn test_github_auth_host_for_url_github_api() {
+        assert_eq!(
+            github_auth_host_for_url("https://api.github.com/repos/owner/repo/releases/assets/123")
+                .as_deref(),
+            Some("github.com")
+        );
+    }
+
+    #[test]
+    fn test_github_auth_host_for_url_enterprise() {
+        assert_eq!(
+            github_auth_host_for_url(
+                "https://github.company.com/org/repo/releases/download/v1/pkg.sembundle"
+            )
+            .as_deref(),
+            Some("github.company.com")
+        );
+    }
+
+    #[test]
     fn test_parse_url_git_suffix() {
         let src = parse_source("https://github.com/owner/repo.git@v1.0").unwrap();
         assert_eq!(src.repo, "repo");
@@ -996,5 +1169,54 @@ mod tests {
             archive_tarball_url(&r),
             "https://github.company.com/org/repo/archive/refs/tags/v3.0.3.tar.gz"
         );
+    }
+
+    #[test]
+    fn test_parse_release_asset_url_github_com() {
+        let parsed = parse_release_asset_url(
+            "https://github.com/org/repo/releases/download/v0.2.0/repo-0.2.0.sembundle",
+        )
+        .expect("should parse");
+        assert_eq!(
+            parsed,
+            ReleaseAssetRef {
+                host: "github.com".into(),
+                owner: "org".into(),
+                repo: "repo".into(),
+                tag: "v0.2.0".into(),
+                asset_name: "repo-0.2.0.sembundle".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_release_asset_url_enterprise() {
+        let parsed = parse_release_asset_url(
+            "https://github.company.com/org/repo/releases/download/v1/pkg.sembundle",
+        )
+        .expect("should parse");
+        assert_eq!(parsed.host, "github.company.com");
+        assert_eq!(parsed.tag, "v1");
+        assert_eq!(parsed.asset_name, "pkg.sembundle");
+    }
+
+    #[test]
+    fn test_parse_release_asset_url_tag_with_slash() {
+        let parsed = parse_release_asset_url(
+            "https://github.com/org/repo/releases/download/release/1.0/pkg.sembundle",
+        )
+        .expect("should parse");
+        assert_eq!(parsed.tag, "release/1.0");
+        assert_eq!(parsed.asset_name, "pkg.sembundle");
+    }
+
+    #[test]
+    fn test_parse_release_asset_url_rejects_non_release_url() {
+        assert!(parse_release_asset_url("https://github.com/org/repo/archive/v1.tar.gz").is_none());
+        assert!(parse_release_asset_url("https://example.com/pkg.sembundle").is_none());
+        assert!(parse_release_asset_url(
+            "https://github.com/org/repo/releases/download/v1.0.0"
+        )
+        .is_none());
     }
 }
