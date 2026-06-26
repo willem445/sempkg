@@ -2,8 +2,9 @@
 ///
 /// Protocol: https://spec.modelcontextprotocol.io
 /// Transport: stdin/stdout (newline-delimited JSON)
-use std::hash::{Hash, Hasher};
 use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, VecDeque};
+use std::hash::{Hash, Hasher};
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 
@@ -12,7 +13,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 
 use crate::packages::PackageRegistry;
 use crate::reranker::{self, Reranker, RerankerConfig};
@@ -964,7 +964,7 @@ impl McpContext {
                 let raw = codegraph::query(&path, query, kind, fetch_limit)
                     .unwrap_or_else(|e| format!("Error: {e}"));
 
-                self.apply_rerank_to_codegraph(query, &raw, limit)
+                self.apply_rerank_to_codegraph_json(query, &raw, limit)
             }
         }
     }
@@ -1619,10 +1619,10 @@ impl McpContext {
                     Ok(Some(src)) => {
                         let loc = format!("{}:{}-{}", src.path, src.start_line, src.end_line);
                         if src.signature.is_empty() {
-                            format!("{} ({}) @ {}\n\n```\n{}\n```",
+                            format!("**{}** ({}) @ {}\n\n```\n{}\n```",
                                 src.symbol, src.kind, loc, src.content)
                         } else {
-                            format!("{} ({}) @ {}\n{}\n\n```\n{}\n```",
+                            format!("**{}** ({}) @ {}\n{}\n\n```\n{}\n```",
                                 src.symbol, src.kind, loc, src.signature, src.content)
                         }
                     }
@@ -1674,10 +1674,10 @@ impl McpContext {
                             src.path.clone()
                         };
                         if src.signature.is_empty() {
-                            format!("{} ({}) @ {}\n\n```\n{}\n```",
+                            format!("**{}** ({}) @ {}\n\n```\n{}\n```",
                                 src.symbol, src.kind, loc, src.content)
                         } else {
-                            format!("{} ({}) @ {}\n{}\n\n```\n{}\n```",
+                            format!("**{}** ({}) @ {}\n{}\n\n```\n{}\n```",
                                 src.symbol, src.kind, loc, src.signature, src.content)
                         }
                     }
@@ -1704,6 +1704,69 @@ impl McpContext {
     /// Rerank raw codegraph JSON output (array of symbol objects).
     /// Both the reranked and BM25 paths produce the same compact text format;
     /// reranked results include a relevance score prefix `[0.92]`.
+    fn apply_rerank_to_codegraph_json(&self, query: &str, raw_json: &str, output_n: usize) -> String {
+        let mut guard = self.reranker.borrow_mut();
+        let Some(ranker) = guard.as_mut() else {
+            return raw_json.to_string();
+        };
+
+        let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(raw_json) else {
+            return raw_json.to_string();
+        };
+
+        let mut node_map: HashMap<String, VecDeque<serde_json::Value>> = HashMap::new();
+        for value in arr.iter().cloned() {
+            let node = value.get("node").unwrap_or(&value);
+            let qual = node
+                .get("qualifiedName")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            let name = node
+                .get("name")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            let key = if !qual.is_empty() { qual } else { name };
+            if !key.is_empty() {
+                node_map.entry(key).or_default().push_back(value);
+            }
+        }
+
+        let candidates = reranker::codegraph_json_to_candidates(raw_json);
+        if candidates.is_empty() {
+            return raw_json.to_string();
+        }
+
+        match ranker.rerank(query, candidates) {
+            Ok(mut scored) => {
+                scored.truncate(output_n);
+                if scored.is_empty() {
+                    return "[]".to_string();
+                }
+
+                let mut reranked = Vec::new();
+                for result in scored {
+                    if let Some(values) = node_map.get_mut(&result.source) {
+                        if let Some(value) = values.pop_front() {
+                            reranked.push(value);
+                        }
+                    }
+                }
+
+                if reranked.is_empty() {
+                    return raw_json.to_string();
+                }
+
+                serde_json::to_string(&reranked).unwrap_or_else(|_| raw_json.to_string())
+            }
+            Err(e) => {
+                eprintln!("sempkg: reranker error ({e}), returning BM25 results");
+                raw_json.to_string()
+            }
+        }
+    }
+
     fn apply_rerank_to_codegraph(&self, query: &str, raw_json: &str, output_n: usize) -> String {
         let mut guard = self.reranker.borrow_mut();
         let Some(ranker) = guard.as_mut() else {
