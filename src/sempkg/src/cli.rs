@@ -375,6 +375,31 @@ pub enum Commands {
     /// Manage the optional Qwen3-Reranker-1.7B GGUF model.
     #[command(subcommand)]
     Reranker(RerankerCommands),
+
+    // -----------------------------------------------------------------------
+    // Vector embedding management
+    // -----------------------------------------------------------------------
+    /// Generate vector embeddings for installed bundles / local packages.
+    ///
+    /// Embeds the `docs` and `code` LanceDB tables in place so the MCP `query`
+    /// tool can run semantic (vector) search alongside BM25. Requires the binary
+    /// to be built with `--features embeddings` and the model downloaded via
+    /// `sempkg embedding pull`.
+    Embed {
+        /// Restrict embedding to a single package / bundle (default: all).
+        package: Option<String>,
+        /// Re-embed even if the table already has vectors for this model.
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Manage the optional Qwen3-Embedding-0.6B GGUF model (vector search).
+    #[command(subcommand)]
+    Embedding(EmbeddingCommands),
+
+    /// Manage the optional query-expansion GGUF model.
+    #[command(subcommand, name = "query-expansion")]
+    QueryExpansion(QueryExpansionCommands),
 }
 
 #[derive(Subcommand)]
@@ -444,6 +469,56 @@ pub enum RerankerCommands {
 
         /// The document string to score against the query.
         document: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum EmbeddingCommands {
+    /// Download the Qwen3-Embedding-0.6B GGUF model to ~/.sempkg/models/
+    /// (or the path configured in [embedding] in sempkg.toml).
+    ///
+    /// The default source (Qwen/Qwen3-Embedding-0.6B-GGUF on HuggingFace) is
+    /// public and does not require authentication.
+    Pull {
+        /// Override the GGUF download URL.
+        #[arg(long)]
+        gguf_url: Option<String>,
+
+        /// HuggingFace access token for downloading gated models.
+        /// Can also be supplied via the HF_TOKEN environment variable.
+        #[arg(long, env = "HF_TOKEN")]
+        hf_token: Option<String>,
+    },
+
+    /// Show embedding model status (present / missing, configured paths, build flags).
+    Status,
+}
+
+#[derive(Subcommand)]
+pub enum QueryExpansionCommands {
+    /// Download the query-expansion GGUF model to ~/.sempkg/models/
+    /// (or the path configured in [query_expansion] in sempkg.toml).
+    ///
+    /// The default source (tobil/qmd-query-expansion-1.7B-gguf on HuggingFace)
+    /// is public and does not require authentication.
+    Pull {
+        /// Override the GGUF download URL.
+        #[arg(long)]
+        gguf_url: Option<String>,
+
+        /// HuggingFace access token for downloading gated models.
+        /// Can also be supplied via the HF_TOKEN environment variable.
+        #[arg(long, env = "HF_TOKEN")]
+        hf_token: Option<String>,
+    },
+
+    /// Show query-expansion model status.
+    Status,
+
+    /// Expand a test query and print the routed variants.
+    Test {
+        /// The query string to expand.
+        query: String,
     },
 }
 

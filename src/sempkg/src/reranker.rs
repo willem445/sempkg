@@ -166,54 +166,112 @@ pub const DEFAULT_GGUF_URL: &str =
 /// Pass an optional HuggingFace bearer token for gated repositories.
 pub fn download_file(url: &str, dest: &Path, hf_token: Option<&str>) -> Result<()> {
     use std::io::Write;
+    use std::time::Duration;
 
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating directory {}", parent.display()))?;
     }
 
-    let client = reqwest::blocking::Client::new();
-    let mut req = client.get(url);
-    if let Some(tok) = hf_token {
-        req = req.bearer_auth(tok);
+    // Large GGUF downloads are prone to transient read timeouts; use generous
+    // request timeout and a few retries before failing.
+    let timeout_secs = std::env::var("SEMPKG_DOWNLOAD_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(1800);
+    let client = reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(30))
+        .timeout(Duration::from_secs(timeout_secs))
+        .build()
+        .context("building HTTP client")?;
+
+    let max_attempts = 3u32;
+    for attempt in 1..=max_attempts {
+        let mut req = client.get(url);
+        if let Some(tok) = hf_token {
+            req = req.bearer_auth(tok);
+        }
+
+        let resp = req
+            .send()
+            .with_context(|| format!("GET {url} (attempt {attempt}/{max_attempts})"));
+
+        let resp = match resp {
+            Ok(r) => r,
+            Err(e) if attempt < max_attempts => {
+                println!(
+                    "  download attempt {attempt}/{max_attempts} failed: {e}; retrying..."
+                );
+                std::thread::sleep(Duration::from_secs(attempt as u64 * 2));
+                continue;
+            }
+            Err(e) => {
+                return Err(e);
+            }
+        };
+
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+            anyhow::bail!(
+                "HTTP 401 Unauthorized for {url}\n\n\
+                 The requested URL requires authentication.\n\
+                 Create a HuggingFace access token at https://huggingface.co/settings/tokens\n\
+                 then re-run with your token:\n\
+                 \n\
+                     sempkg reranker pull --hf-token <YOUR_TOKEN>\n\
+                 \n\
+                 Or set the environment variable and re-run:\n\
+                 \n\
+                     $env:HF_TOKEN = \"<YOUR_TOKEN>\"; sempkg reranker pull"
+            );
+        }
+
+        let mut resp = match resp.error_for_status() {
+            Ok(r) => r,
+            Err(e) if attempt < max_attempts => {
+                println!(
+                    "  download attempt {attempt}/{max_attempts} failed: {e}; retrying..."
+                );
+                std::thread::sleep(Duration::from_secs(attempt as u64 * 2));
+                continue;
+            }
+            Err(e) => return Err(e).with_context(|| format!("HTTP error for {url}")),
+        };
+
+        let total = resp.content_length();
+        let tmp_dest = dest.with_extension("part");
+        let mut file = std::fs::File::create(&tmp_dest)
+            .with_context(|| format!("creating {}", tmp_dest.display()))?;
+
+        let copied = std::io::copy(&mut resp, &mut file)
+            .with_context(|| format!("reading body of {url}"));
+
+        match copied {
+            Ok(n) => {
+                file.flush()
+                    .with_context(|| format!("flushing {}", tmp_dest.display()))?;
+                std::fs::rename(&tmp_dest, dest)
+                    .with_context(|| format!("moving {} to {}", tmp_dest.display(), dest.display()))?;
+
+                let bytes_to_report = total.unwrap_or(n);
+                println!("  downloaded {:.1} MiB", bytes_to_report as f64 / 1_048_576.0);
+                return Ok(());
+            }
+            Err(e) if attempt < max_attempts => {
+                let _ = std::fs::remove_file(&tmp_dest);
+                println!(
+                    "  download attempt {attempt}/{max_attempts} failed: {e}; retrying..."
+                );
+                std::thread::sleep(Duration::from_secs(attempt as u64 * 2));
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp_dest);
+                return Err(e);
+            }
+        }
     }
 
-    let resp = req.send().with_context(|| format!("GET {url}"))?;
-
-    if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
-        anyhow::bail!(
-            "HTTP 401 Unauthorized for {url}\n\n\
-             The requested URL requires authentication.\n\
-             Create a HuggingFace access token at https://huggingface.co/settings/tokens\n\
-             then re-run with your token:\n\
-             \n\
-                 sempkg reranker pull --hf-token <YOUR_TOKEN>\n\
-             \n\
-             Or set the environment variable and re-run:\n\
-             \n\
-                 $env:HF_TOKEN = \"<YOUR_TOKEN>\"; sempkg reranker pull"
-        );
-    }
-
-    let resp = resp
-        .error_for_status()
-        .with_context(|| format!("HTTP error for {url}"))?;
-
-    let total = resp.content_length();
-    let bytes = resp
-        .bytes()
-        .with_context(|| format!("reading body of {url}"))?;
-
-    if let Some(t) = total {
-        println!("  downloaded {:.1} MiB", t as f64 / 1_048_576.0);
-    }
-
-    let mut file =
-        std::fs::File::create(dest).with_context(|| format!("creating {}", dest.display()))?;
-    file.write_all(&bytes)
-        .with_context(|| format!("writing {}", dest.display()))?;
-
-    Ok(())
+    anyhow::bail!("download failed for {url}")
 }
 
 /// Pull the GGUF model into `~/.sempkg/models/` (or the directory implied
@@ -294,7 +352,7 @@ impl Reranker {
     pub fn load(config: &RerankerConfig) -> Result<Self> {
         use llama_cpp_2::llama_backend::LlamaBackend;
         use llama_cpp_2::model::{params::LlamaModelParams, LlamaModel};
-        use llama_cpp_2::{send_logs_to_tracing, LogOptions};
+        use llama_cpp_2::{send_logs_to_tracing, LlamaCppError, LogOptions};
 
         // Silence llama.cpp's extremely verbose stderr logging. Routing logs to
         // `tracing` with logging disabled drops them entirely (sempkg installs
@@ -312,8 +370,12 @@ impl Reranker {
             );
         }
 
-        let backend =
-            LlamaBackend::init().map_err(|e| anyhow::anyhow!("llama backend init: {e}"))?;
+        // Backend init is process-global and idempotent.
+        let backend = match LlamaBackend::init() {
+            Ok(b) => b,
+            Err(LlamaCppError::BackendAlreadyInitialized) => LlamaBackend {},
+            Err(e) => return Err(anyhow::anyhow!("llama backend init: {e}")),
+        };
 
         let model_params = LlamaModelParams::default();
         let model = LlamaModel::load_from_file(&backend, &model_path, &model_params)

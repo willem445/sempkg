@@ -99,6 +99,54 @@ top_k    = 20   # BM25 candidates fed into the reranker
 output_n = 5    # final results returned after reranking
 ```
 
+### Optional vector search + query expansion
+
+The MCP `query` tool runs hybrid retrieval: BM25 (full-text) **and** vector
+(semantic) search in parallel, fused with Reciprocal Rank Fusion before the
+reranker. Two optional GGUF models power this, both behind the `embeddings`
+build feature (`cargo build --features embeddings`):
+
+- **Embedding** (`Qwen3-Embedding-0.6B`) — embeds document chunks and queries
+  for vector search.
+- **Query expansion** (`qmd-query-expansion-1.7B`) — rewrites the query into
+  typed sub-queries (`lex` → BM25, `vec`/`hyde` → vector) for broader recall.
+
+```toml
+[embedding]
+enabled    = true
+# model    = "~/.sempkg/models/qwen3-embedding-0.6b-q8_0.gguf"  # default path
+n_ctx      = 2048
+gpu_layers = 0    # >0 offloads layers to GPU (needs a GPU llama.cpp build)
+
+[query_expansion]
+enabled      = true
+# model      = "~/.sempkg/models/qmd-query-expansion-1.7b-q4_k_m.gguf"
+max_variants = 4
+gpu_layers   = 0
+```
+
+Download the models, then build the vector indexes for installed bundles and
+local packages:
+
+```bash
+sempkg embedding pull          # download the embedding model
+sempkg query-expansion pull    # download the query-expansion model
+sempkg embed                   # embed docs/code tables (add --force to redo)
+sempkg embed <package>         # embed a single package/bundle
+```
+
+Status / test helpers:
+
+```bash
+sempkg embedding status
+sempkg query-expansion status
+sempkg query-expansion test "how do I spawn a task"
+```
+
+Both models are optional. If a model is missing, the feature is not compiled
+in, or a bundle has no embeddings, the `query` tool transparently falls back to
+BM25-only retrieval (and to RRF-only ranking when the reranker is absent).
+
 ---
 
 ## Installing Bundles

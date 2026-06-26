@@ -120,6 +120,10 @@ pub struct WorkspaceManifest {
     pub packages: BTreeMap<String, PackageEntry>,
     /// Optional local LLM reranker configuration.
     pub reranker: Option<crate::reranker::RerankerConfig>,
+    /// Optional vector-embedding configuration (semantic search).
+    pub embedding: Option<crate::embedding::EmbeddingConfig>,
+    /// Optional generative query-expansion configuration.
+    pub query_expansion: Option<crate::query_expansion::QueryExpansionConfig>,
 }
 
 impl WorkspaceManifest {
@@ -234,18 +238,44 @@ pub fn load_manifest(workspace_dir: &Path) -> Result<WorkspaceManifest> {
 /// Write sempkg.toml using toml_edit so that dependency entries are serialized
 /// as inline tables (`{ version = "1.0" }`) rather than dotted headers
 /// (`[dependencies.pkg]`).
+///
+/// When possible, this preserves existing comments and formatting by loading the
+/// existing document and updating only the changed sections.
 pub fn save_manifest(manifest: &WorkspaceManifest, workspace_dir: &Path) -> Result<()> {
     let path = workspace_dir.join(MANIFEST_FILE);
-    let doc = build_document(manifest)?;
     let header = "# sempkg workspace manifest\n# Run 'sempkg sync' to install dependencies.\n\n";
+
+    // Try to load and preserve the existing document
+    let mut doc = if path.exists() {
+        let text = std::fs::read_to_string(&path)
+            .with_context(|| format!("Failed to read existing {}", path.display()))?;
+        // Strip the header if present so we can re-add it
+        let text = if let Some(stripped) = text.strip_prefix(header) {
+            stripped
+        } else {
+            text.as_str()
+        };
+        text.parse::<DocumentMut>()
+            .unwrap_or_else(|_| DocumentMut::new())
+    } else {
+        DocumentMut::new()
+    };
+
+    // Update document with current manifest values
+    update_document(&mut doc, manifest)?;
+
     std::fs::write(&path, format!("{header}{doc}"))
         .with_context(|| format!("Failed to write {}", path.display()))
 }
 
-/// Build a toml_edit Document from a WorkspaceManifest.
-fn build_document(manifest: &WorkspaceManifest) -> Result<DocumentMut> {
-    let mut doc = DocumentMut::new();
-
+/// Update a toml_edit Document with the current WorkspaceManifest values.
+/// This preserves existing comments and formatting in the document.
+///
+/// Strategy:
+/// - For dynamic/mutable sections (dependencies, registries, etc): rebuild from manifest
+/// - For config sections ([embedding], [query_expansion], [reranker]): preserve existing
+///   entries and comments, only update values from manifest if present
+fn update_document(doc: &mut DocumentMut, manifest: &WorkspaceManifest) -> Result<()> {
     // [workspace]
     if let Some(ws) = &manifest.workspace {
         let mut t = Table::new();
@@ -253,6 +283,8 @@ fn build_document(manifest: &WorkspaceManifest) -> Result<DocumentMut> {
             t.insert("verify_key", value(k.as_str()));
         }
         doc.insert("workspace", Item::Table(t));
+    } else {
+        doc.remove("workspace");
     }
 
     // [[registry]]
@@ -262,12 +294,15 @@ fn build_document(manifest: &WorkspaceManifest) -> Result<DocumentMut> {
             .or_insert(Item::ArrayOfTables(toml_edit::ArrayOfTables::new()))
             .as_array_of_tables_mut()
             .context("registry must be an array of tables")?;
+        arr.clear();
         for reg in &manifest.registries {
             let mut t = Table::new();
             t.insert("name", value(reg.name.as_str()));
             t.insert("url", value(reg.url.as_str()));
             arr.push(t);
         }
+    } else {
+        doc.remove("registry");
     }
 
     // [dependencies]
@@ -277,6 +312,8 @@ fn build_document(manifest: &WorkspaceManifest) -> Result<DocumentMut> {
             t.insert(name, Item::Value(Value::InlineTable(dep_inline(dep))));
         }
         doc.insert("dependencies", Item::Table(t));
+    } else {
+        doc.remove("dependencies");
     }
 
     // [dependency-groups]
@@ -290,6 +327,8 @@ fn build_document(manifest: &WorkspaceManifest) -> Result<DocumentMut> {
             groups_table.insert(group_name, Item::Value(Value::InlineTable(group_inline)));
         }
         doc.insert("dependency-groups", Item::Table(groups_table));
+    } else {
+        doc.remove("dependency-groups");
     }
 
     // [packages]
@@ -304,21 +343,74 @@ fn build_document(manifest: &WorkspaceManifest) -> Result<DocumentMut> {
             t.insert(name, Item::Value(Value::InlineTable(it)));
         }
         doc.insert("packages", Item::Table(t));
+    } else {
+        doc.remove("packages");
     }
 
-    // [reranker]
-    if let Some(cfg) = &manifest.reranker {
-        let mut t = Table::new();
+    // [embedding] — preserve existing structure, update values from manifest
+    if let Some(cfg) = &manifest.embedding {
+        let mut t = if let Some(Item::Table(existing)) = doc.get("embedding") {
+            existing.clone()
+        } else {
+            Table::new()
+        };
         t.insert("enabled", value(cfg.enabled));
         if let Some(model) = &cfg.model {
             t.insert("model", value(model.as_str()));
+        } else {
+            t.remove("model");
+        }
+        t.insert("n_ctx", value(cfg.n_ctx as i64));
+        t.insert("gpu_layers", value(cfg.gpu_layers as i64));
+        doc.insert("embedding", Item::Table(t));
+    }
+    // Note: do NOT remove [embedding] if manifest.embedding is None —
+    // this preserves manually configured sections
+
+    // [query_expansion] — preserve existing structure, update values from manifest
+    if let Some(cfg) = &manifest.query_expansion {
+        let mut t = if let Some(Item::Table(existing)) = doc.get("query_expansion") {
+            existing.clone()
+        } else {
+            Table::new()
+        };
+        t.insert("enabled", value(cfg.enabled));
+        if let Some(model) = &cfg.model {
+            t.insert("model", value(model.as_str()));
+        } else {
+            t.remove("model");
+        }
+        t.insert("max_variants", value(cfg.max_variants as i64));
+        t.insert("max_tokens", value(cfg.max_tokens as i64));
+        t.insert("n_ctx", value(cfg.n_ctx as i64));
+        t.insert("gpu_layers", value(cfg.gpu_layers as i64));
+        t.insert("temperature", value(cfg.temperature as f64));
+        doc.insert("query_expansion", Item::Table(t));
+    }
+    // Note: do NOT remove [query_expansion] if manifest.query_expansion is None —
+    // this preserves manually configured sections
+
+    // [reranker] — preserve existing structure, update values from manifest
+    if let Some(cfg) = &manifest.reranker {
+        let mut t = if let Some(Item::Table(existing)) = doc.get("reranker") {
+            existing.clone()
+        } else {
+            Table::new()
+        };
+        t.insert("enabled", value(cfg.enabled));
+        if let Some(model) = &cfg.model {
+            t.insert("model", value(model.as_str()));
+        } else {
+            t.remove("model");
         }
         t.insert("top_k", value(cfg.top_k as i64));
         t.insert("output_n", value(cfg.output_n as i64));
         doc.insert("reranker", Item::Table(t));
     }
+    // Note: do NOT remove [reranker] if manifest.reranker is None —
+    // this preserves manually configured sections
 
-    Ok(doc)
+    Ok(())
 }
 
 /// Build an inline table for a DependencyEntry: `{ version = "x", registry = "y" }`.
@@ -471,4 +563,170 @@ mod tests {
         assert_eq!(reranker.top_k, 42);
         assert_eq!(reranker.output_n, 7);
     }
+
+    #[test]
+    fn save_manifest_preserves_embedding_table() {
+        let dir = tempdir().expect("create temp dir");
+
+        let mut manifest = WorkspaceManifest::default();
+        manifest.dependencies.insert(
+            "demo".to_string(),
+            DependencyEntry {
+                version: "1.0.0".to_string(),
+                registry: None,
+                url: None,
+                git: None,
+                git_ref: None,
+                subdir: None,
+                full: false,
+                local: None,
+                include_source: false,
+                source_glob: None,
+                source_dirs: vec![],
+                docs_dirs: vec![],
+                exclude_dirs: vec![],
+            },
+        );
+        manifest.embedding = Some(crate::embedding::EmbeddingConfig {
+            enabled: true,
+            model: Some("~/.sempkg/models/custom-embedding.gguf".to_string()),
+            n_ctx: 1024,
+            gpu_layers: 2,
+        });
+
+        save_manifest(&manifest, dir.path()).expect("save manifest");
+
+        let saved =
+            fs::read_to_string(dir.path().join(super::MANIFEST_FILE)).expect("read manifest");
+        assert!(saved.contains("[embedding]"));
+        assert!(saved.contains("n_ctx = 1024"));
+        assert!(saved.contains("gpu_layers = 2"));
+
+        let loaded = load_manifest(dir.path()).expect("load manifest");
+        let embedding = loaded.embedding.expect("embedding section present");
+        assert!(embedding.enabled);
+        assert_eq!(
+            embedding.model.as_deref(),
+            Some("~/.sempkg/models/custom-embedding.gguf")
+        );
+        assert_eq!(embedding.n_ctx, 1024);
+        assert_eq!(embedding.gpu_layers, 2);
+    }
+
+    #[test]
+    fn save_manifest_preserves_query_expansion_table() {
+        let dir = tempdir().expect("create temp dir");
+
+        let mut manifest = WorkspaceManifest::default();
+        manifest.dependencies.insert(
+            "demo".to_string(),
+            DependencyEntry {
+                version: "1.0.0".to_string(),
+                registry: None,
+                url: None,
+                git: None,
+                git_ref: None,
+                subdir: None,
+                full: false,
+                local: None,
+                include_source: false,
+                source_glob: None,
+                source_dirs: vec![],
+                docs_dirs: vec![],
+                exclude_dirs: vec![],
+            },
+        );
+        manifest.query_expansion = Some(crate::query_expansion::QueryExpansionConfig {
+            enabled: true,
+            model: Some("~/.sempkg/models/custom-expansion.gguf".to_string()),
+            max_variants: 8,
+            max_tokens: 512,
+            n_ctx: 4096,
+            gpu_layers: 4,
+            temperature: 0.5,
+        });
+
+        save_manifest(&manifest, dir.path()).expect("save manifest");
+
+        let saved =
+            fs::read_to_string(dir.path().join(super::MANIFEST_FILE)).expect("read manifest");
+        assert!(saved.contains("[query_expansion]"));
+        assert!(saved.contains("max_variants = 8"));
+        assert!(saved.contains("max_tokens = 512"));
+        assert!(saved.contains("n_ctx = 4096"));
+        assert!(saved.contains("gpu_layers = 4"));
+
+        let loaded = load_manifest(dir.path()).expect("load manifest");
+        let expansion = loaded.query_expansion.expect("query_expansion section present");
+        assert!(expansion.enabled);
+        assert_eq!(
+            expansion.model.as_deref(),
+            Some("~/.sempkg/models/custom-expansion.gguf")
+        );
+        assert_eq!(expansion.max_variants, 8);
+        assert_eq!(expansion.max_tokens, 512);
+        assert_eq!(expansion.n_ctx, 4096);
+        assert_eq!(expansion.gpu_layers, 4);
+        assert_eq!(expansion.temperature, 0.5);
+    }
+
+    #[test]
+    fn save_manifest_preserves_all_config_tables() {
+        let dir = tempdir().expect("create temp dir");
+
+        let mut manifest = WorkspaceManifest::default();
+        manifest.dependencies.insert(
+            "demo".to_string(),
+            DependencyEntry {
+                version: "1.0.0".to_string(),
+                registry: None,
+                url: None,
+                git: None,
+                git_ref: None,
+                subdir: None,
+                full: false,
+                local: None,
+                include_source: false,
+                source_glob: None,
+                source_dirs: vec![],
+                docs_dirs: vec![],
+                exclude_dirs: vec![],
+            },
+        );
+        manifest.embedding = Some(crate::embedding::EmbeddingConfig {
+            enabled: true,
+            model: None,
+            n_ctx: 2048,
+            gpu_layers: 0,
+        });
+        manifest.query_expansion = Some(crate::query_expansion::QueryExpansionConfig {
+            enabled: true,
+            model: None,
+            max_variants: 4,
+            max_tokens: 256,
+            n_ctx: 2048,
+            gpu_layers: 0,
+            temperature: 0.7,
+        });
+        manifest.reranker = Some(crate::reranker::RerankerConfig {
+            enabled: true,
+            model: None,
+            top_k: 20,
+            output_n: 5,
+        });
+
+        save_manifest(&manifest, dir.path()).expect("save manifest");
+
+        let saved =
+            fs::read_to_string(dir.path().join(super::MANIFEST_FILE)).expect("read manifest");
+        assert!(saved.contains("[embedding]"));
+        assert!(saved.contains("[query_expansion]"));
+        assert!(saved.contains("[reranker]"));
+
+        let loaded = load_manifest(dir.path()).expect("load manifest");
+        assert!(loaded.embedding.is_some());
+        assert!(loaded.query_expansion.is_some());
+        assert!(loaded.reranker.is_some());
+    }
 }
+

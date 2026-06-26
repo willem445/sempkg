@@ -19,6 +19,11 @@ default  = []
 # Requires cmake + MSVC (Windows) or cmake + clang (Linux/macOS) at build time.
 # Build with:  cargo build --features reranker
 reranker = ["dep:llama-cpp-2"]
+# Enable in-process vector embeddings (Qwen3-Embedding-0.6B) + generative query
+# expansion (qmd-query-expansion-1.7B) via llama-cpp-2. Independent of `reranker`;
+# both can be enabled together. Requires the same cmake/compiler toolchain.
+# Build with:  cargo build --features embeddings
+embeddings = ["dep:llama-cpp-2"]
 
 [dependencies]
 sembundle    = { path = "../sembundle" }
@@ -50,4 +55,4 @@ rusqlite     = { version = "0.31", features = ["bundled"] }
 
 # Optional reranker dependency (enabled via --features reranker)
 # llama-cpp-2 wraps llama.cpp with native Qwen3 + RANK-pooling reranker support.
-llama-cpp-2 = { version = "0.1", optional = true }
+llama-cpp-2 = { version = "0.1.150", optional = true }

@@ -6,7 +6,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::io::{self, BufRead, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -17,7 +17,10 @@ use std::cell::RefCell;
 use crate::packages::PackageRegistry;
 use crate::reranker::{self, Reranker, RerankerConfig};
 use crate::store::{list_all_bundles, resolve_bundle, resolve_bundle_spec};
-use crate::{codegraph, lance};
+use crate::{codegraph, embedding, lance, query_expansion};
+
+use crate::embedding::Embedder;
+use crate::query_expansion::{ExpansionKind, QueryExpander};
 
 // Minimum reranker score (P(yes) from the Qwen3 cross-encoder) a result must
 // reach to be returned to the agent.  Results below this threshold are
@@ -467,6 +470,77 @@ struct UnifiedHit {
     kwic_count: usize,
 }
 
+/// Retrieval counters for one `tool_query` run (original or expanded query).
+#[derive(Debug, Default, Clone)]
+struct QueryRunStats {
+    /// Number of hits added by BM25 code-index search.
+    lex_code_hits: usize,
+    /// Number of hits added by BM25 docs search.
+    lex_docs_hits: usize,
+    /// Number of hits added by lexical CodeGraph search.
+    lex_codegraph_hits: usize,
+    /// Number of hits added by vector code-index search.
+    vec_code_hits: usize,
+    /// Number of hits added by vector docs search.
+    vec_docs_hits: usize,
+    /// Number of tables checked for vector compatibility.
+    vec_tables_checked: usize,
+    /// Number of tables deemed vector-compatible.
+    vec_tables_compatible: usize,
+}
+
+impl QueryRunStats {
+    fn total_added(&self) -> usize {
+        self.lex_code_hits
+            + self.lex_docs_hits
+            + self.lex_codegraph_hits
+            + self.vec_code_hits
+            + self.vec_docs_hits
+    }
+}
+
+/// Max items to print per stage when SEMPKG_DEBUG is enabled.
+/// Override with `SEMPKG_DEBUG_LIST_LIMIT=<N>`.
+fn debug_hit_list_limit() -> usize {
+    std::env::var("SEMPKG_DEBUG_LIST_LIMIT")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(25)
+}
+
+fn debug_hit_preview(h: &UnifiedHit) -> String {
+    let loc = if h.start_line > 0 {
+        format!("{}:{}-{}", h.path, h.start_line, h.end_line)
+    } else {
+        h.path.clone()
+    };
+    let symbol = h.symbol.as_deref().unwrap_or("-");
+    let kind = h.kind.as_deref().unwrap_or("-");
+    let mut snip = h.snippet.replace('\n', " ").replace('\r', " ");
+    if snip.len() > 110 {
+        snip.truncate(110);
+        snip.push_str("...");
+    }
+    format!(
+        "pkg={} origin={} kind={} symbol={} loc={} rrf={:.4} snip={:?}",
+        h.package, h.origin, kind, symbol, loc, h.rrf_score, snip
+    )
+}
+
+fn debug_print_stage_hits(stage: &str, hits: &[UnifiedHit], max_items: usize) {
+    eprintln!("sempkg: {stage} count={}", hits.len());
+    for (i, h) in hits.iter().take(max_items).enumerate() {
+        eprintln!("sempkg:   [{i}] {}", debug_hit_preview(h));
+    }
+    if hits.len() > max_items {
+        eprintln!(
+            "sempkg:   ... {} more hit(s) omitted (set SEMPKG_DEBUG_LIST_LIMIT to change)",
+            hits.len() - max_items
+        );
+    }
+}
+
 /// Build the kind+symbol prefix used in all reranker candidate strings.
 /// Returns an empty string when neither field is set.
 fn hit_kind_symbol_prefix(h: &UnifiedHit) -> String {
@@ -784,6 +858,12 @@ struct McpContext {
     /// can mutably borrow it through an immutable &McpContext reference.
     reranker: RefCell<Option<Reranker>>,
     reranker_cfg: Option<RerankerConfig>,
+    /// Optionally-loaded vector embedder for semantic search.
+    embedder: Option<Embedder>,
+    /// Identifier of the loaded embedding model (for bundle compatibility checks).
+    embed_model_id: Option<String>,
+    /// Optionally-loaded generative query expander.
+    expander: Option<QueryExpander>,
 }
 
 impl McpContext {
@@ -817,11 +897,63 @@ impl McpContext {
             }
         });
 
+        // Embedding config + lazy model load (semantic search).
+        let embed_cfg: embedding::EmbeddingConfig = workspace_dir
+            .as_deref()
+            .and_then(|d| crate::manifest::load_manifest(d).ok())
+            .and_then(|mf| mf.embedding)
+            .unwrap_or_default();
+
+        let (embedder, embed_model_id) =
+            if embed_cfg.enabled && embedding::model_is_present(&embed_cfg) {
+                match Embedder::load(&embed_cfg) {
+                    Ok(e) => {
+                        eprintln!(
+                            "sempkg: embedder loaded ({}, dim {})",
+                            embedding::EMBED_MODEL_ID,
+                            e.dim()
+                        );
+                        (Some(e), Some(embedding::EMBED_MODEL_ID.to_string()))
+                    }
+                    Err(e) => {
+                        eprintln!("sempkg: embedder load error (vector search disabled): {e}");
+                        (None, None)
+                    }
+                }
+            } else {
+                (None, None)
+            };
+
+        // Query-expansion config + lazy model load.
+        let qe_cfg: query_expansion::QueryExpansionConfig = workspace_dir
+            .as_deref()
+            .and_then(|d| crate::manifest::load_manifest(d).ok())
+            .and_then(|mf| mf.query_expansion)
+            .unwrap_or_default();
+
+        let expander = if qe_cfg.enabled && query_expansion::model_is_present(&qe_cfg) {
+            match QueryExpander::load(&qe_cfg) {
+                Ok(e) => {
+                    eprintln!("sempkg: query expander loaded");
+                    Some(e)
+                }
+                Err(e) => {
+                    eprintln!("sempkg: query expander load error (expansion disabled): {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         Self {
             workspace_dir,
             registry,
             reranker: RefCell::new(reranker),
             reranker_cfg,
+            embedder,
+            embed_model_id,
+            expander,
         }
     }
 
@@ -1191,14 +1323,78 @@ impl McpContext {
 
     /// Unified cross-package search: queries code, docs, and codegraph across
     /// all installed bundles and local packages, then reranks everything together.
-    fn tool_query(&self, query: &str, limit: usize) -> String {
-        let fetch_limit = self.reranker_fetch_limit(limit).max(20);
-        let mut hits: Vec<UnifiedHit> = Vec::new();
+    /// Retrieve BM25 (+ optional vector) hits for a single (possibly expanded)
+    /// query, scaling each hit's RRF contribution by `weight`. Lexical sources
+    /// (BM25 + codegraph) run when `do_lex`; vector search runs when `do_vec`
+    /// and a compatible embedder + stored vectors are available.
+    ///
+    /// Hits are appended to `hits`; the caller fuses duplicates across runs by
+    /// summing their RRF scores (Reciprocal Rank Fusion).
+    #[allow(clippy::too_many_arguments)]
+    fn collect_query_hits(
+        &self,
+        query: &str,
+        weight: f32,
+        do_lex: bool,
+        do_vec: bool,
+        fetch_limit: usize,
+        hits: &mut Vec<UnifiedHit>,
+    ) -> QueryRunStats {
+        let mut stats = QueryRunStats::default();
+        // Embed the query once (reused across every table) when vector search
+        // is requested and an embedder is loaded. `None` => vector search is
+        // silently skipped and the run degrades to BM25 only.
+        let query_vec: Option<Vec<f32>> = if do_vec {
+            match (self.embedder.as_ref(), self.embed_model_id.as_ref()) {
+                (Some(e), Some(_)) => e.embed_query(query).ok(),
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        // Whether `dir`'s table was embedded with the model we'd query with.
+        let vectors_compatible = |dir: &Path, qlen: usize| -> bool {
+            match lance::read_embedding_info(dir) {
+                Some((model, dim)) => {
+                    self.embed_model_id.as_deref() == Some(model.as_str()) && dim as usize == qlen
+                }
+                None => false,
+            }
+        };
+
+        // ── Helper: push lance SearchResults with weighted RRF ───────────
+        let push_results = |hits: &mut Vec<UnifiedHit>,
+                            pkg: &str,
+                            origin: &'static str,
+                            rs: Vec<lance::SearchResult>| {
+            for (pos, r) in rs.into_iter().enumerate() {
+                hits.push(UnifiedHit {
+                    package: pkg.to_string(),
+                    origin,
+                    path: r.path,
+                    start_line: r.start_line,
+                    end_line: r.end_line,
+                    snippet: r.snippet,
+                    symbol: r.symbol,
+                    kind: r.kind,
+                    signature: r.signature,
+                    rrf_score: weight / (60.0 + pos as f32 + 1.0),
+                    expanded_text: None,
+                    best_window: None,
+                    best_window_first: false,
+                    kwic_count: 0,
+                });
+            }
+        };
 
         // ── Helper: push codegraph JSON nodes into hits ──────────────────
-        let push_codegraph_hits = |hits: &mut Vec<UnifiedHit>, pkg_name: &str, raw_json: &str| {
+        let push_codegraph_hits = |hits: &mut Vec<UnifiedHit>,
+                                  pkg_name: &str,
+                                  raw_json: &str|
+         -> usize {
             let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(raw_json) else {
-                return;
+                return 0;
             };
             for (pos, v) in arr.iter().enumerate() {
                 let node = v.get("node").unwrap_or(v);
@@ -1229,7 +1425,7 @@ impl McpContext {
                 // Codegraph BM25 and lance BM25 are on different scales; mixing
                 // them biases the global sort.  Rank position is the only
                 // comparable signal across heterogeneous sources.
-                let rrf_score = 1.0 / (60.0 + pos as f32 + 1.0);
+                let rrf_score = weight / (60.0 + pos as f32 + 1.0);
                 hits.push(UnifiedHit {
                     package: pkg_name.to_string(),
                     origin: "codegraph",
@@ -1247,6 +1443,7 @@ impl McpContext {
                     kwic_count: 0,
                 });
             }
+            arr.len()
         };
 
         // ── Installed bundles ────────────────────────────────────────────
@@ -1257,24 +1454,20 @@ impl McpContext {
             // Source-code index
             if bundle.has_code() {
                 let code_dir = bundle.bundle_dir.join("code");
-                if let Ok(results) = lance::search_code(&code_dir, query, fetch_limit) {
-                    for (pos, r) in results.into_iter().enumerate() {
-                        hits.push(UnifiedHit {
-                            package: pkg_name.clone(),
-                            origin: "code",
-                            path: r.path,
-                            start_line: r.start_line,
-                            end_line: r.end_line,
-                            snippet: r.snippet,
-                            symbol: r.symbol,
-                            kind: r.kind,
-                            signature: r.signature,
-                            rrf_score: 1.0 / (60.0 + pos as f32 + 1.0),
-                            expanded_text: None,
-                            best_window: None,
-                            best_window_first: false,
-                            kwic_count: 0,
-                        });
+                if do_lex {
+                    if let Ok(results) = lance::search_code(&code_dir, query, fetch_limit) {
+                        stats.lex_code_hits += results.len();
+                        push_results(hits, &pkg_name, "code", results);
+                    }
+                }
+                if let Some(qv) = &query_vec {
+                    stats.vec_tables_checked += 1;
+                    if vectors_compatible(&code_dir, qv.len()) {
+                        stats.vec_tables_compatible += 1;
+                        if let Ok(results) = lance::search_code_vector(&code_dir, qv, fetch_limit) {
+                            stats.vec_code_hits += results.len();
+                            push_results(hits, &pkg_name, "code", results);
+                        }
                     }
                 }
             }
@@ -1282,32 +1475,28 @@ impl McpContext {
             // Documentation index
             if bundle.has_lance() {
                 let lance_dir = bundle.bundle_dir.join("lance");
-                if let Ok(results) = lance::search(&lance_dir, query, fetch_limit) {
-                    for (pos, r) in results.into_iter().enumerate() {
-                        hits.push(UnifiedHit {
-                            package: pkg_name.clone(),
-                            origin: "docs",
-                            path: r.path,
-                            start_line: r.start_line,
-                            end_line: r.end_line,
-                            snippet: r.snippet,
-                            symbol: r.symbol,
-                            kind: r.kind,
-                            signature: r.signature,
-                            rrf_score: 1.0 / (60.0 + pos as f32 + 1.0),
-                            expanded_text: None,
-                            best_window: None,
-                            best_window_first: false,
-                            kwic_count: 0,
-                        });
+                if do_lex {
+                    if let Ok(results) = lance::search(&lance_dir, query, fetch_limit) {
+                        stats.lex_docs_hits += results.len();
+                        push_results(hits, &pkg_name, "docs", results);
+                    }
+                }
+                if let Some(qv) = &query_vec {
+                    stats.vec_tables_checked += 1;
+                    if vectors_compatible(&lance_dir, qv.len()) {
+                        stats.vec_tables_compatible += 1;
+                        if let Ok(results) = lance::search_vector(&lance_dir, qv, fetch_limit) {
+                            stats.vec_docs_hits += results.len();
+                            push_results(hits, &pkg_name, "docs", results);
+                        }
                     }
                 }
             }
 
-            // CodeGraph symbol search
-            if bundle.is_indexed() {
+            // CodeGraph symbol search (lexical only).
+            if do_lex && bundle.is_indexed() {
                 if let Ok(raw) = codegraph::query(&bundle.bundle_dir, query, None, fetch_limit) {
-                    push_codegraph_hits(&mut hits, &pkg_name, &raw);
+                    stats.lex_codegraph_hits += push_codegraph_hits(hits, &pkg_name, &raw);
                 }
             }
         }
@@ -1319,33 +1508,98 @@ impl McpContext {
             // Lance docs index at <pkg>/.sempkg/lance/
             let lance_dir = pkg.abs_path().join(".sempkg").join("lance");
             if lance_dir.is_dir() {
-                if let Ok(results) = lance::search(&lance_dir, query, fetch_limit) {
-                    for (pos, r) in results.into_iter().enumerate() {
-                        hits.push(UnifiedHit {
-                            package: pkg_name.clone(),
-                            origin: "docs",
-                            path: r.path,
-                            start_line: r.start_line,
-                            end_line: r.end_line,
-                            snippet: r.snippet,
-                            symbol: r.symbol,
-                            kind: r.kind,
-                            signature: r.signature,
-                            rrf_score: 1.0 / (60.0 + pos as f32 + 1.0),
-                            expanded_text: None,
-                            best_window: None,
-                            best_window_first: false,
-                            kwic_count: 0,
-                        });
+                if do_lex {
+                    if let Ok(results) = lance::search(&lance_dir, query, fetch_limit) {
+                        stats.lex_docs_hits += results.len();
+                        push_results(hits, &pkg_name, "docs", results);
+                    }
+                }
+                if let Some(qv) = &query_vec {
+                    stats.vec_tables_checked += 1;
+                    if vectors_compatible(&lance_dir, qv.len()) {
+                        stats.vec_tables_compatible += 1;
+                        if let Ok(results) = lance::search_vector(&lance_dir, qv, fetch_limit) {
+                            stats.vec_docs_hits += results.len();
+                            push_results(hits, &pkg_name, "docs", results);
+                        }
                     }
                 }
             }
 
-            // CodeGraph
-            if pkg.is_indexed() {
+            // CodeGraph (lexical only).
+            if do_lex && pkg.is_indexed() {
                 if let Ok(raw) = codegraph::query(&pkg.abs_path(), query, None, fetch_limit) {
-                    push_codegraph_hits(&mut hits, &pkg_name, &raw);
+                    stats.lex_codegraph_hits += push_codegraph_hits(hits, &pkg_name, &raw);
                 }
+            }
+        }
+
+        stats
+    }
+
+    fn tool_query(&self, query: &str, limit: usize) -> String {
+        let debug = std::env::var("SEMPKG_DEBUG").is_ok();
+        let debug_list_limit = debug_hit_list_limit();
+        let fetch_limit = self.reranker_fetch_limit(limit).max(20);
+        let mut hits: Vec<UnifiedHit> = Vec::new();
+
+        // ── Query expansion → retrieval runs ─────────────────────────────
+        // The original query always runs against BOTH backends with double
+        // weight (it is the most trustworthy signal — matches QMD). Expanded
+        // variants are routed by type: `lex` → BM25, `vec`/`hyde` → vector.
+        // When no expander is loaded (model missing / feature off), the single
+        // original run still drives full BM25 + vector search.
+        let mut runs: Vec<(String, f32, bool, bool)> = vec![(query.to_string(), 2.0, true, true)];
+
+        let mut expanded_variants = 0usize;
+        if let Some(expander) = self.expander.as_ref() {
+            for variant in expander.expand(query) {
+                expanded_variants += 1;
+                match variant.kind {
+                    ExpansionKind::Lexical => runs.push((variant.text, 1.0, true, false)),
+                    ExpansionKind::Vector => runs.push((variant.text, 1.0, false, true)),
+                }
+            }
+        }
+
+        if debug {
+            eprintln!(
+                "sempkg: query debug — runs={} (original=1 expanded={}) fetch_limit={} limit={} expander_loaded={} embedder_loaded={}",
+                runs.len(),
+                expanded_variants,
+                fetch_limit,
+                limit,
+                self.expander.is_some(),
+                self.embedder.is_some()
+            );
+            for (i, (q, weight, do_lex, do_vec)) in runs.iter().enumerate() {
+                eprintln!(
+                    "sempkg: run-plan[{i}] route={{lex:{do_lex}, vec:{do_vec}}} weight={weight:.1} q={q:?}"
+                );
+            }
+        }
+
+        for (run_idx, (q, weight, do_lex, do_vec)) in runs.iter().enumerate() {
+            let before = hits.len();
+            let stats = self.collect_query_hits(q, *weight, *do_lex, *do_vec, fetch_limit, &mut hits);
+            if debug {
+                eprintln!(
+                    "sempkg: query run[{run_idx}] route={{lex:{do_lex}, vec:{do_vec}}} weight={weight:.1} q={q:?} added={} lex(code/docs/codegraph)={}/{}/{} vec(code/docs)={}/{} vec_tables(compatible/checked)={}/{}",
+                    stats.total_added(),
+                    stats.lex_code_hits,
+                    stats.lex_docs_hits,
+                    stats.lex_codegraph_hits,
+                    stats.vec_code_hits,
+                    stats.vec_docs_hits,
+                    stats.vec_tables_compatible,
+                    stats.vec_tables_checked
+                );
+                eprintln!("sempkg: query run[{run_idx}] cumulative_raw_hits={}", hits.len());
+                debug_print_stage_hits(
+                    &format!("query run[{run_idx}] raw hits"),
+                    &hits[before..],
+                    debug_list_limit,
+                );
             }
         }
 
@@ -1366,6 +1620,7 @@ impl McpContext {
         let mut hits: Vec<UnifiedHit> = {
             let mut key_map: HashMap<String, usize> = HashMap::with_capacity(hits.len());
             let mut deduped: Vec<UnifiedHit> = Vec::with_capacity(hits.len());
+            let mut duplicate_logs: Vec<String> = Vec::new();
             for hit in hits {
                 let key = dedup_key(&hit);
                 if let Some(&idx) = key_map.get(&key) {
@@ -1376,25 +1631,64 @@ impl McpContext {
                             && hit.snippet.len() > deduped[idx].snippet.len());
                     if should_replace {
                         let old = std::mem::replace(&mut deduped[idx], hit);
+                        if debug {
+                            duplicate_logs.push(format!(
+                                "duplicate key={} action=replace kept=[{}] dropped=[{}]",
+                                key,
+                                debug_hit_preview(&deduped[idx]),
+                                debug_hit_preview(&old)
+                            ));
+                        }
                         merge_complementary(&mut deduped[idx], &old);
-                        // Preserve the stronger fusion signal: if the loser
-                        // ranked higher in its own source list, carry that
-                        // score forward so pool selection isn't penalised.
-                        deduped[idx].rrf_score = deduped[idx].rrf_score.max(old.rrf_score);
+                        // RRF fusion: a hit found by multiple runs/sources
+                        // accumulates their reciprocal-rank contributions.
+                        deduped[idx].rrf_score += old.rrf_score;
                     } else {
-                        // Existing wins; harvest complementary fields and keep
-                        // the better RRF score regardless of which side won.
+                        if debug {
+                            duplicate_logs.push(format!(
+                                "duplicate key={} action=drop kept=[{}] dropped=[{}]",
+                                key,
+                                debug_hit_preview(&deduped[idx]),
+                                debug_hit_preview(&hit)
+                            ));
+                        }
+                        // Existing wins; harvest complementary fields and add
+                        // this run's RRF contribution to the running total.
                         let new_rrf = hit.rrf_score;
                         merge_complementary(&mut deduped[idx], &hit);
-                        deduped[idx].rrf_score = deduped[idx].rrf_score.max(new_rrf);
+                        deduped[idx].rrf_score += new_rrf;
                     }
                 } else {
                     key_map.insert(key, deduped.len());
                     deduped.push(hit);
                 }
             }
+            if debug {
+                eprintln!(
+                    "sempkg: dedup decisions count={} (showing up to {})",
+                    duplicate_logs.len(),
+                    debug_list_limit
+                );
+                for (i, line) in duplicate_logs.iter().take(debug_list_limit).enumerate() {
+                    eprintln!("sempkg:   dedup[{i}] {line}");
+                }
+                if duplicate_logs.len() > debug_list_limit {
+                    eprintln!(
+                        "sempkg:   ... {} more dedup decision(s) omitted",
+                        duplicate_logs.len() - debug_list_limit
+                    );
+                }
+            }
             deduped
         };
+
+        if debug {
+            eprintln!(
+                "sempkg: query fusion — deduped_hits={} (post-run pre-dedup can be inferred from last cumulative_raw_hits)",
+                hits.len()
+            );
+            debug_print_stage_hits("query post-dedup hits", &hits, debug_list_limit);
+        }
 
         // ── Global RRF sort ───────────────────────────────────────────────
         // All sources used the same RRF formula so this sort is apples-to-apples.
@@ -1404,6 +1698,9 @@ impl McpContext {
                 .partial_cmp(&a.rrf_score)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
+        if debug {
+            debug_print_stage_hits("query post-rrf-sort hits", &hits, debug_list_limit);
+        }
 
         // ── Diversity selection ───────────────────────────────────────────
         // Greedy pass over the RRF-sorted list: accept each hit until its
@@ -1432,6 +1729,21 @@ impl McpContext {
             })
             .take(pool_size)
             .collect();
+        if debug {
+            eprintln!(
+                "sempkg: query diversity-selected pool count={}",
+                pool_indices.len()
+            );
+            for (i, hi) in pool_indices.iter().take(debug_list_limit).enumerate() {
+                eprintln!("sempkg:   [pool:{i}] {}", debug_hit_preview(&hits[*hi]));
+            }
+            if pool_indices.len() > debug_list_limit {
+                eprintln!(
+                    "sempkg:   ... {} more pool hit(s) omitted",
+                    pool_indices.len() - debug_list_limit
+                );
+            }
+        }
 
         // ── Small-to-big expansion ────────────────────────────────────────
         // Fetch the full symbol body for each code/codegraph hit in the pool.
