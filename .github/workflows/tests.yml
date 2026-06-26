@@ -229,6 +229,16 @@ jobs:
         env:
           SEMPKG_WORKSPACE: /tmp/sempkg-test-workspace
 
+      - name: Enable reranker in test workspace
+        run: |
+          cat >> /tmp/sempkg-test-workspace/sempkg.toml << 'EOF'
+
+          [reranker]
+          enabled = true
+          top_k = 20
+          output_n = 5
+          EOF
+
       - name: Install codegraph bundle (fresh build with new sembundle)
         run: |
           ./src/sempkg/target/release/sempkg add colbymchenry/codegraph@v0.9.7 \
