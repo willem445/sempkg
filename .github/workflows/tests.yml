@@ -262,6 +262,43 @@ jobs:
           SEMPKG_WORKSPACE: /tmp/sempkg-test-workspace
         timeout-minutes: 15
 
+      - name: Install lancedb bundle for query benchmarks
+        run: |
+          ./src/sempkg/target/release/sempkg add lancedb/lancedb@v0.30.0 \
+            --include-source \
+            --source-dir rust/lancedb/src \
+            --docs-dir docs/src \
+            --workspace /tmp/sempkg-test-workspace \
+            --reinstall
+        env:
+          SEMPKG_WORKSPACE: /tmp/sempkg-test-workspace
+        timeout-minutes: 20
+
+      - name: Install local sempkg bundle for query benchmarks
+        run: |
+          ./src/sempkg/target/release/sempkg add . \
+            --name sempkg \
+            --include-source \
+            --source-dir src/sempkg/src \
+            --docs-dir docs \
+            --workspace /tmp/sempkg-test-workspace \
+            --reinstall
+        env:
+          SEMPKG_WORKSPACE: /tmp/sempkg-test-workspace
+        timeout-minutes: 20
+
+      - name: Install llama-cpp-rs bundle for pooling benchmark
+        run: |
+          ./src/sempkg/target/release/sempkg add utilityai/llama-cpp-rs@0.1.150 \
+            --include-source \
+            --source-dir llama-cpp-2/src \
+            --docs-dir examples/reranker \
+            --workspace /tmp/sempkg-test-workspace \
+            --reinstall
+        env:
+          SEMPKG_WORKSPACE: /tmp/sempkg-test-workspace
+        timeout-minutes: 20
+
       # ---- Run tests ----
 
       - name: Run functional MCP tests
