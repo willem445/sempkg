@@ -6,3 +6,8 @@ codegraph = { version = "0.9.7", git = "github:colbymchenry/codegraph", git_ref 
 lancedb = { version = "0.30.0", git = "github:lancedb/lancedb", git_ref = "v0.30.0", full = true, include_source = true, source_dirs = ['.\rust\lancedb\src'], docs_dirs = ['.\docs\src\'] }
 qmd = { version = "2.5.2", git = "github:tobi/qmd", git_ref = "v2.5.2", full = true, include_source = true, source_dirs = ['.\src\'], docs_dirs = ['.\docs\'] }
 sempkg = { version = "0.3.0-beta-30-gcfcfdefb0b81", local = ".", include_source = true, source_dirs = ['.\src\'], docs_dirs = ['.\docs\'] }
+
+[reranker]
+enabled = true
+top_k = 20
+output_n = 5

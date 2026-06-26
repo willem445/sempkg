@@ -8,8 +8,8 @@ use std::sync::Arc;
 use arrow_array::{RecordBatch, StringArray, UInt32Array};
 use arrow_schema::{DataType, Field, Schema};
 use futures::TryStreamExt;
-use lancedb::query::{ExecutableQuery, QueryBase};
 use lancedb::index::scalar::FullTextSearchQuery;
+use lancedb::query::{ExecutableQuery, QueryBase};
 use serde::Deserialize;
 
 use crate::error::SempkgError;
@@ -54,7 +54,7 @@ pub fn load_metadata(lance_dir: &Path) -> Option<LanceMetadata> {
 // Search
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SearchResult {
     pub path: String,
     pub snippet: String,
@@ -82,6 +82,30 @@ pub struct SymbolSource {
     pub content: String,
     pub start_line: u32,
     pub end_line: u32,
+}
+
+/// A lightweight description of a symbol candidate used when a name is ambiguous.
+#[derive(Debug, Clone)]
+pub struct SymbolCandidate {
+    pub name: String,
+    pub qualified_name: String,
+    pub kind: String,
+    pub path: String,
+    pub start_line: u32,
+    pub end_line: u32,
+}
+
+/// Result of a `fetch_symbol_source` lookup.
+///
+/// - `Unique`      — exactly one match; contains the full source.
+/// - `Ambiguous`   — multiple nodes share the same name; the caller must ask
+///                   the user to disambiguate.
+/// - `NotFound`    — no node matched the requested symbol name.
+#[derive(Debug)]
+pub enum SymbolLookup {
+    Unique(SymbolSource),
+    Ambiguous(Vec<SymbolCandidate>),
+    NotFound,
 }
 
 pub fn code_dir_path(bundle_dir: &Path) -> PathBuf {
@@ -120,9 +144,7 @@ fn search_table(
     is_code: bool,
 ) -> crate::error::Result<Vec<SearchResult>> {
     if !dir.is_dir() {
-        return Err(SempkgError::NoLanceIndex(
-            dir.to_string_lossy().to_string(),
-        ));
+        return Err(SempkgError::NoLanceIndex(dir.to_string_lossy().to_string()));
     }
 
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -226,19 +248,113 @@ fn search_table(
 }
 
 /// Fetch the full source body for a symbol from the `code` table.
-/// Returns the first exact match on the `symbol` column.
-pub fn fetch_symbol_source(
+///
+/// Resolution path:
+/// 1. Query `codegraph.db` (via the `graph/` sibling of `code_dir`) for an
+///    exact name / qualified-name match — this gives precise `file_path`,
+///    `start_line`, `end_line`.
+/// 2. If more than one node matches the name exactly, return
+///    [`SymbolLookup::Ambiguous`] with a candidate list so the caller can ask
+///    the user to disambiguate via `read_code(file, line)`.
+/// 3. Query the LanceDB `code` table with an exact `path + start_line` filter
+///    to retrieve the stored content without any BM25 / FTS ambiguity.
+/// 4. If the stored chunk is wider than the codegraph range, slice it to the
+///    exact lines.
+pub fn fetch_symbol_source(code_dir: &Path, symbol: &str) -> crate::error::Result<SymbolLookup> {
+    if !code_dir.is_dir() {
+        return Ok(SymbolLookup::NotFound);
+    }
+
+    // Derive the codegraph.db path from the bundle directory (parent of code/).
+    let db_path = code_dir
+        .parent()
+        .map(|p| p.join("graph").join("codegraph.db"))
+        .filter(|p| p.exists());
+
+    // --- Step 1: resolve symbol location via SQLite ---
+    let nodes: Vec<crate::codegraph::NodeRecord> = if let Some(ref db) = db_path {
+        crate::codegraph::db_query_symbol_all(db, symbol).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    // --- Step 2: check for ambiguity ---
+    if nodes.len() > 1 {
+        let candidates = nodes
+            .into_iter()
+            .map(|n| SymbolCandidate {
+                qualified_name: n.qualified_name.clone(),
+                name: n.name,
+                kind: n.kind,
+                path: n.file_path,
+                start_line: n.start_line,
+                end_line: n.end_line,
+            })
+            .collect();
+        return Ok(SymbolLookup::Ambiguous(candidates));
+    }
+
+    let node = nodes.into_iter().next();
+
+    // --- Step 3: find the LanceDB row with an exact path+start_line filter ---
+    match fetch_from_code_table(code_dir, node.as_ref(), symbol)? {
+        Some(src) => Ok(SymbolLookup::Unique(src)),
+        None => Ok(SymbolLookup::NotFound),
+    }
+}
+
+/// Fetch the symbol whose source range contains `line` in `file`.
+///
+/// Resolution path:
+/// 1. Query `codegraph.db` (SQLite) for the tightest enclosing symbol at
+///    `file:line` — gives precise `file_path`, `start_line`, `end_line`.
+/// 2. Query the LanceDB `code` table with an exact `path + start_line` filter.
+/// 3. Slice the content to the codegraph range if the stored chunk is wider.
+pub fn fetch_symbol_at_location(
     code_dir: &Path,
-    symbol: &str,
+    file: &str,
+    line: u32,
 ) -> crate::error::Result<Option<SymbolSource>> {
     if !code_dir.is_dir() {
         return Ok(None);
     }
 
+    let db_path = code_dir
+        .parent()
+        .map(|p| p.join("graph").join("codegraph.db"))
+        .filter(|p| p.exists());
+
+    let node = if let Some(ref db) = db_path {
+        crate::codegraph::db_query_at_location(db, file, line)
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
+
+    // Fall back to a path-suffix + line-range filter when no SQLite DB is available.
+    if node.is_none() && db_path.is_none() {
+        return fetch_at_location_lance_fallback(code_dir, file, line);
+    }
+
+    fetch_from_code_table(code_dir, node.as_ref(), file)
+}
+
+/// Internal: given a resolved `NodeRecord` (or `None`), query the LanceDB
+/// `code` table by exact `path + start_line` and return the tightest content.
+///
+/// When `node` is `Some`, we filter by the node's `file_path` + `start_line`.
+/// When `node` is `None` and only a `hint` (symbol name or file path) is
+/// provided, we attempt a name-based fallback via a wider filter.
+fn fetch_from_code_table(
+    code_dir: &Path,
+    node: Option<&crate::codegraph::NodeRecord>,
+    hint: &str,
+) -> crate::error::Result<Option<SymbolSource>> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .map_err(|e| SempkgError::Io(e))?;
+        .map_err(SempkgError::Io)?;
 
     let result = rt.block_on(async {
         let db = lancedb::connect(code_dir.to_str().unwrap_or("."))
@@ -252,19 +368,38 @@ pub fn fetch_symbol_source(
             .await
             .map_err(|e| SempkgError::LanceError(e.to_string()))?;
 
-        // Use a full-text search on the symbol name as a proxy for exact lookup,
-        // then filter client-side for an exact symbol match.
-        let batches: Vec<RecordBatch> = tbl
-            .query()
-            .full_text_search(FullTextSearchQuery::new(symbol.to_string()))
-            .limit(50)
-            .execute()
-            .await
-            .map_err(|e| SempkgError::LanceError(e.to_string()))?
-            .try_collect()
-            .await
-            .map_err(|e| SempkgError::LanceError(e.to_string()))?;
+        // Build the filter expression from the resolved node or fall back to a
+        // full-text search on the symbol/hint name.
+        let batches: Vec<RecordBatch> = if let Some(n) = node {
+            let safe_fp = n.file_path.replace('\'', "''");
+            let filter = format!(
+                "(path = '{safe_fp}' OR path LIKE '%/{safe_fp}' OR path LIKE '%\\\\{safe_fp}') \
+                 AND start_line = {}",
+                n.start_line
+            );
+            tbl.query()
+                .only_if(filter)
+                .execute()
+                .await
+                .map_err(|e| SempkgError::LanceError(e.to_string()))?
+                .try_collect()
+                .await
+                .map_err(|e| SempkgError::LanceError(e.to_string()))?
+        } else {
+            // No SQLite DB available — fall back to FTS on the symbol/hint name
+            // and do an exact client-side match.
+            tbl.query()
+                .full_text_search(FullTextSearchQuery::new(hint.to_string()))
+                .limit(50)
+                .execute()
+                .await
+                .map_err(|e| SempkgError::LanceError(e.to_string()))?
+                .try_collect()
+                .await
+                .map_err(|e| SempkgError::LanceError(e.to_string()))?
+        };
 
+        // Extract the first matching row.
         for batch in &batches {
             let syms = batch
                 .column_by_name("symbol")
@@ -288,19 +423,55 @@ pub fn fetch_symbol_source(
                 .column_by_name("end_line")
                 .and_then(|c| c.as_any().downcast_ref::<UInt32Array>());
 
-            if let (Some(s), Some(p), Some(c)) = (syms, paths, contents) {
+            if let (Some(p), Some(c)) = (paths, contents) {
                 for i in 0..batch.num_rows() {
-                    if s.value(i) == symbol {
-                        return Ok(Some(SymbolSource {
-                            path: p.value(i).to_string(),
-                            symbol: s.value(i).to_string(),
-                            kind: kinds.map_or("", |a| a.value(i)).to_string(),
-                            signature: sigs.map_or("", |a| a.value(i)).to_string(),
-                            content: c.value(i).to_string(),
-                            start_line: start_lines.map_or(0, |a| a.value(i)),
-                            end_line: end_lines.map_or(0, |a| a.value(i)),
-                        }));
+                    // When using FTS fallback, require exact symbol name match.
+                    if node.is_none() {
+                        let sym_val = syms.map_or("", |a| a.value(i));
+                        if sym_val != hint {
+                            continue;
+                        }
                     }
+
+                    let row_start = start_lines.map_or(0, |a| a.value(i));
+                    let row_end = end_lines.map_or(0, |a| a.value(i));
+
+                    // Determine the exact line range to extract.
+                    let (exact_start, exact_end) = if let Some(n) = node {
+                        (n.start_line, n.end_line)
+                    } else {
+                        (row_start, row_end)
+                    };
+
+                    // Slice the stored content to the precise codegraph range
+                    // in case the chunk is wider than the symbol.
+                    let raw_content = c.value(i);
+                    let content =
+                        slice_content_to_range(raw_content, row_start, exact_start, exact_end);
+
+                    let sym_name = node
+                        .map(|n| n.name.clone())
+                        .or_else(|| syms.map(|a| a.value(i).to_string()))
+                        .unwrap_or_default();
+                    let kind = node
+                        .map(|n| n.kind.clone())
+                        .or_else(|| kinds.map(|a| a.value(i).to_string()))
+                        .unwrap_or_default();
+                    let signature = node
+                        .as_ref()
+                        .and_then(|n| n.signature.clone())
+                        .or_else(|| sigs.map(|a| a.value(i).to_string()))
+                        .unwrap_or_default();
+
+                    return Ok(Some(SymbolSource {
+                        path: p.value(i).to_string(),
+                        symbol: sym_name,
+                        kind,
+                        signature,
+                        content,
+                        start_line: exact_start,
+                        end_line: exact_end,
+                    }));
                 }
             }
         }
@@ -310,27 +481,49 @@ pub fn fetch_symbol_source(
     Ok(result)
 }
 
-/// Fetch the symbol whose source range contains `line` in `file` from the `code` table.
-/// `file` is matched as a suffix of the stored path (e.g. `src/foo.rs` matches
-/// `some/prefix/src/foo.rs`). Returns the best (tightest) match when multiple
-/// symbols overlap the requested line.
-pub fn fetch_symbol_at_location(
+/// Slice `content` (which starts at `chunk_start` line) to the range
+/// `[exact_start, exact_end]` (both 1-based, inclusive).
+/// Returns the full content unchanged when the chunk already matches or when
+/// line numbers are zero/unavailable.
+fn slice_content_to_range(
+    content: &str,
+    chunk_start: u32,
+    exact_start: u32,
+    exact_end: u32,
+) -> String {
+    if chunk_start == 0 || exact_start == 0 || exact_end == 0 {
+        return content.to_string();
+    }
+    if chunk_start == exact_start {
+        // The chunk starts exactly at the symbol — just drop trailing lines.
+        let keep = (exact_end - exact_start + 1) as usize;
+        let result: Vec<&str> = content.lines().take(keep).collect();
+        return result.join("\n");
+    }
+    // The chunk starts before the symbol (larger chunk) — extract the sub-range.
+    let skip = (exact_start.saturating_sub(chunk_start)) as usize;
+    let keep = (exact_end - exact_start + 1) as usize;
+    let result: Vec<&str> = content.lines().skip(skip).take(keep).collect();
+    if result.is_empty() {
+        content.to_string() // safety: return full content if arithmetic went wrong
+    } else {
+        result.join("\n")
+    }
+}
+
+/// LanceDB-only fallback for `fetch_symbol_at_location` when `codegraph.db`
+/// is not present.  Preserves the original tightest-range heuristic.
+fn fetch_at_location_lance_fallback(
     code_dir: &Path,
     file: &str,
     line: u32,
 ) -> crate::error::Result<Option<SymbolSource>> {
-    if !code_dir.is_dir() {
-        return Ok(None);
-    }
-
-    // Sanitise the file argument so it can be embedded in a SQL filter string.
-    // Reject anything that could alter the expression syntax.
     let safe_file = file.replace('\'', "''");
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .map_err(|e| SempkgError::Io(e))?;
+        .map_err(SempkgError::Io)?;
 
     let result = rt.block_on(async {
         let db = lancedb::connect(code_dir.to_str().unwrap_or("."))
@@ -344,10 +537,8 @@ pub fn fetch_symbol_at_location(
             .await
             .map_err(|e| SempkgError::LanceError(e.to_string()))?;
 
-        // Filter to rows whose path ends with the requested file and whose line
-        // range brackets the requested line number.
         let filter = format!(
-            "(path = '{safe_file}' OR path LIKE '%/{safe_file}' OR path LIKE '%\\{safe_file}') \
+            "(path = '{safe_file}' OR path LIKE '%/{safe_file}' OR path LIKE '%\\\\{safe_file}') \
              AND start_line <= {line} AND end_line >= {line}"
         );
 
@@ -401,7 +592,6 @@ pub fn fetch_symbol_at_location(
                         end_line: end,
                     };
 
-                    // Keep the tightest enclosing range (smallest span).
                     let span = end.saturating_sub(start);
                     let is_better = match &best {
                         None => true,
@@ -436,8 +626,15 @@ pub fn format_results(results: &[SearchResult], query: &str) -> String {
             if let Some(sym) = &r.symbol {
                 let kind = r.kind.as_deref().unwrap_or("symbol");
                 let sig = r.signature.as_deref().unwrap_or("");
-                let sig_part = if sig.is_empty() { String::new() } else { format!("\n_{sig}_") };
-                format!("**{sym}** ({kind}) @ {loc}{sig_part}\n\n```\n{}\n```", r.snippet)
+                let sig_part = if sig.is_empty() {
+                    String::new()
+                } else {
+                    format!("\n_{sig}_")
+                };
+                format!(
+                    "**{sym}** ({kind}) @ {loc}{sig_part}\n\n```\n{}\n```",
+                    r.snippet
+                )
             } else {
                 format!("**{}**\n\n{}", loc, r.snippet)
             }

@@ -37,7 +37,7 @@ jobs:
         run: uv pip install --system -e ".[dev]"
 
       - name: Run pytest
-        run: python -m pytest
+        run: python -m pytest --cov=src/sempkg_registry --cov-report=term-missing
 
       - name: Upload coverage reports
         uses: codecov/codecov-action@v3
@@ -144,3 +144,167 @@ jobs:
 
       - name: Test sempkg
         run: cargo test --manifest-path src/sempkg/Cargo.toml --features reranker
+
+  functional-tests:
+    name: Functional MCP tests (ubuntu)
+    runs-on: ubuntu-latest
+    # Only run on pushes/PRs to main, and on
+    # manual dispatch — this job downloads & indexes an external repo so it
+    # takes several minutes.
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && github.ref_name == 'main') ||
+      (github.event_name == 'pull_request' && github.base_ref == 'main')
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install Python test dependencies
+        run: uv pip install --system pytest
+
+      - name: Install Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "lts/*"
+
+      - name: Install codegraph CLI (required by sembundle indexer)
+        run: npm install -g @colbymchenry/codegraph
+
+      # ---- Rust build dependencies ----
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y cmake clang libclang-dev llvm-dev
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+          key: functional-rust-ubuntu
+
+      - name: Resolve LIBCLANG_PATH
+        shell: bash
+        run: |
+          if command -v llvm-config >/dev/null 2>&1; then
+            echo "LIBCLANG_PATH=$(llvm-config --libdir)" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          for p in /usr/lib/llvm-*/lib; do
+            if [ -e "$p/libclang.so" ] || ls "$p"/libclang-*.so 2>/dev/null | grep -q .; then
+              echo "LIBCLANG_PATH=$p" >> "$GITHUB_ENV"
+              exit 0
+            fi
+          done
+          echo "libclang not found" >&2
+          exit 1
+
+      - name: Build sempkg release binary
+        run: cargo build --release --manifest-path src/sempkg/Cargo.toml --features reranker
+
+      # ---- Install the test bundle ----
+
+      - name: Create test workspace
+        run: mkdir -p /tmp/sempkg-test-workspace
+
+      - name: Initialize sempkg workspace
+        run: ./src/sempkg/target/release/sempkg init --workspace /tmp/sempkg-test-workspace
+        env:
+          SEMPKG_WORKSPACE: /tmp/sempkg-test-workspace
+
+      - name: Enable reranker in test workspace
+        run: |
+          cat >> /tmp/sempkg-test-workspace/sempkg.toml << 'EOF'
+
+          [reranker]
+          enabled = true
+          top_k = 20
+          output_n = 5
+          EOF
+
+      - name: Download Qwen3-Reranker GGUF model from HuggingFace
+        run: ./src/sempkg/target/release/sempkg reranker pull --workspace /tmp/sempkg-test-workspace
+        env:
+          SEMPKG_WORKSPACE: /tmp/sempkg-test-workspace
+        timeout-minutes: 10
+
+      - name: Verify reranker is configured and model is present
+        run: ./src/sempkg/target/release/sempkg reranker status --workspace /tmp/sempkg-test-workspace
+        env:
+          SEMPKG_WORKSPACE: /tmp/sempkg-test-workspace
+
+      - name: Install codegraph bundle (fresh build with new sembundle)
+        run: |
+          ./src/sempkg/target/release/sempkg add colbymchenry/codegraph@v0.9.7 \
+            --include-source \
+            --source-dir src/ \
+            --docs-dir docs/ \
+            --workspace /tmp/sempkg-test-workspace \
+            --reinstall
+        env:
+          SEMPKG_WORKSPACE: /tmp/sempkg-test-workspace
+        timeout-minutes: 15
+
+      - name: Install lancedb bundle for query benchmarks
+        run: |
+          ./src/sempkg/target/release/sempkg add lancedb/lancedb@v0.30.0 \
+            --include-source \
+            --source-dir rust/lancedb/src \
+            --docs-dir docs/src \
+            --workspace /tmp/sempkg-test-workspace \
+            --reinstall
+        env:
+          SEMPKG_WORKSPACE: /tmp/sempkg-test-workspace
+        timeout-minutes: 20
+
+      - name: Install local sempkg bundle for query benchmarks
+        run: |
+          ./src/sempkg/target/release/sempkg add . \
+            --name sempkg \
+            --include-source \
+            --source-dir src/sempkg/src \
+            --docs-dir docs \
+            --workspace /tmp/sempkg-test-workspace \
+            --reinstall
+        env:
+          SEMPKG_WORKSPACE: /tmp/sempkg-test-workspace
+        timeout-minutes: 20
+
+      - name: Install llama-cpp-rs bundle for pooling benchmark
+        run: |
+          ./src/sempkg/target/release/sempkg add utilityai/llama-cpp-rs@0.1.150 \
+            --include-source \
+            --source-dir llama-cpp-2/src \
+            --docs-dir examples/reranker \
+            --workspace /tmp/sempkg-test-workspace \
+            --reinstall
+        env:
+          SEMPKG_WORKSPACE: /tmp/sempkg-test-workspace
+        timeout-minutes: 20
+
+      # ---- Run tests ----
+
+      - name: Run functional MCP tests
+        run: |
+          pytest tests/test_mcp_functional.py -v \
+            --override-ini="addopts=-v" \
+            --tb=short
+        env:
+          SEMPKG_WORKSPACE: /tmp/sempkg-test-workspace

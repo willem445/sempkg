@@ -331,7 +331,12 @@ impl Reranker {
     ///
     /// A fresh context is created per pair so there is no residual KV-cache
     /// state between calls.  Context creation from a loaded model is cheap.
-    fn score_pair(&self, query: &str, document: &str) -> Result<f32> {
+    /// Score a single `(query, document)` pair, returning P(relevant) in [0, 1].
+    ///
+    /// Made public so callers that need to bypass the `top_k` / `output_n` caps
+    /// inside `rerank()` (e.g. KWIC window scoring in pass-2) can iterate over
+    /// windows themselves and call this primitive directly.
+    pub fn score_pair(&self, query: &str, document: &str) -> Result<f32> {
         use llama_cpp_2::{
             context::params::LlamaContextParams, llama_batch::LlamaBatch, model::AddBos,
         };
@@ -434,6 +439,11 @@ impl Reranker {
         _candidates: Vec<RerankCandidate>,
     ) -> Result<Vec<RerankResult>> {
         Ok(Vec::new())
+    }
+
+    /// Stub — always returns 0.0; real scoring requires `--features reranker`.
+    pub fn score_pair(&self, _query: &str, _document: &str) -> Result<f32> {
+        Ok(0.0)
     }
 }
 

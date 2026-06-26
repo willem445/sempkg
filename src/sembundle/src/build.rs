@@ -3,6 +3,7 @@
 //!
 //! This is the implementation behind the `SemBundle build` subcommand.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -112,8 +113,11 @@ pub fn build(opts: BuildOptions) -> Result<PathBuf, PackError> {
             .source_glob
             .as_deref()
             .unwrap_or("**/*.rs,**/*.py,**/*.ts,**/*.tsx,**/*.js,**/*.jsx,**/*.go,**/*.java,**/*.cpp,**/*.cc,**/*.cxx,**/*.c,**/*.h,**/*.hpp");
+        // Prefer the codegraph.db that run_codegraph just produced.
+        let cg_db = cg_out.join("graph").join("codegraph.db");
+        let cg_db_opt = if cg_db.exists() { Some(cg_db.as_path()) } else { None };
         eprintln!("[sembundle] Building LanceDB source-code index ...");
-        match run_source_index(&opts.source_dirs, &code_dir, glob, &opts.exclude_dirs) {
+        match run_source_index(&opts.source_dirs, &code_dir, glob, &opts.exclude_dirs, cg_db_opt) {
             Ok(()) => Some(code_dir),
             Err(PackError::InvalidField { ref field, .. }) if field == "source_dirs" => {
                 eprintln!(
@@ -402,161 +406,330 @@ async fn run_lance_inner(
 // Source-code index step
 // ---------------------------------------------------------------------------
 
-/// A single top-level symbol extracted from a source file.
+/// Returns `true` when `trimmed` (already `.trim()`-ed) looks like a comment
+/// line in any of the languages the code index supports.
+///
+/// Covers:
+/// - `//`  `///`  `////`  — Rust / C / C++ / Java / JS / TS / Go / Swift
+/// - `#`               — Python / Ruby / Shell / TOML / YAML / R
+/// - `/*`  `*/`  `*`   — C-family block comments (middle lines start with `*`)
+/// - `--`              — SQL / Lua / Haskell
+/// - `%`               — MATLAB / LaTeX
+fn is_comment_line(trimmed: &str) -> bool {
+    trimmed.starts_with("//")
+        || trimmed.starts_with('#')
+        || trimmed.starts_with("/*")
+        || trimmed.starts_with("*/")
+        || trimmed.starts_with('*')
+        || trimmed.starts_with("--")
+        || trimmed.starts_with('%')
+}
+
+/// Walk backward from `symbol_start` (0-based index into `lines`) and return
+/// the index of the first line of the comment block that immediately precedes
+/// the symbol.
+///
+/// Algorithm:
+/// 1. Allow **at most one** blank line between the symbol and the comment
+///    block above (e.g. an empty separator line after the previous symbol).
+/// 2. Collect contiguous comment lines walking upward until the first
+///    non-comment line is reached — blank lines inside the comment block
+///    are **not** crossed, so comments for a different symbol above a blank
+///    separator are never captured.
+///
+/// Returns `symbol_start` unchanged when no qualifying comment is found.
+fn collect_leading_comment_start(lines: &[&str], symbol_start: usize) -> usize {
+    if symbol_start == 0 {
+        return symbol_start;
+    }
+    let mut scan = symbol_start - 1;
+
+    // Allow one blank separator line between the symbol and the comment.
+    if lines[scan].trim().is_empty() {
+        if scan == 0 {
+            return symbol_start;
+        }
+        scan -= 1;
+        // After the blank, the very next line must be a comment or we give up.
+        if !is_comment_line(lines[scan].trim()) {
+            return symbol_start;
+        }
+    } else if !is_comment_line(lines[scan].trim()) {
+        return symbol_start;
+    }
+
+    // `scan` is now on a comment line.  Walk upward while lines stay comments.
+    let mut comment_start = scan;
+    while scan > 0 && is_comment_line(lines[scan - 1].trim()) {
+        scan -= 1;
+        comment_start = scan;
+    }
+    comment_start
+}
+
+/// Walk forward from `symbol_end` (0-based, inclusive) and return the index
+/// of the last contiguous trailing comment line.
+///
+/// Only strictly adjacent lines are included — the first blank or non-comment
+/// line terminates the scan.  This is intentionally conservative: trailing
+/// comments are rare and we must not capture the leading comment of the next
+/// symbol.
+fn collect_trailing_comment_end(lines: &[&str], symbol_end: usize) -> usize {
+    let mut comment_end = symbol_end;
+    let mut scan = symbol_end + 1;
+    while scan < lines.len() && is_comment_line(lines[scan].trim()) {
+        comment_end = scan;
+        scan += 1;
+    }
+    comment_end
+}
+
+/// A single symbol chunk ready to be written into the LanceDB `code` table.
 struct SymbolChunk {
-    /// Repo-relative source file path (forward slashes).
     path: String,
-    /// Symbol name extracted from the declaration line.
     symbol: String,
-    /// Symbol kind: `function`, `class`, `method`, `struct`, `enum`, `trait`,
-    /// `impl`, `interface`, or `unknown`.
     kind: String,
-    /// First non-blank line of the symbol body (the declaration / signature).
     signature: String,
-    /// Full text of the symbol body.
     content: String,
     start_line: u32,
     end_line: u32,
-    start_byte: u32,
-    end_byte: u32,
 }
 
-/// Extract top-level symbol chunks from a single source file using a
-/// language-agnostic line-scanner.  The heuristic detects declarations at
-/// column 0 (or immediately after common visibility modifiers) and groups
-/// the following lines as the symbol body until the next declaration or EOF.
+// ---------------------------------------------------------------------------
+// Codegraph-DB driven extractor (primary path)
+// ---------------------------------------------------------------------------
+
+/// One row from the codegraph `nodes` SQLite table.
+struct NodeRow {
+    name: String,
+    qualified_name: String,
+    kind: String,
+    file_path: String,
+    start_line: u32,
+    end_line: u32,
+    signature: String,
+}
+
+/// Read every non-import, non-file node from `codegraph.db`, slice the
+/// corresponding source lines from disk, and return the resulting chunks.
 ///
-/// Falls back to a single whole-file chunk when no symbols are detected.
+/// Each returned chunk has `start_line`/`end_line` that match the DB exactly,
+/// so `read_symbol` / `read_code` in sempkg can locate them via a precise
+/// `path + start_line` filter.
+///
+/// Bodies wider than `max_chunk_bytes` are split into numbered sub-chunks
+/// (e.g. `MyFn#0`, `MyFn#1`) while preserving the original line range on
+/// every sub-chunk row (so the location filter still finds the first chunk).
+fn extract_chunks_from_codegraph_db(
+    db_path: &Path,
+    source_dirs: &[PathBuf],
+    exclude_dirs: &[PathBuf],
+    max_chunk_bytes: usize,
+) -> Result<Vec<SymbolChunk>, PackError> {
+    let conn = rusqlite::Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|e| PackError::InvalidField {
+        field: "codegraph_db_open".to_string(),
+        reason: e.to_string(),
+    })?;
+
+    // Exclude import/file nodes — they carry no meaningful source body.
+    let mut stmt = conn
+        .prepare(
+            "SELECT name, COALESCE(qualified_name,''), kind, file_path, \
+             COALESCE(start_line,0), COALESCE(end_line,0), COALESCE(signature,'') \
+             FROM nodes \
+             WHERE file_path IS NOT NULL AND file_path != '' \
+               AND COALESCE(start_line,0) > 0 \
+               AND COALESCE(end_line,0)   > 0 \
+               AND kind NOT IN ('import','file','import_export') \
+             ORDER BY file_path, start_line",
+        )
+        .map_err(|e| PackError::InvalidField {
+            field: "codegraph_db_prepare".to_string(),
+            reason: e.to_string(),
+        })?;
+
+    let rows: Vec<NodeRow> = stmt
+        .query_map([], |row| {
+            Ok(NodeRow {
+                name: row.get(0)?,
+                qualified_name: row.get(1)?,
+                kind: row.get(2)?,
+                file_path: row.get(3)?,
+                start_line: row.get::<_, i64>(4)? as u32,
+                end_line: row.get::<_, i64>(5)? as u32,
+                signature: row.get(6)?,
+            })
+        })
+        .map_err(|e| PackError::InvalidField {
+            field: "codegraph_db_query".to_string(),
+            reason: e.to_string(),
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    // Group nodes by file_path so each source file is read exactly once.
+    let mut by_file: HashMap<String, Vec<usize>> = HashMap::new();
+    for (i, row) in rows.iter().enumerate() {
+        by_file.entry(row.file_path.clone()).or_default().push(i);
+    }
+
+    let mut chunks: Vec<SymbolChunk> = Vec::with_capacity(rows.len());
+
+    'file: for (file_path, indices) in &by_file {
+        // Resolve the relative path against each source_dir in order.
+        let mut resolved: Option<(PathBuf, &PathBuf)> = None;
+        for sd in source_dirs {
+            // file_path uses forward slashes; Path::join handles them on all platforms.
+            let candidate = sd.join(Path::new(file_path));
+            if candidate.exists() {
+                resolved = Some((candidate, sd));
+                break;
+            }
+        }
+        let (full_path, base_dir) = match resolved {
+            Some(p) => p,
+            None => continue 'file,
+        };
+
+        if !exclude_dirs.is_empty() && is_excluded(&full_path, base_dir, exclude_dirs) {
+            continue 'file;
+        }
+
+        let text = match std::fs::read_to_string(&full_path) {
+            Ok(t) => t,
+            Err(_) => continue 'file,
+        };
+        let text_lines: Vec<&str> = text.lines().collect();
+        let n_lines = text_lines.len();
+
+        for &idx in indices {
+            let row = &rows[idx];
+
+            let s = row.start_line as usize;
+            let e = row.end_line as usize;
+            if s == 0 || s > n_lines {
+                continue;
+            }
+            let start_idx = s - 1;
+            let end_idx = (e - 1).min(n_lines.saturating_sub(1));
+
+            // Extend the content window to include adjacent comment blocks.
+            // start_line/end_line stored in the chunk remain the *symbol's*
+            // own boundaries so that read_symbol / read_code location lookups
+            // (which filter by path + start_line) are completely unaffected.
+            let ctx_start = collect_leading_comment_start(&text_lines, start_idx);
+            let ctx_end   = collect_trailing_comment_end(&text_lines, end_idx);
+            let body: String = text_lines[ctx_start..=ctx_end].join("\n");
+
+            // Signature comes from the first non-empty line of the symbol
+            // itself (not the comment prefix), so skip leading comment lines.
+            let sig = text_lines[start_idx..=end_idx]
+                .iter()
+                .find(|l| !l.trim().is_empty() && !is_comment_line(l.trim()))
+                .copied()
+                .unwrap_or("");
+
+            // Prefer qualified_name; it is more unique (e.g. "Vec::push" vs "push").
+            let sym_name = if !row.qualified_name.is_empty() {
+                row.qualified_name.clone()
+            } else {
+                row.name.clone()
+            };
+
+            let sig = sig.to_string();
+
+            if body.len() > max_chunk_bytes {
+                // Sub-chunk oversized bodies; every sub-chunk keeps the same
+                // start_line/end_line so the location filter still hits chunk #0.
+                for (sub_idx, sub) in split_body_into_windows(&body, max_chunk_bytes)
+                    .into_iter()
+                    .enumerate()
+                {
+                    chunks.push(SymbolChunk {
+                        path: file_path.clone(),
+                        symbol: format!("{}#{}", sym_name, sub_idx),
+                        kind: row.kind.clone(),
+                        signature: if sub_idx == 0 { sig.clone() } else { String::new() },
+                        content: sub,
+                        start_line: row.start_line,
+                        end_line: row.end_line,
+                    });
+                }
+            } else {
+                chunks.push(SymbolChunk {
+                    path: file_path.clone(),
+                    symbol: sym_name,
+                    kind: row.kind.clone(),
+                    signature: sig,
+                    content: body,
+                    start_line: row.start_line,
+                    end_line: row.end_line,
+                });
+            }
+        }
+    }
+
+    Ok(chunks)
+}
+
+// ---------------------------------------------------------------------------
+// Line-scanner fallback (used when no codegraph.db is available)
+// ---------------------------------------------------------------------------
+
+/// Extract top-level symbol chunks using a language-agnostic line-scanner.
+///
+/// Used as a fallback when no `codegraph.db` is available.
 fn extract_symbol_chunks(rel_path: &str, text: &str, max_chunk_bytes: usize) -> Vec<SymbolChunk> {
-    // Patterns that signal the start of a top-level symbol, matched against
-    // the leading token sequence on each line (after stripping visibility
-    // modifiers / decorators).
-    //
-    // Each entry: (keyword, kind string)
     const KW: &[(&str, &str)] = &[
-        // Rust
-        ("fn ", "function"),
-        ("async fn ", "function"),
-        ("const fn ", "function"),
-        ("unsafe fn ", "function"),
-        ("extern \"C\" fn ", "function"),
-        ("struct ", "struct"),
-        ("enum ", "enum"),
-        ("trait ", "trait"),
-        ("impl ", "impl"),
-        ("type ", "type"),
-        ("mod ", "module"),
-        // Python
-        ("def ", "function"),
-        ("async def ", "function"),
-        ("class ", "class"),
-        // JS / TS
-        ("function ", "function"),
-        ("function* ", "function"),
-        ("async function ", "function"),
-        ("class ", "class"),
-        ("interface ", "interface"),
-        ("type ", "type"),
-        ("enum ", "enum"),
-        // Go
-        ("func ", "function"),
-        ("type ", "type"),
-        // Java / C#
-        ("class ", "class"),
-        ("interface ", "interface"),
-        ("enum ", "enum"),
-        ("record ", "class"),
+        ("fn ", "function"), ("async fn ", "function"), ("const fn ", "function"),
+        ("unsafe fn ", "function"), ("extern \"C\" fn ", "function"),
+        ("struct ", "struct"), ("enum ", "enum"), ("trait ", "trait"),
+        ("impl ", "impl"), ("type ", "type"), ("mod ", "module"),
+        ("def ", "function"), ("async def ", "function"), ("class ", "class"),
+        ("function ", "function"), ("function* ", "function"),
+        ("async function ", "function"), ("interface ", "interface"),
+        ("func ", "function"), ("record ", "class"),
     ];
-
-    // Visibility / modifier prefixes to strip before matching keywords.
     const MODS: &[&str] = &[
-        "pub(crate) ",
-        "pub(super) ",
-        "pub(in ",
-        "pub ",
-        "private ",
-        "protected ",
-        "public ",
-        "static ",
-        "abstract ",
-        "final ",
-        "override ",
-        "export default ",
-        "export ",
-        "extern ",
-        "inline ",
-        "virtual ",
-        "async ",
+        "pub(crate) ", "pub(super) ", "pub(in ", "pub ", "private ", "protected ",
+        "public ", "static ", "abstract ", "final ", "override ", "export default ",
+        "export ", "extern ", "inline ", "virtual ", "async ",
     ];
 
-    /// Strip all leading modifier prefixes from a line to expose the keyword.
     fn strip_mods<'a>(line: &'a str, mods: &[&str]) -> &'a str {
         let mut s = line;
         loop {
-            let mut changed = false;
-            for m in mods {
-                if let Some(rest) = s.strip_prefix(m) {
-                    s = rest;
-                    changed = true;
-                }
-            }
-            if !changed {
-                break;
-            }
+            let before = s;
+            for m in mods { if let Some(r) = s.strip_prefix(m) { s = r; break; } }
+            if s == before { break; }
         }
         s
     }
 
-    /// Extract the symbol name: the first identifier token after the keyword.
     fn extract_name(stripped: &str, keyword: &str) -> String {
-        let after = stripped.strip_prefix(keyword).unwrap_or(stripped);
-        after
+        stripped.strip_prefix(keyword).unwrap_or(stripped)
             .split(|c: char| !c.is_alphanumeric() && c != '_')
-            .next()
-            .unwrap_or("")
-            .to_string()
-    }
-
-    struct Boundary {
-        kind: String,
-        name: String,
-        line_idx: usize, // 0-based index into `lines`
-        byte_offset: usize,
+            .next().unwrap_or("").to_string()
     }
 
     let lines: Vec<&str> = text.lines().collect();
+    struct Boundary { kind: String, name: String, line_idx: usize }
     let mut boundaries: Vec<Boundary> = Vec::new();
 
-    // Compute byte offset of each line.
-    let mut byte_offsets: Vec<usize> = Vec::with_capacity(lines.len());
-    let mut off = 0usize;
-    for line in &lines {
-        byte_offsets.push(off);
-        off += line.len() + 1; // +1 for \n
-    }
-
     for (i, line) in lines.iter().enumerate() {
-        // Only consider lines at column 0 (top-level declarations).
-        if line.starts_with(|c: char| c.is_whitespace()) {
-            continue;
-        }
-        // Skip blank lines and comment-only lines.
+        if line.starts_with(|c: char| c.is_whitespace()) { continue; }
         let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with("/") || trimmed.starts_with("#") || trimmed.starts_with("//") {
-            continue;
-        }
-
+        if trimmed.is_empty() || trimmed.starts_with('/') || trimmed.starts_with('#') { continue; }
         let stripped = strip_mods(line, MODS);
         for &(kw, kind_str) in KW {
             if stripped.starts_with(kw) {
                 let name = extract_name(stripped, kw);
                 if !name.is_empty() {
-                    boundaries.push(Boundary {
-                        kind: kind_str.to_string(),
-                        name,
-                        line_idx: i,
-                        byte_offset: byte_offsets[i],
-                    });
+                    boundaries.push(Boundary { kind: kind_str.to_string(), name, line_idx: i });
                     break;
                 }
             }
@@ -564,84 +737,64 @@ fn extract_symbol_chunks(rel_path: &str, text: &str, max_chunk_bytes: usize) -> 
     }
 
     if boundaries.is_empty() {
-        // No symbols detected — emit the whole file as one chunk.
-        if text.is_empty() {
-            return Vec::new();
-        }
-        let end_line = lines.len() as u32;
-        let end_byte = text.len() as u32;
-        let (sig, body) = split_signature(text);
+        if text.is_empty() { return Vec::new(); }
+        let content: String = text.chars().take(max_chunk_bytes).collect();
+        let sig = content.lines().find(|l| !l.trim().is_empty()).unwrap_or("").to_string();
         return vec![SymbolChunk {
-            path: rel_path.to_string(),
-            symbol: rel_path.to_string(),
-            kind: "file".to_string(),
-            signature: sig,
-            content: body.chars().take(max_chunk_bytes).collect(),
-            start_line: 1,
-            end_line,
-            start_byte: 0,
-            end_byte,
+            path: rel_path.to_string(), symbol: rel_path.to_string(),
+            kind: "file".to_string(), signature: sig, content,
+            start_line: 1, end_line: lines.len() as u32,
         }];
     }
 
     let mut chunks: Vec<SymbolChunk> = Vec::new();
     for (idx, b) in boundaries.iter().enumerate() {
-        let body_start_line = b.line_idx;
-        let body_end_line = if idx + 1 < boundaries.len() {
-            boundaries[idx + 1].line_idx.saturating_sub(1)
+        let start = b.line_idx;
+
+        // Content ends just before the NEXT symbol's leading comments begin,
+        // so each symbol owns its own comment block rather than stealing the
+        // next symbol's documentation.
+        let end = if idx + 1 < boundaries.len() {
+            let next_ctx = collect_leading_comment_start(&lines, boundaries[idx + 1].line_idx);
+            next_ctx.saturating_sub(1)
         } else {
             lines.len().saturating_sub(1)
         };
 
-        let start_byte = b.byte_offset as u32;
-        let end_byte = if body_end_line < lines.len() {
-            (byte_offsets[body_end_line] + lines[body_end_line].len() + 1).min(text.len()) as u32
-        } else {
-            text.len() as u32
-        };
+        // Walk upward from this symbol's first line to pick up any preceding
+        // comment block.  The stored start_line reflects the symbol keyword
+        // line, not the comment.
+        let content_start = collect_leading_comment_start(&lines, start);
+        let body: String = lines[content_start..=end.min(lines.len().saturating_sub(1))].join("\n");
 
-        let body: String = lines[body_start_line..=body_end_line.min(lines.len().saturating_sub(1))]
-            .join("\n");
+        // Signature = first non-empty, non-comment line of the symbol itself.
+        let sig = lines[start..=end.min(lines.len().saturating_sub(1))]
+            .iter()
+            .find(|l| !l.trim().is_empty() && !is_comment_line(l.trim()))
+            .copied()
+            .unwrap_or("");
+        let start_line = (start + 1) as u32;
+        let end_line = (end + 1) as u32;
 
-        // Split oversized bodies into sub-chunks.
         if body.len() > max_chunk_bytes {
-            let sub_chunks = split_body_into_windows(&body, max_chunk_bytes);
-            let (sig, _) = split_signature(&body);
-            for (sub_idx, sub) in sub_chunks.into_iter().enumerate() {
+            for (sub_idx, sub) in split_body_into_windows(&body, max_chunk_bytes).into_iter().enumerate() {
                 chunks.push(SymbolChunk {
                     path: rel_path.to_string(),
                     symbol: format!("{}#{}", b.name, sub_idx),
                     kind: b.kind.clone(),
-                    signature: if sub_idx == 0 { sig.clone() } else { String::new() },
-                    content: sub,
-                    start_line: (body_start_line + 1) as u32,
-                    end_line: (body_end_line + 1) as u32,
-                    start_byte,
-                    end_byte,
+                    signature: if sub_idx == 0 { sig.to_string() } else { String::new() },
+                    content: sub, start_line, end_line,
                 });
             }
         } else {
-            let (sig, _) = split_signature(&body);
             chunks.push(SymbolChunk {
-                path: rel_path.to_string(),
-                symbol: b.name.clone(),
-                kind: b.kind.clone(),
-                signature: sig,
-                content: body,
-                start_line: (body_start_line + 1) as u32,
-                end_line: (body_end_line + 1) as u32,
-                start_byte,
-                end_byte,
+                path: rel_path.to_string(), symbol: b.name.clone(),
+                kind: b.kind.clone(), signature: sig.to_string(), content: body,
+                start_line, end_line,
             });
         }
     }
     chunks
-}
-
-/// Returns `(signature_line, full_body)`. The signature is the first non-blank line.
-fn split_signature(body: &str) -> (String, String) {
-    let sig = body.lines().find(|l| !l.trim().is_empty()).unwrap_or("").to_string();
-    (sig, body.to_string())
 }
 
 /// Split a long body string into windows of at most `max_bytes` characters.
@@ -651,29 +804,37 @@ fn split_body_into_windows(body: &str, max_bytes: usize) -> Vec<String> {
     let bytes = body.as_bytes();
     while start < bytes.len() {
         let end = (start + max_bytes).min(bytes.len());
-        // Snap to a char boundary.
         let mut boundary = end;
-        while boundary > start && !body.is_char_boundary(boundary) {
-            boundary -= 1;
-        }
+        while boundary > start && !body.is_char_boundary(boundary) { boundary -= 1; }
         out.push(body[start..boundary].to_string());
         start = boundary;
     }
     out
 }
 
+// ---------------------------------------------------------------------------
+// LanceDB writer
+// ---------------------------------------------------------------------------
+
 /// Build a LanceDB source-code index from `source_dirs` and write it to `out_dir`.
+///
+/// When `codegraph_db` is `Some`, symbols are read from the codegraph SQLite
+/// database so each row's `start_line`/`end_line` aligns exactly with the
+/// coordinates used by `read_symbol` and `read_code` in sempkg.
+///
+/// Falls back to a language-agnostic line-scanner when the DB is absent.
 fn run_source_index(
     source_dirs: &[PathBuf],
     out_dir: &Path,
     glob_pattern: &str,
     exclude_dirs: &[PathBuf],
+    codegraph_db: Option<&Path>,
 ) -> Result<(), PackError> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(PackError::Io)?;
-    rt.block_on(run_source_inner(source_dirs, out_dir, glob_pattern, exclude_dirs))
+    rt.block_on(run_source_inner(source_dirs, out_dir, glob_pattern, exclude_dirs, codegraph_db))
 }
 
 async fn run_source_inner(
@@ -681,170 +842,138 @@ async fn run_source_inner(
     out_dir: &Path,
     glob_pattern: &str,
     exclude_dirs: &[PathBuf],
+    codegraph_db: Option<&Path>,
 ) -> Result<(), PackError> {
     const MAX_CHUNK_BYTES: usize = 8 * 1024; // 8 KiB per symbol chunk
+    const BATCH_SIZE: usize = 500;            // rows per LanceDB write batch
 
     std::fs::create_dir_all(out_dir)?;
 
-    let mut row_paths: Vec<String> = Vec::new();
-    let mut row_symbols: Vec<String> = Vec::new();
-    let mut row_kinds: Vec<String> = Vec::new();
-    let mut row_signatures: Vec<String> = Vec::new();
-    let mut row_contents: Vec<String> = Vec::new();
-    let mut row_start_lines: Vec<u32> = Vec::new();
-    let mut row_end_lines: Vec<u32> = Vec::new();
-    let mut row_start_bytes: Vec<u32> = Vec::new();
-    let mut row_end_bytes: Vec<u32> = Vec::new();
-    let mut symbol_count: u64 = 0;
-
-    let patterns: Vec<&str> = glob_pattern.split(',').map(str::trim).collect();
-
-    for source_dir in source_dirs {
-        for entry in WalkDir::new(source_dir)
-            .min_depth(1)
-            .into_iter()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_type().is_file())
-        {
-            let path = entry.path();
-            if !exclude_dirs.is_empty() && is_excluded(path, source_dir, exclude_dirs) {
-                continue;
-            }
-            let rel = path.strip_prefix(source_dir).unwrap_or(path);
-            let rel_str = rel
-                .components()
-                .map(|c| c.as_os_str().to_string_lossy().into_owned())
-                .collect::<Vec<_>>()
-                .join("/");
-
-            let matches = patterns.iter().any(|pat| {
-                glob::Pattern::new(pat)
-                    .map(|p| p.matches(&rel_str))
-                    .unwrap_or(false)
-            });
-            if !matches {
-                continue;
-            }
-
-            let text = match std::fs::read_to_string(path) {
-                Ok(t) => t,
-                Err(_) => continue,
-            };
-
-            let file_chunks = extract_symbol_chunks(&rel_str, &text, MAX_CHUNK_BYTES);
-            if !file_chunks.is_empty() {
-                symbol_count += file_chunks.iter().filter(|c| !c.symbol.contains('#')).count() as u64;
-                for c in file_chunks {
-                    row_paths.push(c.path);
-                    row_symbols.push(c.symbol);
-                    row_kinds.push(c.kind);
-                    row_signatures.push(c.signature);
-                    row_contents.push(c.content);
-                    row_start_lines.push(c.start_line);
-                    row_end_lines.push(c.end_line);
-                    row_start_bytes.push(c.start_byte);
-                    row_end_bytes.push(c.end_byte);
+    // -----------------------------------------------------------------------
+    // Extract chunks — codegraph DB path or line-scanner fallback
+    // -----------------------------------------------------------------------
+    let (chunks, used_db) = if let Some(db) = codegraph_db.filter(|p| p.exists()) {
+        eprintln!("[sembundle]   code: reading symbols from codegraph.db ...");
+        let c = extract_chunks_from_codegraph_db(db, source_dirs, exclude_dirs, MAX_CHUNK_BYTES)?;
+        (c, true)
+    } else {
+        eprintln!("[sembundle]   code: codegraph.db not found — falling back to line-scanner ...");
+        let mut acc: Vec<SymbolChunk> = Vec::new();
+        let patterns: Vec<&str> = glob_pattern.split(',').map(str::trim).collect();
+        for source_dir in source_dirs {
+            for entry in WalkDir::new(source_dir).min_depth(1).into_iter()
+                .filter_map(|e| e.ok()).filter(|e| e.file_type().is_file())
+            {
+                let path = entry.path();
+                if !exclude_dirs.is_empty() && is_excluded(path, source_dir, exclude_dirs) { continue; }
+                let rel = path.strip_prefix(source_dir).unwrap_or(path);
+                let rel_str = rel.components()
+                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                    .collect::<Vec<_>>().join("/");
+                if !patterns.iter().any(|pat| glob::Pattern::new(pat).map(|p| p.matches(&rel_str)).unwrap_or(false)) {
+                    continue;
                 }
+                let text = match std::fs::read_to_string(path) { Ok(t) => t, Err(_) => continue };
+                acc.extend(extract_symbol_chunks(&rel_str, &text, MAX_CHUNK_BYTES));
             }
         }
-    }
+        (acc, false)
+    };
 
-    let chunk_count = row_paths.len() as u64;
-
+    let chunk_count = chunks.len() as u64;
     if chunk_count == 0 {
         return Err(PackError::InvalidField {
             field: "source_dirs".to_string(),
-            reason: "no source files matched the glob pattern — check --source-dir and --source-glob"
-                .to_string(),
+            reason: "no source files/symbols found — check --source-dir and --source-glob".to_string(),
         });
     }
 
-    let schema = std::sync::Arc::new(Schema::new(vec![
-        Field::new("path", DataType::Utf8, false),
-        Field::new("symbol", DataType::Utf8, false),
-        Field::new("kind", DataType::Utf8, false),
-        Field::new("signature", DataType::Utf8, false),
-        Field::new("content", DataType::Utf8, false),
+    // Count primary symbols (not sub-chunks).
+    let symbol_count: u64 = chunks.iter().filter(|c| !c.symbol.contains('#')).count() as u64;
+
+    // -----------------------------------------------------------------------
+    // Schema — drop start_byte/end_byte (reader treats them as optional/0)
+    // -----------------------------------------------------------------------
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("path",       DataType::Utf8,   false),
+        Field::new("symbol",     DataType::Utf8,   false),
+        Field::new("kind",       DataType::Utf8,   false),
+        Field::new("signature",  DataType::Utf8,   false),
+        Field::new("content",    DataType::Utf8,   false),
         Field::new("start_line", DataType::UInt32, false),
-        Field::new("end_line", DataType::UInt32, false),
-        Field::new("start_byte", DataType::UInt32, false),
-        Field::new("end_byte", DataType::UInt32, false),
+        Field::new("end_line",   DataType::UInt32, false),
     ]));
 
-    let batch = RecordBatch::try_new(
-        schema.clone(),
-        vec![
-            std::sync::Arc::new(StringArray::from(row_paths)),
-            std::sync::Arc::new(StringArray::from(row_symbols)),
-            std::sync::Arc::new(StringArray::from(row_kinds)),
-            std::sync::Arc::new(StringArray::from(row_signatures)),
-            std::sync::Arc::new(StringArray::from(row_contents)),
-            std::sync::Arc::new(UInt32Array::from(row_start_lines)),
-            std::sync::Arc::new(UInt32Array::from(row_end_lines)),
-            std::sync::Arc::new(UInt32Array::from(row_start_bytes)),
-            std::sync::Arc::new(UInt32Array::from(row_end_bytes)),
-        ],
-    )
-    .map_err(|e| PackError::InvalidField {
-        field: "code_batch".to_string(),
-        reason: e.to_string(),
-    })?;
-
-    let batches = vec![batch];
-
+    // -----------------------------------------------------------------------
+    // Write to LanceDB in BATCH_SIZE batches to avoid a single giant allocation
+    // -----------------------------------------------------------------------
     let db = lancedb::connect(out_dir.to_str().unwrap_or("."))
         .execute()
         .await
-        .map_err(|e| PackError::InvalidField {
-            field: "lancedb_connect".to_string(),
-            reason: e.to_string(),
-        })?;
+        .map_err(|e| PackError::InvalidField { field: "lancedb_connect".to_string(), reason: e.to_string() })?;
 
+    let make_batch = |slice: &[SymbolChunk]| -> Result<RecordBatch, PackError> {
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(slice.iter().map(|c| c.path.as_str()).collect::<Vec<_>>())),
+                Arc::new(StringArray::from(slice.iter().map(|c| c.symbol.as_str()).collect::<Vec<_>>())),
+                Arc::new(StringArray::from(slice.iter().map(|c| c.kind.as_str()).collect::<Vec<_>>())),
+                Arc::new(StringArray::from(slice.iter().map(|c| c.signature.as_str()).collect::<Vec<_>>())),
+                Arc::new(StringArray::from(slice.iter().map(|c| c.content.as_str()).collect::<Vec<_>>())),
+                Arc::new(UInt32Array::from(slice.iter().map(|c| c.start_line).collect::<Vec<_>>())),
+                Arc::new(UInt32Array::from(slice.iter().map(|c| c.end_line).collect::<Vec<_>>())),
+            ],
+        )
+        .map_err(|e| PackError::InvalidField { field: "code_batch".to_string(), reason: e.to_string() })
+    };
+
+    let mut batches = chunks.chunks(BATCH_SIZE);
+
+    // First batch creates the table.
+    let first = batches.next().expect("chunk_count > 0 guarantees at least one batch");
     let tbl = db
-        .create_table("code", batches)
+        .create_table("code", vec![make_batch(first)?])
         .execute()
         .await
-        .map_err(|e| PackError::InvalidField {
-            field: "lancedb_create_table".to_string(),
-            reason: e.to_string(),
-        })?;
+        .map_err(|e| PackError::InvalidField { field: "lancedb_create_table".to_string(), reason: e.to_string() })?;
 
+    // Subsequent batches are appended.
+    for batch_slice in batches {
+        tbl.add(vec![make_batch(batch_slice)?])
+            .execute()
+            .await
+            .map_err(|e| PackError::InvalidField { field: "lancedb_add".to_string(), reason: e.to_string() })?;
+    }
+
+    // FTS index on the content column.
     let fts_ok = tbl
         .create_index(
             &["content"],
-            lancedb::index::Index::FTS(
-                lancedb::index::scalar::FtsIndexBuilder::default(),
-            ),
+            lancedb::index::Index::FTS(lancedb::index::scalar::FtsIndexBuilder::default()),
         )
         .execute()
         .await
         .is_ok();
 
     if !fts_ok {
-        eprintln!(
-            "[sembundle] Warning: code FTS index creation failed — search will use full scan."
-        );
+        eprintln!("[sembundle] Warning: code FTS index creation failed — search will use full scan.");
     }
 
     let metadata = CodeMetadata {
         table_name: "code".to_string(),
         symbol_count,
         chunk_count,
-        indexed_paths: source_dirs
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect(),
+        indexed_paths: source_dirs.iter().map(|p| p.to_string_lossy().into_owned()).collect(),
         fts_enabled: fts_ok,
         created_at: String::new(), // stamped by pack()
     };
-    std::fs::write(
-        out_dir.join("metadata.json"),
-        serde_json::to_vec_pretty(&metadata)?,
-    )?;
+    std::fs::write(out_dir.join("metadata.json"), serde_json::to_vec_pretty(&metadata)?)?;
 
     eprintln!(
-        "[sembundle]   code: indexed {symbol_count} symbols, {chunk_count} chunks{}.",
-        if fts_ok { " (FTS enabled)" } else { "" }
+        "[sembundle]   code: indexed {symbol_count} symbols, {chunk_count} chunks{} (source: {}).",
+        if fts_ok { " (FTS enabled)" } else { "" },
+        if used_db { "codegraph.db" } else { "line-scanner" },
     );
 
     Ok(())
@@ -1029,3 +1158,5 @@ mod tests {
         }
     }
 }
+
+// ---------------------------------------------------------------------------

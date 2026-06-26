@@ -293,9 +293,12 @@ pub enum Commands {
     Files {
         /// Package or bundle name.
         package: String,
-        /// Optional path/glob filter.
+        /// Optional glob pattern (e.g. **/*.rs) or substring (e.g. auth).
         #[arg(long, short = 'f')]
         filter: Option<String>,
+        /// Max files to return (default 200).
+        #[arg(long, default_value_t = 200)]
+        limit: usize,
     },
 
     // -----------------------------------------------------------------------

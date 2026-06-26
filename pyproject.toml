@@ -4,7 +4,8 @@ build-backend = "uv_build"
 
 [project]
 name = "sempkg-registry"
-version = "0.4.0"
+version = "0.5.0"
+
 
 description = "Self-hosted sembundle registry server for semantic index packages"
 license = "MIT"
@@ -32,7 +33,10 @@ testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
-addopts = "-v --cov=src/sempkg_registry --cov-report=term-missing"
+addopts = "-v"
+markers = [
+    "functional: end-to-end tests requiring the sempkg binary and installed bundles (skipped when binary absent)",
+]
 
 [tool.uv]
 # Prefer uv for dependency management and environment sync in this project.
