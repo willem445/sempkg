@@ -1191,11 +1191,88 @@ fn byte_to_line(text: &str, byte_offset: usize) -> u32 {
     text[..boundary].bytes().filter(|&b| b == b'\n').count() as u32 + 1
 }
 
+/// Push the exact source slice `text[start..end]` as a chunk.
+///
+/// Storing the verbatim slice (rather than a re-joined copy) is what makes line
+/// resolution exact downstream: splitting the stored text on `'\n'` maps line
+/// `i` back to source line `start_line + i`. A trailing newline is trimmed so
+/// the slice ends on real content and `end_line` is the line of the last byte.
+fn push_chunk(text: &str, start: usize, mut end: usize, chunks: &mut Vec<DocChunk>) {
+    let bytes = text.as_bytes();
+    while end > start && (bytes[end - 1] == b'\n' || bytes[end - 1] == b'\r') {
+        end -= 1;
+    }
+    if end <= start {
+        return;
+    }
+    chunks.push(DocChunk {
+        text: text[start..end].to_string(),
+        start_line: byte_to_line(text, start),
+        end_line: byte_to_line(text, end - 1),
+        start_byte: start as u32,
+        end_byte: end as u32,
+    });
+}
+
+/// Split the oversized paragraph at `[start, end)` into chunks that never begin
+/// or end mid-line. Whole lines are accumulated until the next line would
+/// overflow `max_chars`; a single line longer than `max_chars` is hard-split on
+/// char boundaries as a last resort.
+fn push_oversized_on_lines(
+    text: &str,
+    start: usize,
+    end: usize,
+    max_chars: usize,
+    chunks: &mut Vec<DocChunk>,
+) {
+    // Absolute byte offsets where each line begins within [start, end).
+    let bytes = text.as_bytes();
+    let mut line_starts = vec![start];
+    for (offset, &b) in bytes[start..end].iter().enumerate() {
+        if b == b'\n' && start + offset + 1 < end {
+            line_starts.push(start + offset + 1);
+        }
+    }
+    line_starts.push(end); // sentinel: one past the last line
+
+    let mut win_start = start;
+    for w in 1..line_starts.len() {
+        let line_lo = line_starts[w - 1];
+        let line_hi = line_starts[w];
+        // Adding this line would overflow a non-empty window: flush whole lines
+        // accumulated so far first.
+        if line_hi - win_start > max_chars && line_lo > win_start {
+            push_chunk(text, win_start, line_lo, chunks);
+            win_start = line_lo;
+        }
+        // A single line longer than the budget: hard-split it on char
+        // boundaries (the one unavoidable mid-line case).
+        if line_hi - line_lo > max_chars {
+            let mut off = line_lo;
+            while off < line_hi {
+                let mut stop = (off + max_chars).min(line_hi);
+                while stop > off && !text.is_char_boundary(stop) {
+                    stop -= 1;
+                }
+                if stop == off {
+                    stop = line_hi;
+                }
+                push_chunk(text, off, stop, chunks);
+                off = stop;
+            }
+            win_start = line_hi;
+        }
+    }
+    if end > win_start {
+        push_chunk(text, win_start, end, chunks);
+    }
+}
+
 fn chunk_text(text: &str, max_chars: usize) -> Vec<DocChunk> {
-    // Collect paragraphs (split on \n\n) with their byte offsets in `text`.
-    // `str::split` returns subslices of the original, so pointer arithmetic
-    // correctly gives us the byte offset of each paragraph.
-    let mut paras: Vec<(usize, usize, &str)> = Vec::new();
+    // Collect paragraphs (split on \n\n) as byte ranges in `text`. `str::split`
+    // returns subslices of the original, so pointer arithmetic gives us each
+    // paragraph's byte offset.
+    let mut paras: Vec<(usize, usize)> = Vec::new();
     for raw in text.split("\n\n") {
         let trimmed = raw.trim();
         if trimmed.is_empty() {
@@ -1203,82 +1280,50 @@ fn chunk_text(text: &str, max_chars: usize) -> Vec<DocChunk> {
         }
         let raw_start = raw.as_ptr() as usize - text.as_ptr() as usize;
         let trim_lead = raw.len() - raw.trim_start().len();
-        let start_byte = raw_start + trim_lead;
-        let end_byte = start_byte + trimmed.len();
-        paras.push((start_byte, end_byte, trimmed));
+        let start = raw_start + trim_lead;
+        paras.push((start, start + trimmed.len()));
     }
 
     let mut chunks: Vec<DocChunk> = Vec::new();
-    let mut cur_text = String::new();
-    let mut cur_start = 0usize;
+    // Accumulate consecutive paragraphs as a single source span so the stored
+    // chunk is the exact substring `text[cur_start..cur_end]`.
+    let mut cur_start: Option<usize> = None;
     let mut cur_end = 0usize;
 
-    for &(start_byte, end_byte, para) in &paras {
-        let fits = if cur_text.is_empty() {
-            para.len() <= max_chars
-        } else {
-            cur_text.len() + 2 + para.len() <= max_chars
+    for &(p_start, p_end) in &paras {
+        // Measure the prospective chunk on its original byte span — that is the
+        // slice we will actually store.
+        let fits = match cur_start {
+            None => p_end - p_start <= max_chars,
+            Some(s) => p_end - s <= max_chars,
         };
 
         if fits {
-            if cur_text.is_empty() {
-                cur_start = start_byte;
-            } else {
-                cur_text.push_str("\n\n");
-            }
-            cur_text.push_str(para);
-            cur_end = end_byte;
+            cur_start.get_or_insert(p_start);
+            cur_end = p_end;
+            continue;
+        }
+
+        // Flush what we have, then restart with this paragraph.
+        if let Some(s) = cur_start.take() {
+            push_chunk(text, s, cur_end, &mut chunks);
+        }
+        if p_end - p_start <= max_chars {
+            cur_start = Some(p_start);
+            cur_end = p_end;
         } else {
-            // Flush accumulated chunk.
-            if !cur_text.is_empty() {
-                chunks.push(DocChunk {
-                    start_line: byte_to_line(text, cur_start),
-                    end_line: byte_to_line(text, cur_end.saturating_sub(1)),
-                    start_byte: cur_start as u32,
-                    end_byte: cur_end as u32,
-                    text: std::mem::take(&mut cur_text),
-                });
-            }
-            if para.len() <= max_chars {
-                cur_text.push_str(para);
-                cur_start = start_byte;
-                cur_end = end_byte;
-            } else {
-                // Oversized paragraph: split into byte windows.
-                let mut off = 0usize;
-                for window in para.as_bytes().chunks(max_chars) {
-                    let w_start = start_byte + off;
-                    let w_end = w_start + window.len();
-                    chunks.push(DocChunk {
-                        text: String::from_utf8_lossy(window).into_owned(),
-                        start_line: byte_to_line(text, w_start),
-                        end_line: byte_to_line(text, w_end.saturating_sub(1)),
-                        start_byte: w_start as u32,
-                        end_byte: w_end as u32,
-                    });
-                    off += window.len();
-                }
-            }
+            push_oversized_on_lines(text, p_start, p_end, max_chars, &mut chunks);
+            cur_start = None;
         }
     }
-    if !cur_text.is_empty() {
-        chunks.push(DocChunk {
-            start_line: byte_to_line(text, cur_start),
-            end_line: byte_to_line(text, cur_end.saturating_sub(1)),
-            start_byte: cur_start as u32,
-            end_byte: cur_end as u32,
-            text: cur_text,
-        });
+    if let Some(s) = cur_start {
+        push_chunk(text, s, cur_end, &mut chunks);
     }
+
     if chunks.is_empty() && !text.is_empty() {
-        let end = text.len().min(max_chars);
-        chunks.push(DocChunk {
-            text: text.chars().take(max_chars).collect(),
-            start_line: 1,
-            end_line: byte_to_line(text, end),
-            start_byte: 0,
-            end_byte: end as u32,
-        });
+        // No paragraph breaks at all: fall back to line-aware windowing over the
+        // whole text so we still avoid mid-line cuts where possible.
+        push_oversized_on_lines(text, 0, text.len(), max_chars, &mut chunks);
     }
     chunks
 }
