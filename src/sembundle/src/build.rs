@@ -177,6 +177,25 @@ fn is_excluded(path: &Path, base_dir: &Path, exclude_dirs: &[PathBuf]) -> bool {
     })
 }
 
+/// Returns `true` when `dot_cg` is an actual initialized CodeGraph index.
+///
+/// CodeGraph keys initialization off its database file, not the `.codegraph/`
+/// directory. A directory that exists but contains only a tracked `.gitignore`
+/// (no database) is not initialized, so this checks for a `*.db` database file.
+fn codegraph_initialized(dot_cg: &Path) -> bool {
+    if dot_cg.join("codegraph.db").is_file() {
+        return true;
+    }
+    std::fs::read_dir(dot_cg)
+        .map(|entries| {
+            entries.flatten().any(|entry| {
+                let path = entry.path();
+                path.is_file() && path.extension().map(|ext| ext == "db").unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
+}
+
 fn run_codegraph(source_dirs: &[PathBuf], out_dir: &Path, exclude_dirs: &[PathBuf]) -> Result<(), PackError> {
     let exe = find_tool("codegraph")?;
     let graph_dir = out_dir.join("graph");
@@ -193,13 +212,20 @@ fn run_codegraph(source_dirs: &[PathBuf], out_dir: &Path, exclude_dirs: &[PathBu
             source_dir.display()
         );
         // `codegraph init --index` only indexes during first-time initialization.
-        // If a `.codegraph/` directory already exists, `init` bails out with
-        // "Already initialized" and performs no indexing, leaving the bundle with
-        // a stale (or empty) graph. Detect that case and run a forced full
-        // re-index instead, so every build produces a fresh, complete index.
+        // If the project is already initialized, `init` bails out with "Already
+        // initialized" and performs no indexing, leaving the bundle with a stale
+        // (or empty) graph. Detect that case and run a forced full re-index
+        // instead, so every build produces a fresh, complete index.
+        //
+        // Initialization is keyed off CodeGraph's database file, not the
+        // `.codegraph/` directory itself: a directory containing only a tracked
+        // `.gitignore` (no database) is *not* an initialized index, and running
+        // `index --force` against it fails with "CodeGraph not initialized".
+        // Only treat the project as initialized when an actual `*.db` database
+        // is present; otherwise run `init --index` to create a fresh index.
         let src_str = source_dir.to_string_lossy();
         let dot_cg = source_dir.join(".codegraph");
-        let args: Vec<&str> = if dot_cg.exists() {
+        let args: Vec<&str> = if codegraph_initialized(&dot_cg) {
             vec!["index", "--force", src_str.as_ref()]
         } else {
             vec!["init", "--index", src_str.as_ref()]
