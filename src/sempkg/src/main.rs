@@ -2079,17 +2079,26 @@ fn add_from_local(
         source_dirs: if source_dirs_override.is_empty() {
             vec![canonical.clone()]
         } else {
-            source_dirs_override.clone()
+            source_dirs_override
+                .iter()
+                .map(|d| if d.is_absolute() { d.clone() } else { canonical.join(d) })
+                .collect()
         },
         docs_dirs: if docs_dirs_override.is_empty() {
             vec![canonical.clone()]
         } else {
-            docs_dirs_override.clone()
+            docs_dirs_override
+                .iter()
+                .map(|d| if d.is_absolute() { d.clone() } else { canonical.join(d) })
+                .collect()
         },
         docs_glob: None,
         include_source,
         source_glob: source_glob.clone(),
-        exclude_dirs: exclude_dirs.clone(),
+        exclude_dirs: exclude_dirs
+            .iter()
+            .map(|d| if d.is_absolute() { d.clone() } else { canonical.join(d) })
+            .collect(),
     };
 
     sembundle::build(build_opts).with_context(|| {
