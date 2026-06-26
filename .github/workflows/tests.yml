@@ -200,10 +200,24 @@ jobs:
           workspaces: . -> target
           key: functional-rust-ubuntu
 
+      - name: Resolve LIBCLANG_PATH
+        shell: bash
+        run: |
+          if command -v llvm-config >/dev/null 2>&1; then
+            echo "LIBCLANG_PATH=$(llvm-config --libdir)" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          for p in /usr/lib/llvm-*/lib; do
+            if [ -e "$p/libclang.so" ] || ls "$p"/libclang-*.so 2>/dev/null | grep -q .; then
+              echo "LIBCLANG_PATH=$p" >> "$GITHUB_ENV"
+              exit 0
+            fi
+          done
+          echo "libclang not found" >&2
+          exit 1
+
       - name: Build sempkg release binary
         run: cargo build --release --manifest-path src/sempkg/Cargo.toml --features reranker
-        env:
-          LIBCLANG_PATH: /usr/lib/llvm-14/lib
 
       # ---- Install the test bundle ----
 
