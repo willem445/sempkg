@@ -36,7 +36,7 @@ flate2       = "1"
 ed25519-dalek = { version = "2", features = ["pkcs8", "pem"] }
 lancedb      = "0.30"
 arrow-array  = "58"
-arrow-schema = "58"
+arrow-schema = "59"
 futures      = "0.3"
 glob         = "0.3"
 anyhow       = "1"
