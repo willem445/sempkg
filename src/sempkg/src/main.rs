@@ -16,7 +16,6 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use clap::Parser;
 
-
 use crate::cli::{Cli, Commands, PkgCommands, RerankerCommands};
 use crate::manifest::{DependencyEntry, RegistryEntry};
 use crate::packages::PackageRegistry;
@@ -145,9 +144,10 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
         } => {
             let dir = require_workspace(workspace)?;
 
-            let source_input = spec
-                .as_deref()
-                .or_else(|| url.as_deref().filter(|candidate| github::parse_source(candidate).is_some()));
+            let source_input = spec.as_deref().or_else(|| {
+                url.as_deref()
+                    .filter(|candidate| github::parse_source(candidate).is_some())
+            });
 
             if let Some(source_input) = source_input {
                 // Check if this is a local folder path first.
@@ -288,7 +288,11 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
         // -----------------------------------------------------------------------
         // Remove dependency from manifest and/or uninstall from store
         // -----------------------------------------------------------------------
-        Commands::Remove { name, group, global } => {
+        Commands::Remove {
+            name,
+            group,
+            global,
+        } => {
             if global {
                 if group.is_some() {
                     anyhow::bail!("--group cannot be used with --global");
@@ -440,8 +444,15 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
                 if let Some(local_path_str) = &dep.local {
                     // The stored path may be relative to the workspace dir.
                     let raw = PathBuf::from(local_path_str);
-                    let local_path = if raw.is_absolute() { raw } else { dir.join(raw) };
-                    println!("  Syncing {dep_name} from local path {} ...", local_path.display());
+                    let local_path = if raw.is_absolute() {
+                        raw
+                    } else {
+                        dir.join(raw)
+                    };
+                    println!(
+                        "  Syncing {dep_name} from local path {} ...",
+                        local_path.display()
+                    );
                     add_from_local(
                         local_path,
                         dir,
@@ -767,7 +778,11 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
             Ok(())
         }
 
-        Commands::Files { package, filter, limit } => {
+        Commands::Files {
+            package,
+            filter,
+            limit,
+        } => {
             let path = resolve_codegraph_path(&package, workspace)?;
             println!("{}", codegraph::files(&path, filter.as_deref(), limit)?);
             Ok(())
@@ -1432,23 +1447,44 @@ fn add_from_github(
         source_dirs: if source_dirs_override.is_empty() {
             vec![source_root.clone()]
         } else {
-            source_dirs_override.iter().map(|d| {
-                if d.is_absolute() { d.clone() } else { source_root.join(d) }
-            }).collect()
+            source_dirs_override
+                .iter()
+                .map(|d| {
+                    if d.is_absolute() {
+                        d.clone()
+                    } else {
+                        source_root.join(d)
+                    }
+                })
+                .collect()
         },
         docs_dirs: if docs_dirs_override.is_empty() {
             vec![source_root.clone()]
         } else {
-            docs_dirs_override.iter().map(|d| {
-                if d.is_absolute() { d.clone() } else { source_root.join(d) }
-            }).collect()
+            docs_dirs_override
+                .iter()
+                .map(|d| {
+                    if d.is_absolute() {
+                        d.clone()
+                    } else {
+                        source_root.join(d)
+                    }
+                })
+                .collect()
         },
         docs_glob: None,
         include_source,
         source_glob: source_glob.clone(),
-        exclude_dirs: exclude_dirs.iter().map(|d| {
-            if d.is_absolute() { d.clone() } else { source_root.join(d) }
-        }).collect(),
+        exclude_dirs: exclude_dirs
+            .iter()
+            .map(|d| {
+                if d.is_absolute() {
+                    d.clone()
+                } else {
+                    source_root.join(d)
+                }
+            })
+            .collect(),
     };
 
     sembundle::build(build_opts).with_context(|| {
@@ -1506,7 +1542,10 @@ fn install_github_bundle(
     let existing_dir = store.bundle_dir(&resolved.package_name, &resolved.version);
     if existing_dir.exists() {
         std::fs::remove_dir_all(&existing_dir).with_context(|| {
-            format!("Failed to remove existing bundle at {}", existing_dir.display())
+            format!(
+                "Failed to remove existing bundle at {}",
+                existing_dir.display()
+            )
         })?;
     }
 
@@ -1797,11 +1836,12 @@ fn parse_local_source(spec: &str) -> Option<PathBuf> {
     }
 
     // Expand `~` to the user home directory.
-    let expanded: PathBuf = if let Some(rest) = s.strip_prefix("~/").or_else(|| s.strip_prefix("~\\")) {
-        dirs::home_dir()?.join(rest)
-    } else {
-        PathBuf::from(s)
-    };
+    let expanded: PathBuf =
+        if let Some(rest) = s.strip_prefix("~/").or_else(|| s.strip_prefix("~\\")) {
+            dirs::home_dir()?.join(rest)
+        } else {
+            PathBuf::from(s)
+        };
 
     Some(expanded)
 }
@@ -1814,11 +1854,12 @@ fn run_refresh(workspace: Option<&Path>) -> Result<()> {
     let manifest = manifest::load_manifest(dir)?;
 
     let (dep_name, dep, group_name) = find_local_dependency_for_workspace(&manifest, &canonical)?;
-    let local_path = PathBuf::from(
-        dep.local
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("Local dependency '{}' is missing its source path.", dep_name))?,
-    );
+    let local_path = PathBuf::from(dep.local.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "Local dependency '{}' is missing its source path.",
+            dep_name
+        )
+    })?);
 
     println!(
         "Refreshing {} from local path {} ...",
@@ -1943,16 +1984,10 @@ fn add_from_local(
 ) -> Result<()> {
     // --- 1. Validate path ---------------------------------------------------
     if !local_path.exists() {
-        anyhow::bail!(
-            "Local path '{}' does not exist.",
-            local_path.display()
-        );
+        anyhow::bail!("Local path '{}' does not exist.", local_path.display());
     }
     if !local_path.is_dir() {
-        anyhow::bail!(
-            "Local path '{}' is not a directory.",
-            local_path.display()
-        );
+        anyhow::bail!("Local path '{}' is not a directory.", local_path.display());
     }
     let canonical = local_path
         .canonicalize()
@@ -1968,7 +2003,13 @@ fn add_from_local(
             // Replace characters that are invalid in bundle names with `-`.
             .map(|n| {
                 n.chars()
-                    .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '-' })
+                    .map(|c| {
+                        if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                            c
+                        } else {
+                            '-'
+                        }
+                    })
                     .collect()
             })
             .unwrap_or_else(|| "local-package".to_string())
@@ -2055,7 +2096,9 @@ fn add_from_local(
         format!(
             "Failed to build bundle for {}@{} from '{}'.\n\
              Ensure `codegraph` is on your PATH.",
-            package_name, version, canonical.display()
+            package_name,
+            version,
+            canonical.display()
         )
     })?;
 
@@ -2067,7 +2110,10 @@ fn add_from_local(
     let existing_dir = store.bundle_dir(&package_name, &version);
     if existing_dir.exists() {
         std::fs::remove_dir_all(&existing_dir).with_context(|| {
-            format!("Failed to remove existing bundle at {}", existing_dir.display())
+            format!(
+                "Failed to remove existing bundle at {}",
+                existing_dir.display()
+            )
         })?;
     }
 
@@ -2106,7 +2152,14 @@ fn add_from_local(
 /// directory is not a git repository.
 fn local_git_version(path: &Path) -> Option<String> {
     let describe = std::process::Command::new("git")
-        .args(["-C", &path.to_string_lossy(), "describe", "--tags", "--always", "--abbrev=12"])
+        .args([
+            "-C",
+            &path.to_string_lossy(),
+            "describe",
+            "--tags",
+            "--always",
+            "--abbrev=12",
+        ])
         .output()
         .ok()?;
 
@@ -2215,7 +2268,10 @@ fn record_local_dep(
     )?;
 
     if let Some(g) = group {
-        println!("Recorded {}@{} in group '{}' in sempkg.toml.", package_name, version, g);
+        println!(
+            "Recorded {}@{} in group '{}' in sempkg.toml.",
+            package_name, version, g
+        );
     } else {
         println!("Recorded {}@{} in sempkg.toml.", package_name, version);
     }

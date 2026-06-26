@@ -701,6 +701,28 @@ pub fn github_token() -> Option<String> {
     github_token_for_host("github.com")
 }
 
+/// Resolve which host should be used for GitHub PAT lookup for a URL.
+///
+/// This normalizes GitHub API hosts like `api.github.com` back to `github.com`
+/// so direct artifact downloads can reuse the same token environment variables
+/// as the source-build path.
+pub fn github_auth_host_for_url(url: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(url).ok()?;
+    let host = parsed.host_str()?.to_ascii_lowercase();
+
+    match host.as_str() {
+        "api.github.com" | "uploads.github.com" => Some("github.com".to_owned()),
+        _ if is_github_host(&host) => Some(host),
+        _ => None,
+    }
+}
+
+/// Read a GitHub token appropriate for a URL, if the URL points at GitHub or
+/// GitHub Enterprise.
+pub fn github_token_for_url(url: &str) -> Option<String> {
+    github_auth_host_for_url(url).and_then(|host| github_token_for_host(&host))
+}
+
 /// Read a GitHub token for a specific host.
 ///
 /// Resolution order (first match wins):
@@ -909,6 +931,37 @@ mod tests {
     fn test_parse_url_releases_tag() {
         let src = parse_source("https://github.com/pandas-dev/pandas/releases/tag/v2.2.2").unwrap();
         assert_eq!(src.git_ref.as_deref(), Some("v2.2.2"));
+    }
+
+    #[test]
+    fn test_github_auth_host_for_url_github_web() {
+        assert_eq!(
+            github_auth_host_for_url(
+                "https://github.com/owner/repo/releases/download/v1/pkg.sembundle"
+            )
+            .as_deref(),
+            Some("github.com")
+        );
+    }
+
+    #[test]
+    fn test_github_auth_host_for_url_github_api() {
+        assert_eq!(
+            github_auth_host_for_url("https://api.github.com/repos/owner/repo/releases/assets/123")
+                .as_deref(),
+            Some("github.com")
+        );
+    }
+
+    #[test]
+    fn test_github_auth_host_for_url_enterprise() {
+        assert_eq!(
+            github_auth_host_for_url(
+                "https://github.company.com/org/repo/releases/download/v1/pkg.sembundle"
+            )
+            .as_deref(),
+            Some("github.company.com")
+        );
     }
 
     #[test]

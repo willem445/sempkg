@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-use crate::error::SempkgError;
+use crate::{error::SempkgError, github};
 
 // ---------------------------------------------------------------------------
 // Registry index schema
@@ -197,8 +197,7 @@ pub fn download_from_url(url: &str, expected_sha256: Option<&str>) -> Result<Vec
         .build()
         .context("Failed to build HTTP client")?;
 
-    let resp = client
-        .get(url)
+    let resp = direct_download_request(&client, url)
         .send()
         .with_context(|| format!("Failed to connect to {url}"))?;
 
@@ -228,4 +227,81 @@ pub fn download_from_url(url: &str, expected_sha256: Option<&str>) -> Result<Vec
     }
 
     Ok(bytes)
+}
+
+fn direct_download_request(
+    client: &reqwest::blocking::Client,
+    url: &str,
+) -> reqwest::blocking::RequestBuilder {
+    let mut req = client.get(url);
+    if let Some(token) = github::github_token_for_url(url) {
+        req = req.header("Authorization", format!("token {token}"));
+    }
+    req
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct EnvGuard {
+        key: &'static str,
+        old: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let old = std::env::var(key).ok();
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, old }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            if let Some(old) = self.old.as_deref() {
+                unsafe {
+                    std::env::set_var(self.key, old);
+                }
+            } else {
+                unsafe {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_direct_download_request_adds_github_auth_header() {
+        let _guard = EnvGuard::set("GITHUB_TOKEN_GITHUB_COMPANY_COM", "secret-token");
+        let client = reqwest::blocking::Client::new();
+
+        let request = direct_download_request(
+            &client,
+            "https://github.company.com/org/repo/releases/download/v1/pkg.sembundle",
+        )
+        .build()
+        .expect("request should build");
+
+        assert_eq!(
+            request
+                .headers()
+                .get("Authorization")
+                .and_then(|v| v.to_str().ok()),
+            Some("token secret-token")
+        );
+    }
+
+    #[test]
+    fn test_direct_download_request_skips_auth_for_non_github_url() {
+        let client = reqwest::blocking::Client::new();
+
+        let request = direct_download_request(&client, "https://example.com/pkg.sembundle")
+            .build()
+            .expect("request should build");
+
+        assert!(request.headers().get("Authorization").is_none());
+    }
 }

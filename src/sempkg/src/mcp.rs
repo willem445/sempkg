@@ -294,7 +294,11 @@ fn fmt_codegraph_hit(item: &serde_json::Value, score: Option<f32>) -> String {
     let get = |k: &str| node.get(k).and_then(|v| v.as_str()).unwrap_or("");
     let qualified = get("qualifiedName");
     let name = get("name");
-    let label = if !qualified.is_empty() { qualified } else { name };
+    let label = if !qualified.is_empty() {
+        qualified
+    } else {
+        name
+    };
     let kind = get("kind");
     let file = get("filePath");
     let sig = get("signature");
@@ -315,13 +319,20 @@ fn fmt_codegraph_hit(item: &serde_json::Value, score: Option<f32>) -> String {
     };
 
     let header = match (!kind.is_empty(), !loc.is_empty()) {
-        (true, true)  => format!("{}{} ({}) @ {}", score_str, label, kind, loc),
+        (true, true) => format!("{}{} ({}) @ {}", score_str, label, kind, loc),
         (true, false) => format!("{}{} ({})", score_str, label, kind),
         (false, true) => format!("{}{} @ {}", score_str, label, loc),
-        _             => format!("{}{}", score_str, label),
+        _ => format!("{}{}", score_str, label),
     };
-    if sig.is_empty() { header } else { format!("{}
-{}", header, sig) }
+    if sig.is_empty() {
+        header
+    } else {
+        format!(
+            "{}
+{}",
+            header, sig
+        )
+    }
 }
 
 /// Parse a codegraph JSON array and render as a compact newline-separated
@@ -355,23 +366,32 @@ fn fmt_lance_result(r: &lance::SearchResult, score: Option<f32>) -> String {
         let sig = r.signature.as_deref().unwrap_or("");
         let header = format!("{}{} ({}) @ {}", score_str, sym, kind, loc);
         if sig.is_empty() {
-            format!("{}
+            format!(
+                "{}
 
 ```
 {}
-```", header, r.snippet)
+```",
+                header, r.snippet
+            )
         } else {
-            format!("{}
+            format!(
+                "{}
 {}
 
 ```
 {}
-```", header, sig, r.snippet)
+```",
+                header, sig, r.snippet
+            )
         }
     } else {
-        format!("{}{}
+        format!(
+            "{}{}
 
-{}", score_str, loc, r.snippet)
+{}",
+            score_str, loc, r.snippet
+        )
     }
 }
 
@@ -984,8 +1004,7 @@ impl McpContext {
             Ok(s) => s,
             Err(_) => {
                 // Graceful fallback: return plain markdown output.
-                return codegraph::context(&path, task)
-                    .unwrap_or_else(|e| format!("Error: {e}"));
+                return codegraph::context(&path, task).unwrap_or_else(|e| format!("Error: {e}"));
             }
         };
 
@@ -993,7 +1012,10 @@ impl McpContext {
         // it as a plain array so `codegraph_json_to_candidates` can consume it.
         let nodes_json: String = match serde_json::from_str::<serde_json::Value>(&raw) {
             Ok(v) => {
-                let nodes = v.get("nodes").cloned().unwrap_or(serde_json::Value::Array(vec![]));
+                let nodes = v
+                    .get("nodes")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Array(vec![]));
                 serde_json::to_string(&nodes).unwrap_or_default()
             }
             Err(_) => return raw, // not JSON — return as-is
@@ -1038,7 +1060,9 @@ impl McpContext {
     fn tool_list_files(&self, package: &str, filter: Option<&str>, limit: usize) -> String {
         match self.resolve_codegraph_path(package) {
             Err(e) => e,
-            Ok(path) => codegraph::files(&path, filter, limit).unwrap_or_else(|e| format!("Error: {e}")),
+            Ok(path) => {
+                codegraph::files(&path, filter, limit).unwrap_or_else(|e| format!("Error: {e}"))
+            }
         }
     }
 
@@ -1055,7 +1079,13 @@ impl McpContext {
         }
     }
 
-    fn tool_search_code(&self, package: &str, query: &str, kind_filter: Option<&str>, limit: usize) -> String {
+    fn tool_search_code(
+        &self,
+        package: &str,
+        query: &str,
+        kind_filter: Option<&str>,
+        limit: usize,
+    ) -> String {
         match self.resolve_code_path(package) {
             Err(e) => e,
             Ok(code_dir) => {
@@ -1065,9 +1095,7 @@ impl McpContext {
                     Ok(mut results) => {
                         // Client-side kind filter
                         if let Some(k) = kind_filter {
-                            results.retain(|r| {
-                                r.kind.as_deref().map_or(false, |rk| rk == k)
-                            });
+                            results.retain(|r| r.kind.as_deref().map_or(false, |rk| rk == k));
                         }
                         self.apply_rerank_to_lance(query, results, limit)
                     }
@@ -1100,7 +1128,13 @@ impl McpContext {
             // Extract the fields we need before taking any mutable reference.
             let (origin, pkg, path, start_line, symbol) = {
                 let h = &hits[hit_idx];
-                (h.origin, h.package.clone(), h.path.clone(), h.start_line, h.symbol.clone())
+                (
+                    h.origin,
+                    h.package.clone(),
+                    h.path.clone(),
+                    h.start_line,
+                    h.symbol.clone(),
+                )
             };
 
             if origin == "docs" {
@@ -1176,18 +1210,16 @@ impl McpContext {
                 };
                 let qualified = get_str("qualifiedName");
                 let name = get_str("name");
-                let label = if !qualified.is_empty() { qualified } else { name };
+                let label = if !qualified.is_empty() {
+                    qualified
+                } else {
+                    name
+                };
                 let kind = get_str("kind");
                 let sig = get_str("signature");
                 let file = get_str("filePath");
-                let start = node
-                    .get("startLine")
-                    .and_then(|x| x.as_u64())
-                    .unwrap_or(0) as u32;
-                let end = node
-                    .get("endLine")
-                    .and_then(|x| x.as_u64())
-                    .unwrap_or(0) as u32;
+                let start = node.get("startLine").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+                let end = node.get("endLine").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
                 let snippet = if !sig.is_empty() {
                     sig.clone()
                 } else {
@@ -1464,17 +1496,19 @@ impl McpContext {
                         (hi, score)
                     })
                     .collect();
-                p1_scored.sort_by(|a, b| {
-                    b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-                });
+                p1_scored
+                    .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
                 // Promote the top `pass2_budget` hits to the expensive pass.
                 // Budget tracks `limit` so output is not capped at PASS1_K;
                 // PASS1_K is only a floor (small limits still expand a few
                 // candidates so the best of them can be picked accurately).
                 let pass2_budget = limit.max(PASS1_K);
-                let top_indices: Vec<usize> =
-                    p1_scored.iter().take(pass2_budget).map(|&(i, _)| i).collect();
+                let top_indices: Vec<usize> = p1_scored
+                    .iter()
+                    .take(pass2_budget)
+                    .map(|&(i, _)| i)
+                    .collect();
 
                 // ── Pass 2: KWIC-windowed scoring on expanded bodies ──────
                 // Call score_pair() directly per window instead of going through
@@ -1544,9 +1578,8 @@ impl McpContext {
                     .enumerate()
                     .filter_map(|(tp, &hi)| best.get(&tp).map(|&(s, _)| (hi, s)))
                     .collect();
-                final_scored.sort_by(|a, b| {
-                    b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-                });
+                final_scored
+                    .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
                 // …then the cheap pass-1 tail (hits beyond the budget), in
                 // pass-1 order, appended after the expanded set.  This backfills
                 // the output if expanded hits are later dropped by the floor.
@@ -1554,10 +1587,13 @@ impl McpContext {
                 final_scored.into_iter().take(limit).collect()
             } else {
                 // No reranker — return top N from the diversity-selected pool, scored by RRF.
-                pool_indices.iter().take(limit).map(|&i| (i, hits[i].rrf_score)).collect()
+                pool_indices
+                    .iter()
+                    .take(limit)
+                    .map(|&i| (i, hits[i].rrf_score))
+                    .collect()
             }
         };
-
 
         // ── Relevance floor ──────────────────────────────────────────────
         // Drop results the reranker considers irrelevant.  Only applied when
@@ -1608,81 +1644,85 @@ impl McpContext {
     fn tool_read_code(&self, package: &str, file: &str, line: u32) -> String {
         match self.resolve_code_path(package) {
             Err(e) => e,
-            Ok(code_dir) => {
-                match lance::fetch_symbol_at_location(&code_dir, file, line) {
-                    Err(e) => format!("Error reading code: {e}"),
-                    Ok(None) => format!(
-                        "No symbol found covering {file}:{line} in the code index for '{package}'. \
+            Ok(code_dir) => match lance::fetch_symbol_at_location(&code_dir, file, line) {
+                Err(e) => format!("Error reading code: {e}"),
+                Ok(None) => format!(
+                    "No symbol found covering {file}:{line} in the code index for '{package}'. \
                          Verify the file path and line number from the codegraph results, or use \
                          read_symbol to look up by name."
-                    ),
-                    Ok(Some(src)) => {
-                        let loc = format!("{}:{}-{}", src.path, src.start_line, src.end_line);
-                        if src.signature.is_empty() {
-                            format!("**{}** ({}) @ {}\n\n```\n{}\n```",
-                                src.symbol, src.kind, loc, src.content)
-                        } else {
-                            format!("**{}** ({}) @ {}\n{}\n\n```\n{}\n```",
-                                src.symbol, src.kind, loc, src.signature, src.content)
-                        }
+                ),
+                Ok(Some(src)) => {
+                    let loc = format!("{}:{}-{}", src.path, src.start_line, src.end_line);
+                    if src.signature.is_empty() {
+                        format!(
+                            "**{}** ({}) @ {}\n\n```\n{}\n```",
+                            src.symbol, src.kind, loc, src.content
+                        )
+                    } else {
+                        format!(
+                            "**{}** ({}) @ {}\n{}\n\n```\n{}\n```",
+                            src.symbol, src.kind, loc, src.signature, src.content
+                        )
                     }
                 }
-            }
+            },
         }
     }
 
     fn tool_read_symbol(&self, package: &str, symbol: &str) -> String {
         match self.resolve_code_path(package) {
             Err(e) => e,
-            Ok(code_dir) => {
-                match lance::fetch_symbol_source(&code_dir, symbol) {
-                    Err(e) => format!("Error reading symbol: {e}"),
-                    Ok(lance::SymbolLookup::NotFound) => format!(
-                        "Symbol '{symbol}' not found in the code index for '{package}'. \
+            Ok(code_dir) => match lance::fetch_symbol_source(&code_dir, symbol) {
+                Err(e) => format!("Error reading symbol: {e}"),
+                Ok(lance::SymbolLookup::NotFound) => format!(
+                    "Symbol '{symbol}' not found in the code index for '{package}'. \
                          Try search_code to locate it first."
-                    ),
-                    Ok(lance::SymbolLookup::Ambiguous(candidates)) => {
-                        let mut msg = format!(
-                            "**'{symbol}' is ambiguous** — {n} nodes share this name. \
+                ),
+                Ok(lance::SymbolLookup::Ambiguous(candidates)) => {
+                    let mut msg = format!(
+                        "**'{symbol}' is ambiguous** — {n} nodes share this name. \
                              Use `read_code` with a file path and line number to disambiguate.\n\n\
                              | # | Name | Kind | File | Lines |\n\
                              |---|------|------|------|-------|\n",
-                            n = candidates.len()
-                        );
-                        for (i, c) in candidates.iter().enumerate() {
-                            let display_name = if c.qualified_name.is_empty() {
-                                c.name.clone()
-                            } else {
-                                c.qualified_name.clone()
-                            };
-                            msg.push_str(&format!(
-                                "| {} | `{}` | {} | {} | {}-{} |\n",
-                                i + 1,
-                                display_name,
-                                c.kind,
-                                c.path,
-                                c.start_line,
-                                c.end_line,
-                            ));
-                        }
-                        msg
-                    }
-                    Ok(lance::SymbolLookup::Unique(src)) => {
-                        let loc = if src.start_line > 0 {
-                            format!("{}:{}-{}", src.path, src.start_line, src.end_line)
+                        n = candidates.len()
+                    );
+                    for (i, c) in candidates.iter().enumerate() {
+                        let display_name = if c.qualified_name.is_empty() {
+                            c.name.clone()
                         } else {
-                            src.path.clone()
+                            c.qualified_name.clone()
                         };
-                        if src.signature.is_empty() {
-                            format!("**{}** ({}) @ {}\n\n```\n{}\n```",
-                                src.symbol, src.kind, loc, src.content)
-                        } else {
-                            format!("**{}** ({}) @ {}\n{}\n\n```\n{}\n```",
-                                src.symbol, src.kind, loc, src.signature, src.content)
-                        }
+                        msg.push_str(&format!(
+                            "| {} | `{}` | {} | {} | {}-{} |\n",
+                            i + 1,
+                            display_name,
+                            c.kind,
+                            c.path,
+                            c.start_line,
+                            c.end_line,
+                        ));
+                    }
+                    msg
+                }
+                Ok(lance::SymbolLookup::Unique(src)) => {
+                    let loc = if src.start_line > 0 {
+                        format!("{}:{}-{}", src.path, src.start_line, src.end_line)
+                    } else {
+                        src.path.clone()
+                    };
+                    if src.signature.is_empty() {
+                        format!(
+                            "**{}** ({}) @ {}\n\n```\n{}\n```",
+                            src.symbol, src.kind, loc, src.content
+                        )
+                    } else {
+                        format!(
+                            "**{}** ({}) @ {}\n{}\n\n```\n{}\n```",
+                            src.symbol, src.kind, loc, src.signature, src.content
+                        )
                     }
                 }
-            }
+            },
         }
     }
 
@@ -1704,7 +1744,12 @@ impl McpContext {
     /// Rerank raw codegraph JSON output (array of symbol objects).
     /// Both the reranked and BM25 paths produce the same compact text format;
     /// reranked results include a relevance score prefix `[0.92]`.
-    fn apply_rerank_to_codegraph_json(&self, query: &str, raw_json: &str, output_n: usize) -> String {
+    fn apply_rerank_to_codegraph_json(
+        &self,
+        query: &str,
+        raw_json: &str,
+        output_n: usize,
+    ) -> String {
         let mut guard = self.reranker.borrow_mut();
         let Some(ranker) = guard.as_mut() else {
             return raw_json.to_string();
@@ -1792,7 +1837,11 @@ impl McpContext {
                         .unwrap_or("")
                         .to_string();
                     let key = if !qual.is_empty() { qual } else { name };
-                    if key.is_empty() { None } else { Some((key, node)) }
+                    if key.is_empty() {
+                        None
+                    } else {
+                        Some((key, node))
+                    }
                 })
                 .collect();
 
@@ -1848,10 +1897,8 @@ impl McpContext {
             Ok(mut scored) => {
                 scored.truncate(output_n);
                 // Build score map: loc_key → score
-                let score_map: HashMap<String, f32> = scored
-                    .iter()
-                    .map(|r| (r.source.clone(), r.score))
-                    .collect();
+                let score_map: HashMap<String, f32> =
+                    scored.iter().map(|r| (r.source.clone(), r.score)).collect();
                 // Re-order the original results to match the reranked order,
                 // keeping only those that appear in the scored set.
                 let mut ordered: Vec<lance::SearchResult> = results
@@ -1964,9 +2011,15 @@ impl McpContext {
                 let get_str = |k: &str| node.get(k).and_then(|x| x.as_str()).unwrap_or("");
                 let qualified = get_str("qualifiedName");
                 let name = get_str("name");
-                let sym = if !qualified.is_empty() { qualified } else { name };
+                let sym = if !qualified.is_empty() {
+                    qualified
+                } else {
+                    name
+                };
                 if !sym.is_empty() {
-                    if let Ok(lance::SymbolLookup::Unique(src)) = lance::fetch_symbol_source(dir, sym) {
+                    if let Ok(lance::SymbolLookup::Unique(src)) =
+                        lance::fetch_symbol_source(dir, sym)
+                    {
                         if total_bytes + src.content.len() <= BYTE_BUDGET {
                             total_bytes += src.content.len();
                             sections.push(format!("{header}\n\n```\n{}\n```", src.content));
@@ -1998,11 +2051,9 @@ impl McpContext {
                 opt_str("kind"),
                 int_arg("limit", 20),
             ),
-            "get_context" => self.tool_get_context(
-                str_arg("package"),
-                str_arg("task"),
-                int_arg("limit", 20),
-            ),
+            "get_context" => {
+                self.tool_get_context(str_arg("package"), str_arg("task"), int_arg("limit", 20))
+            }
             "get_callers" => {
                 self.tool_get_callers(str_arg("package"), str_arg("symbol"), int_arg("limit", 20))
             }
@@ -2012,7 +2063,9 @@ impl McpContext {
             "get_impact" => {
                 self.tool_get_impact(str_arg("package"), str_arg("symbol"), int_arg("depth", 3))
             }
-            "list_files" => self.tool_list_files(str_arg("package"), opt_str("filter"), int_arg("limit", 200)),
+            "list_files" => {
+                self.tool_list_files(str_arg("package"), opt_str("filter"), int_arg("limit", 200))
+            }
             "search_docs" => {
                 self.tool_search_docs(str_arg("package"), str_arg("query"), int_arg("limit", 10))
             }
@@ -2025,10 +2078,7 @@ impl McpContext {
             ),
             "read_symbol" => self.tool_read_symbol(str_arg("package"), str_arg("symbol")),
             "read_code" => {
-                let line = args
-                    .get("line")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0) as u32;
+                let line = args.get("line").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
                 self.tool_read_code(str_arg("package"), str_arg("file"), line)
             }
             "query" => self.tool_query(str_arg("query"), int_arg("limit", 10)),

@@ -318,8 +318,12 @@ impl BundleStore {
             .filter(|entry| entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false))
             .count();
 
-        std::fs::remove_dir_all(&package_dir)
-            .with_context(|| format!("Failed to remove package store at {}", package_dir.display()))?;
+        std::fs::remove_dir_all(&package_dir).with_context(|| {
+            format!(
+                "Failed to remove package store at {}",
+                package_dir.display()
+            )
+        })?;
 
         Ok(version_count)
     }
@@ -527,4 +531,3 @@ pub fn resolve_bundle_spec(spec: &str, workspace_dir: Option<&Path>) -> Option<B
     }
     resolve_bundle(spec, workspace_dir)
 }
-

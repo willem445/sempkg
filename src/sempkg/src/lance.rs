@@ -8,8 +8,8 @@ use std::sync::Arc;
 use arrow_array::{RecordBatch, StringArray, UInt32Array};
 use arrow_schema::{DataType, Field, Schema};
 use futures::TryStreamExt;
-use lancedb::query::{ExecutableQuery, QueryBase};
 use lancedb::index::scalar::FullTextSearchQuery;
+use lancedb::query::{ExecutableQuery, QueryBase};
 use serde::Deserialize;
 
 use crate::error::SempkgError;
@@ -144,9 +144,7 @@ fn search_table(
     is_code: bool,
 ) -> crate::error::Result<Vec<SearchResult>> {
     if !dir.is_dir() {
-        return Err(SempkgError::NoLanceIndex(
-            dir.to_string_lossy().to_string(),
-        ));
+        return Err(SempkgError::NoLanceIndex(dir.to_string_lossy().to_string()));
     }
 
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -262,10 +260,7 @@ fn search_table(
 ///    to retrieve the stored content without any BM25 / FTS ambiguity.
 /// 4. If the stored chunk is wider than the codegraph range, slice it to the
 ///    exact lines.
-pub fn fetch_symbol_source(
-    code_dir: &Path,
-    symbol: &str,
-) -> crate::error::Result<SymbolLookup> {
+pub fn fetch_symbol_source(code_dir: &Path, symbol: &str) -> crate::error::Result<SymbolLookup> {
     if !code_dir.is_dir() {
         return Ok(SymbolLookup::NotFound);
     }
@@ -451,7 +446,8 @@ fn fetch_from_code_table(
                     // Slice the stored content to the precise codegraph range
                     // in case the chunk is wider than the symbol.
                     let raw_content = c.value(i);
-                    let content = slice_content_to_range(raw_content, row_start, exact_start, exact_end);
+                    let content =
+                        slice_content_to_range(raw_content, row_start, exact_start, exact_end);
 
                     let sym_name = node
                         .map(|n| n.name.clone())
@@ -630,8 +626,15 @@ pub fn format_results(results: &[SearchResult], query: &str) -> String {
             if let Some(sym) = &r.symbol {
                 let kind = r.kind.as_deref().unwrap_or("symbol");
                 let sig = r.signature.as_deref().unwrap_or("");
-                let sig_part = if sig.is_empty() { String::new() } else { format!("\n_{sig}_") };
-                format!("**{sym}** ({kind}) @ {loc}{sig_part}\n\n```\n{}\n```", r.snippet)
+                let sig_part = if sig.is_empty() {
+                    String::new()
+                } else {
+                    format!("\n_{sig}_")
+                };
+                format!(
+                    "**{sym}** ({kind}) @ {loc}{sig_part}\n\n```\n{}\n```",
+                    r.snippet
+                )
             } else {
                 format!("**{}**\n\n{}", loc, r.snippet)
             }
