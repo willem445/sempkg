@@ -488,6 +488,7 @@ falling back to global bundles. Omit `-C` to use only the global bundle store.
 | `get_impact` | `package`, `symbol` | `depth` | Downstream impact of changing a symbol |
 | `list_files` | `package` | `filter` | List source files tracked by CodeGraph |
 | `search_docs` | `package`, `query` | `limit` | BM25 full-text search over LanceDB docs index |
+| `read_docs` | `package`, `file` | `start_line`, `end_line` | Read raw documentation content for a file. When a line range is given it returns exactly those whole lines (resolved to line boundaries, never mid-line) — the follow-up to a `search_docs` hit |
 | `docs_metadata` | `package` | — | LanceDB index stats: document count, chunk count, FTS status |
 
 All tools accept a `package` name that can be:

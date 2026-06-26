@@ -484,6 +484,12 @@ struct UnifiedHit {
     /// Total number of KWIC windows the body was split into during pass-2.
     /// 0 = not windowed; 1 = body fits in a single window; >1 = multi-window.
     kwic_count: usize,
+    /// `true` when this hit was retrieved by the original (un-expanded) query
+    /// on at least one run. Set per-run during collection and OR-ed across
+    /// runs during dedup. Drives the additive-only guard (expansion may only
+    /// reinforce original-found documents) and topical anchoring (a package's
+    /// anchor strength is the original query's support for it).
+    from_original: bool,
 }
 
 /// Retrieval counters for one `tool_query` run (original or expanded query).
@@ -880,6 +886,9 @@ struct McpContext {
     embed_model_id: Option<String>,
     /// Optionally-loaded generative query expander.
     expander: Option<QueryExpander>,
+    /// Query-expansion / fusion configuration (used even when the expander
+    /// model is absent — the additive-only and anchoring knobs are read here).
+    qe_cfg: query_expansion::QueryExpansionConfig,
 }
 
 impl McpContext {
@@ -970,6 +979,7 @@ impl McpContext {
             embedder,
             embed_model_id,
             expander,
+            qe_cfg,
         }
     }
 
@@ -1394,6 +1404,7 @@ impl McpContext {
         weight: f32,
         do_lex: bool,
         do_vec: bool,
+        is_original: bool,
         fetch_limit: usize,
         hits: &mut Vec<UnifiedHit>,
     ) -> QueryRunStats {
@@ -1441,6 +1452,7 @@ impl McpContext {
                     best_window: None,
                     best_window_first: false,
                     kwic_count: 0,
+                    from_original: is_original,
                 });
             }
         };
@@ -1496,6 +1508,7 @@ impl McpContext {
                         best_window: None,
                         best_window_first: false,
                         kwic_count: 0,
+                        from_original: is_original,
                     });
                 }
                 arr.len()
@@ -1636,8 +1649,17 @@ impl McpContext {
 
         for (run_idx, (q, weight, do_lex, do_vec)) in runs.iter().enumerate() {
             let before = hits.len();
-            let stats =
-                self.collect_query_hits(q, *weight, *do_lex, *do_vec, fetch_limit, &mut hits);
+            // Run 0 is always the original query; later runs are expansions.
+            let is_original = run_idx == 0;
+            let stats = self.collect_query_hits(
+                q,
+                *weight,
+                *do_lex,
+                *do_vec,
+                is_original,
+                fetch_limit,
+                &mut hits,
+            );
             if debug {
                 eprintln!(
                     "sempkg: query run[{run_idx}] route={{lex:{do_lex}, vec:{do_vec}}} weight={weight:.1} q={q:?} added={} lex(code/docs/codegraph)={}/{}/{} vec(code/docs)={}/{} vec_tables(compatible/checked)={}/{}",
@@ -1702,6 +1724,11 @@ impl McpContext {
                         // RRF fusion: a hit found by multiple runs/sources
                         // accumulates their reciprocal-rank contributions.
                         deduped[idx].rrf_score += old.rrf_score;
+                        // Provenance is the OR across every run that found it:
+                        // a doc seen by the original query stays "original" even
+                        // when an expansion variant also (and now primarily)
+                        // surfaced it.
+                        deduped[idx].from_original |= old.from_original;
                     } else {
                         if debug {
                             duplicate_logs.push(format!(
@@ -1714,8 +1741,10 @@ impl McpContext {
                         // Existing wins; harvest complementary fields and add
                         // this run's RRF contribution to the running total.
                         let new_rrf = hit.rrf_score;
+                        let new_from_original = hit.from_original;
                         merge_complementary(&mut deduped[idx], &hit);
                         deduped[idx].rrf_score += new_rrf;
+                        deduped[idx].from_original |= new_from_original;
                     }
                 } else {
                     key_map.insert(key, deduped.len());
@@ -1749,6 +1778,49 @@ impl McpContext {
             debug_print_stage_hits("query post-dedup hits", &hits, debug_list_limit);
         }
 
+        // ── Topical anchoring ─────────────────────────────────────────────
+        // Cross-package RRF on its own has no notion of *which* packages the
+        // query is actually about, so a bare lexical match of a generic term
+        // (e.g. "wait") in an unrelated package can out-rank the one on-topic
+        // semantic hit. Anchor the fusion to the packages the ORIGINAL query
+        // surfaced: each package's anchor strength is the summed original-query
+        // RRF it received, normalised to the strongest package. Hits in weakly-
+        // or un-anchored packages have their score scaled toward `anchor_floor`.
+        //
+        // Only engaged when expansion actually ran — without extra variants the
+        // ranking is the original query's own, and we leave it untouched.
+        if self.qe_cfg.topical_anchoring && expanded_variants > 0 {
+            let mut anchor: HashMap<String, f32> = HashMap::new();
+            for h in &hits {
+                if h.from_original {
+                    *anchor.entry(h.package.clone()).or_insert(0.0) += h.rrf_score;
+                }
+            }
+            let max_anchor = anchor.values().copied().fold(0.0_f32, f32::max);
+            if max_anchor > 0.0 {
+                let floor = self.qe_cfg.anchor_floor.clamp(0.0, 1.0);
+                for h in &mut hits {
+                    let strength =
+                        anchor.get(h.package.as_str()).copied().unwrap_or(0.0) / max_anchor;
+                    h.rrf_score *= floor + (1.0 - floor) * strength;
+                }
+                if debug {
+                    let mut pkgs: Vec<(&str, f32)> = anchor
+                        .iter()
+                        .map(|(k, v)| (k.as_str(), *v / max_anchor))
+                        .collect();
+                    pkgs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                    eprintln!(
+                        "sempkg: topical anchoring — floor={floor:.2} anchored_packages={}",
+                        pkgs.len()
+                    );
+                    for (pkg, s) in pkgs.iter().take(debug_list_limit) {
+                        eprintln!("sempkg:   anchor[{pkg}] strength={s:.3}");
+                    }
+                }
+            }
+        }
+
         // ── Global RRF sort ───────────────────────────────────────────────
         // All sources used the same RRF formula so this sort is apples-to-apples.
         // Rank-1 from every (package, origin) pair competes fairly.
@@ -1771,16 +1843,38 @@ impl McpContext {
         // codegraph) each get roughly equal representation.
         let pool_size = fetch_limit;
         let max_per_bucket = (pool_size / 3).max(3);
+        // Additive-only / never-pool-dominating guard. Documents *introduced*
+        // by an expansion variant (never seen by the original query) may take
+        // at most `expansion_cap` pool slots:
+        //   • `additive_only` (default) → cap is 0: expansion may only
+        //     reinforce documents the original already found, never introduce
+        //     new ones. This is the high-leverage fix for the pool-poisoning
+        //     regression.
+        //   • otherwise → cap is `max_expansion_pool_fraction` of the pool, so
+        //     novel expansion hits can contribute but can never dominate.
+        let expansion_cap = if self.qe_cfg.additive_only {
+            0
+        } else {
+            ((pool_size as f32) * self.qe_cfg.max_expansion_pool_fraction.clamp(0.0, 1.0)) as usize
+        };
+        let mut expansion_used = 0usize;
         let mut bucket_counts: HashMap<(String, &'static str), usize> = HashMap::new();
         let pool_indices: Vec<usize> = hits
             .iter()
             .enumerate()
             .filter_map(|(i, h)| {
+                // Reject expansion-introduced docs once their budget is spent.
+                if !h.from_original && expansion_used >= expansion_cap {
+                    return None;
+                }
                 let count = bucket_counts
                     .entry((h.package.clone(), h.origin))
                     .or_insert(0);
                 if *count < max_per_bucket {
                     *count += 1;
+                    if !h.from_original {
+                        expansion_used += 1;
+                    }
                     Some(i)
                 } else {
                     None
@@ -1790,8 +1884,11 @@ impl McpContext {
             .collect();
         if debug {
             eprintln!(
-                "sempkg: query diversity-selected pool count={}",
-                pool_indices.len()
+                "sempkg: query diversity-selected pool count={} (additive_only={} expansion_introduced={}/{} cap)",
+                pool_indices.len(),
+                self.qe_cfg.additive_only,
+                expansion_used,
+                expansion_cap
             );
             for (i, hi) in pool_indices.iter().take(debug_list_limit).enumerate() {
                 eprintln!("sempkg:   [pool:{i}] {}", debug_hit_preview(&hits[*hi]));
