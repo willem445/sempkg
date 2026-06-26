@@ -191,28 +191,38 @@ impl RegistryClient {
 ///
 /// Use this when a dependency specifies a `url` directly (e.g. a GitHub release
 /// asset) rather than going through a registry.
+///
+/// GitHub does **not** honor a PAT `Authorization` header on the public
+/// `browser_download_url` of a **private** repository — it returns `404`. When
+/// the URL is a GitHub release asset and a token is configured, the bytes are
+/// resolved and fetched through the authenticated REST API instead; otherwise
+/// we fall back to a plain download (which works for public release assets and
+/// arbitrary URLs).
 pub fn download_from_url(url: &str, expected_sha256: Option<&str>) -> Result<Vec<u8>> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
-        .build()
-        .context("Failed to build HTTP client")?;
+    let bytes = if let Some(bytes) = github::download_release_asset_authenticated(url)? {
+        bytes
+    } else {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(120))
+            .build()
+            .context("Failed to build HTTP client")?;
 
-    let resp = direct_download_request(&client, url)
-        .send()
-        .with_context(|| format!("Failed to connect to {url}"))?;
+        let resp = direct_download_request(&client, url)
+            .send()
+            .with_context(|| format!("Failed to connect to {url}"))?;
 
-    if !resp.status().is_success() {
-        return Err(SempkgError::RegistryError {
-            url: url.to_string(),
-            message: format!("HTTP {}", resp.status()),
+        if !resp.status().is_success() {
+            return Err(SempkgError::RegistryError {
+                url: url.to_string(),
+                message: format!("HTTP {}", resp.status()),
+            }
+            .into());
         }
-        .into());
-    }
 
-    let bytes = resp
-        .bytes()
-        .context("Failed to read response body")?
-        .to_vec();
+        resp.bytes()
+            .context("Failed to read response body")?
+            .to_vec()
+    };
 
     if let Some(expected) = expected_sha256 {
         let actual = hex::encode(Sha256::digest(&bytes));
