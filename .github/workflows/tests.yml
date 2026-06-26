@@ -153,8 +153,8 @@ jobs:
     # takes several minutes.
     if: |
       github.event_name == 'workflow_dispatch' ||
-      github.event_name == 'pull_request' ||
-      contains(fromJson('["main","code-bundle"]'), github.ref_name)
+      github.event_name == 'push' ||
+      github.event_name == 'pull_request'
 
     steps:
       - name: Checkout code
