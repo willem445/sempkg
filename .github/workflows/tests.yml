@@ -148,13 +148,13 @@ jobs:
   functional-tests:
     name: Functional MCP tests (ubuntu)
     runs-on: ubuntu-latest
-    # Only run on pushes/PRs to main or the code-bundle branch, and on
+    # Only run on pushes/PRs to main, and on
     # manual dispatch — this job downloads & indexes an external repo so it
     # takes several minutes.
     if: |
       github.event_name == 'workflow_dispatch' ||
-      github.event_name == 'push' ||
-      github.event_name == 'pull_request'
+      (github.event_name == 'push' && github.ref_name == 'main') ||
+      (github.event_name == 'pull_request' && github.base_ref == 'main')
 
     steps:
       - name: Checkout code
