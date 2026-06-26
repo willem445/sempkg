@@ -1104,3 +1104,406 @@ class TestReadSymbolAmbiguity:
         assert "```" not in text, (
             f"Not-found response must not contain a code block:\n{text}"
         )
+
+
+# ---------------------------------------------------------------------------
+# MCP — query (cross-package hybrid search + reranker)
+# ---------------------------------------------------------------------------
+#
+# Ground truth verified live against all installed bundles with reranker
+# active (Qwen3-Reranker-0.6B, RANK pooling).
+#
+# Score expectations:
+#   - When reranker is loaded, top-hit scores are cross-encoder P(yes) values
+#     in [0, 1].  They must be substantially above the RRF-fallback floor of
+#     ~0.016 (= 1/61).  We require at least one score ≥ 0.50.
+#   - The relevance floor is 0.10; queries with no relevant content return a
+#     sentinel message rather than below-floor noise.
+#
+# Each benchmark query was chosen to be semantically demanding — BM25 alone
+# on keyword overlap would surface many wrong candidates, so correct top-1
+# placement is strong evidence that the cross-encoder ran.
+
+import re as _re
+
+
+def _parse_query_scores(text: str) -> list[float]:
+    """Extract the reranker scores from the query tool markdown output.
+
+    Handles both the reranker-active format  ``· score 0.998``
+    and the RRF-fallback format              ``· score 0.016``
+    """
+    return [float(m) for m in _re.findall(r"·\s*score\s+([0-9.]+)", text)]
+
+
+def _top_score(text: str) -> float:
+    """Return the highest score in a query result, or 0.0 if none found."""
+    scores = _parse_query_scores(text)
+    return max(scores, default=0.0)
+
+
+def _result_packages(text: str) -> list[str]:
+    """Return the list of **Package** values from a query result table."""
+    return _re.findall(r"\*\*Package\*\*\s*\|\s*`([^`]+)`", text)
+
+
+def _result_sources(text: str) -> list[str]:
+    """Return the list of **Source** file values from a query result table."""
+    return _re.findall(r"\*\*Source\*\*\s*\|\s*`([^`]+)`", text)
+
+
+@pytest.mark.functional
+class TestQueryTool:
+    """Cross-package query tool with reranker active.
+
+    These tests verify that:
+    1. The query tool returns well-formed markdown output.
+    2. Reranker scores are high-fidelity cross-encoder values (not RRF noise).
+    3. Semantically-demanding queries surface the correct result from the right
+       package, even when the answer lives in a challenging location that BM25
+       alone would likely miss.
+    4. The relevance floor suppresses completely irrelevant queries with a
+       clear sentinel message.
+    """
+
+    # ------------------------------------------------------------------
+    # Output shape and reranker-active signal
+    # ------------------------------------------------------------------
+
+    def test_query_returns_results_header(self, mcp_client: McpClient) -> None:
+        """Output must start with the standard '## Query results for:' header."""
+        text = mcp_client.tool_text(
+            "query",
+            {"query": "how does sempkg build the unified candidate pool before reranking"},
+        )
+        assert text.startswith("## Query results for:"), (
+            f"Missing results header:\n{text[:200]}"
+        )
+
+    def test_query_scores_above_rrf_floor(self, mcp_client: McpClient) -> None:
+        """When the reranker is loaded, the top score must be well above the RRF
+        baseline of ~0.016.  A score ≥ 0.50 is unambiguously cross-encoder output."""
+        text = mcp_client.tool_text(
+            "query",
+            {"query": "how does sempkg build the unified candidate pool before reranking"},
+        )
+        top = _top_score(text)
+        assert top >= 0.50, (
+            f"Top score {top:.3f} is below 0.50 — reranker may not be active "
+            f"(RRF fallback produces scores ~0.016).\nOutput:\n{text[:400]}"
+        )
+
+    def test_query_result_has_package_provenance(self, mcp_client: McpClient) -> None:
+        """Every result section must declare its source package."""
+        text = mcp_client.tool_text(
+            "query",
+            {"query": "how does sempkg build the unified candidate pool before reranking"},
+        )
+        packages = _result_packages(text)
+        assert packages, (
+            f"No **Package** entries found in query output:\n{text[:400]}"
+        )
+
+    def test_query_result_has_source_files(self, mcp_client: McpClient) -> None:
+        """Every result section must include a Source file path."""
+        text = mcp_client.tool_text(
+            "query",
+            {"query": "how does sempkg build the unified candidate pool before reranking"},
+        )
+        sources = _result_sources(text)
+        assert sources, (
+            f"No **Source** entries found in query output:\n{text[:400]}"
+        )
+
+    # ------------------------------------------------------------------
+    # Relevance floor — sentinel for irrelevant queries
+    # ------------------------------------------------------------------
+
+    def test_irrelevant_query_triggers_floor_sentinel(self, mcp_client: McpClient) -> None:
+        """A completely off-topic query must return the 'No relevant results' sentinel
+        rather than low-score noise results."""
+        text = mcp_client.tool_text(
+            "query",
+            {
+                "query": (
+                    "xyzzy completely irrelevant nonsense query "
+                    "about sandwich recipes and cooking temperatures"
+                )
+            },
+        )
+        assert "No relevant results for:" in text, (
+            f"Expected 'No relevant results for:' sentinel for off-topic query:\n{text[:400]}"
+        )
+
+    def test_irrelevant_query_sentinel_mentions_floor(self, mcp_client: McpClient) -> None:
+        """The floor sentinel must state the threshold so the caller understands why."""
+        text = mcp_client.tool_text(
+            "query",
+            {
+                "query": (
+                    "xyzzy completely irrelevant nonsense query "
+                    "about sandwich recipes and cooking temperatures"
+                )
+            },
+        )
+        assert "0.10" in text, (
+            f"Floor threshold (0.10) missing from sentinel message:\n{text}"
+        )
+
+    def test_irrelevant_query_sentinel_suggests_alternatives(
+        self, mcp_client: McpClient
+    ) -> None:
+        """The sentinel must guide the caller to narrower tools."""
+        text = mcp_client.tool_text(
+            "query",
+            {
+                "query": (
+                    "xyzzy completely irrelevant nonsense query "
+                    "about sandwich recipes and cooking temperatures"
+                )
+            },
+        )
+        assert "search_code" in text or "search_symbols" in text or "search_docs" in text, (
+            f"Floor sentinel does not suggest alternative tools:\n{text}"
+        )
+
+    # ------------------------------------------------------------------
+    # Benchmark 1: llama-cpp-rs — RANK pooling for cross-encoder reranking
+    #
+    # This query asks about a specific implementation detail (LLAMA_POOLING_TYPE_RANK
+    # and sigmoid normalisation) that only appears in llama-cpp-rs docs and the
+    # sempkg reranker design doc.  BM25 on "pooling type" alone would surface many
+    # unrelated embedding-pooling results; the cross-encoder must prefer the
+    # reranker-specific content.
+    # ------------------------------------------------------------------
+
+    POOLING_QUERY = (
+        "What pooling type does llama-cpp-rs use to perform cross-encoder reranking "
+        "and how is the raw logit converted to a score?"
+    )
+    POOLING_EXPECTED_PKG = "llama-cpp-rs"
+    POOLING_EXPECTED_SOURCE = "examples/reranker/README.md"
+    POOLING_BODY_MARKER = "LLAMA_POOLING_TYPE_RANK"
+
+    def test_pooling_query_top_hit_is_llama_cpp_rs(self, mcp_client: McpClient) -> None:
+        """Top result must be from the llama-cpp-rs package."""
+        text = mcp_client.tool_text("query", {"query": self.POOLING_QUERY, "limit": 5})
+        packages = _result_packages(text)
+        assert packages, f"No packages returned:\n{text[:400]}"
+        assert self.POOLING_EXPECTED_PKG in packages[0], (
+            f"Top result package '{packages[0]}' is not '{self.POOLING_EXPECTED_PKG}'.\n"
+            f"Full output:\n{text[:600]}"
+        )
+
+    def test_pooling_query_top_source_is_reranker_readme(
+        self, mcp_client: McpClient
+    ) -> None:
+        """Top result must point to the reranker README inside llama-cpp-rs."""
+        text = mcp_client.tool_text("query", {"query": self.POOLING_QUERY, "limit": 5})
+        sources = _result_sources(text)
+        assert sources, f"No sources returned:\n{text[:400]}"
+        assert self.POOLING_EXPECTED_SOURCE in sources[0], (
+            f"Top source '{sources[0]}' is not '{self.POOLING_EXPECTED_SOURCE}'.\n"
+            f"Full output:\n{text[:600]}"
+        )
+
+    def test_pooling_query_snippet_contains_pooling_type(
+        self, mcp_client: McpClient
+    ) -> None:
+        """The top result snippet must contain LLAMA_POOLING_TYPE_RANK."""
+        text = mcp_client.tool_text("query", {"query": self.POOLING_QUERY, "limit": 5})
+        assert self.POOLING_BODY_MARKER in text, (
+            f"'{self.POOLING_BODY_MARKER}' not found in query output:\n{text[:600]}"
+        )
+
+    def test_pooling_query_score_is_high(self, mcp_client: McpClient) -> None:
+        """Cross-encoder score for this well-matched query must be ≥ 0.85."""
+        text = mcp_client.tool_text("query", {"query": self.POOLING_QUERY, "limit": 5})
+        top = _top_score(text)
+        assert top >= 0.85, (
+            f"Expected top score ≥ 0.85 for pooling/reranker query, got {top:.3f}.\n"
+            f"Output:\n{text[:400]}"
+        )
+
+    # ------------------------------------------------------------------
+    # Benchmark 2: lancedb — RRFReranker with k=60 from the paper
+    #
+    # Asking for the specific numeric constant (k=60) in lancedb's RRF
+    # implementation requires surfacing `RRFReranker::new` in rerankers/rrf.rs.
+    # BM25 on "RRF k parameter" would also match sempkg's own RRF comments;
+    # the cross-encoder must prefer the canonical source-of-truth in lancedb.
+    # ------------------------------------------------------------------
+
+    RRF_QUERY = (
+        "What is the RRF k parameter value used in sempkg when building the "
+        "candidate pool before reranking?"
+    )
+    RRF_EXPECTED_PKG = "lancedb"
+    RRF_EXPECTED_SOURCE = "rerankers/rrf.rs"
+    RRF_BODY_MARKER = "k = 60"
+
+    def test_rrf_query_top_hit_is_lancedb(self, mcp_client: McpClient) -> None:
+        """Top result for the RRF k-parameter query must be from lancedb."""
+        text = mcp_client.tool_text("query", {"query": self.RRF_QUERY, "limit": 5})
+        packages = _result_packages(text)
+        assert packages, f"No packages returned:\n{text[:400]}"
+        assert self.RRF_EXPECTED_PKG in packages[0], (
+            f"Top result package '{packages[0]}' is not '{self.RRF_EXPECTED_PKG}'.\n"
+            f"Full output:\n{text[:600]}"
+        )
+
+    def test_rrf_query_top_source_is_rrf_rs(self, mcp_client: McpClient) -> None:
+        """Top result must point to rerankers/rrf.rs."""
+        text = mcp_client.tool_text("query", {"query": self.RRF_QUERY, "limit": 5})
+        sources = _result_sources(text)
+        assert sources, f"No sources returned:\n{text[:400]}"
+        assert self.RRF_EXPECTED_SOURCE in sources[0], (
+            f"Top source '{sources[0]}' is not '{self.RRF_EXPECTED_SOURCE}'.\n"
+            f"Full output:\n{text[:600]}"
+        )
+
+    def test_rrf_query_snippet_contains_k_value(self, mcp_client: McpClient) -> None:
+        """Result snippet must show the k=60 constant from the paper."""
+        text = mcp_client.tool_text("query", {"query": self.RRF_QUERY, "limit": 5})
+        assert self.RRF_BODY_MARKER in text, (
+            f"'{self.RRF_BODY_MARKER}' not found in query output:\n{text[:600]}"
+        )
+
+    def test_rrf_query_score_is_high(self, mcp_client: McpClient) -> None:
+        """Cross-encoder score must be ≥ 0.85."""
+        text = mcp_client.tool_text("query", {"query": self.RRF_QUERY, "limit": 5})
+        top = _top_score(text)
+        assert top >= 0.85, (
+            f"Expected top score ≥ 0.85 for RRF k-parameter query, got {top:.3f}.\n"
+            f"Output:\n{text[:400]}"
+        )
+
+    # ------------------------------------------------------------------
+    # Benchmark 3: sempkg — query expansion routing (ExpansionKind enum)
+    #
+    # This query asks about the internal routing logic in sempkg's query
+    # expander: lexical vs. vector variant dispatch.  The canonical answer
+    # lives in `query_expansion.rs` as the `ExpansionKind` enum and
+    # `QueryExpander::expand` method.  Many other packages have "expansion"
+    # or "query" in their docs, so keyword overlap alone is noisy.
+    # ------------------------------------------------------------------
+
+    EXPANSION_QUERY = (
+        "How does sempkg expand a lexical query variant and route it "
+        "separately from vector variants before retrieval?"
+    )
+    EXPANSION_EXPECTED_PKG = "sempkg"
+    EXPANSION_EXPECTED_FILE = "query_expansion.rs"
+    EXPANSION_EXPECTED_SYMBOL = "QueryExpander"
+
+    def test_expansion_query_top_hit_is_sempkg(self, mcp_client: McpClient) -> None:
+        """Top result must be from the sempkg package."""
+        text = mcp_client.tool_text(
+            "query", {"query": self.EXPANSION_QUERY, "limit": 5}
+        )
+        packages = _result_packages(text)
+        assert packages, f"No packages returned:\n{text[:400]}"
+        assert self.EXPANSION_EXPECTED_PKG in packages[0], (
+            f"Top result package '{packages[0]}' is not '{self.EXPANSION_EXPECTED_PKG}'.\n"
+            f"Full output:\n{text[:600]}"
+        )
+
+    def test_expansion_query_top_source_is_query_expansion_rs(
+        self, mcp_client: McpClient
+    ) -> None:
+        """Top result must point to query_expansion.rs."""
+        text = mcp_client.tool_text(
+            "query", {"query": self.EXPANSION_QUERY, "limit": 5}
+        )
+        sources = _result_sources(text)
+        assert sources, f"No sources returned:\n{text[:400]}"
+        assert self.EXPANSION_EXPECTED_FILE in sources[0], (
+            f"Top source '{sources[0]}' does not contain '{self.EXPANSION_EXPECTED_FILE}'.\n"
+            f"Full output:\n{text[:600]}"
+        )
+
+    def test_expansion_query_snippet_contains_expander_symbol(
+        self, mcp_client: McpClient
+    ) -> None:
+        """Result snippet must reference the QueryExpander symbol."""
+        text = mcp_client.tool_text(
+            "query", {"query": self.EXPANSION_QUERY, "limit": 5}
+        )
+        assert self.EXPANSION_EXPECTED_SYMBOL in text, (
+            f"'{self.EXPANSION_EXPECTED_SYMBOL}' not found in query output:\n{text[:600]}"
+        )
+
+    def test_expansion_query_score_is_high(self, mcp_client: McpClient) -> None:
+        """Cross-encoder score must be ≥ 0.85."""
+        text = mcp_client.tool_text(
+            "query", {"query": self.EXPANSION_QUERY, "limit": 5}
+        )
+        top = _top_score(text)
+        assert top >= 0.85, (
+            f"Expected top score ≥ 0.85 for query expansion routing query, "
+            f"got {top:.3f}.\nOutput:\n{text[:400]}"
+        )
+
+    # ------------------------------------------------------------------
+    # Benchmark 4: cross-package — lancedb QueryRequest hybrid fields
+    #
+    # Asking specifically how lancedb merges vector + FTS results in a
+    # hybrid query should surface `QueryRequest` in `query.rs` (lancedb)
+    # because it contains both `full_text_search` and `reranker` fields
+    # alongside the hybrid merger logic.  The sempkg CLI and ADR-002 are
+    # noisy competitors that BM25 would over-promote.
+    # ------------------------------------------------------------------
+
+    HYBRID_QUERY = (
+        "How does lancedb merge vector search results with full-text search "
+        "results in a hybrid query?"
+    )
+    HYBRID_EXPECTED_PKG = "lancedb"
+    HYBRID_EXPECTED_SOURCE = "query.rs"
+    HYBRID_BODY_MARKER = "full_text_search"
+
+    def test_hybrid_query_result_includes_lancedb(self, mcp_client: McpClient) -> None:
+        """At least one of the top results must be from lancedb."""
+        text = mcp_client.tool_text("query", {"query": self.HYBRID_QUERY, "limit": 5})
+        packages = _result_packages(text)
+        assert any(self.HYBRID_EXPECTED_PKG in p for p in packages), (
+            f"No lancedb result in top 5:\n{text[:600]}"
+        )
+
+    def test_hybrid_query_lancedb_source_is_query_rs(
+        self, mcp_client: McpClient
+    ) -> None:
+        """The lancedb result must point to query.rs."""
+        text = mcp_client.tool_text("query", {"query": self.HYBRID_QUERY, "limit": 5})
+        sources = _result_sources(text)
+        lancedb_idx = next(
+            (i for i, p in enumerate(_result_packages(text))
+             if self.HYBRID_EXPECTED_PKG in p),
+            None,
+        )
+        assert lancedb_idx is not None, f"No lancedb result found:\n{text[:400]}"
+        assert lancedb_idx < len(sources), f"Source list shorter than expected:\n{text[:400]}"
+        assert self.HYBRID_EXPECTED_SOURCE in sources[lancedb_idx], (
+            f"lancedb source '{sources[lancedb_idx]}' is not '{self.HYBRID_EXPECTED_SOURCE}'.\n"
+            f"Full output:\n{text[:600]}"
+        )
+
+    def test_hybrid_query_snippet_contains_fts_field(
+        self, mcp_client: McpClient
+    ) -> None:
+        """The result must contain the full_text_search field from QueryRequest."""
+        text = mcp_client.tool_text("query", {"query": self.HYBRID_QUERY, "limit": 5})
+        assert self.HYBRID_BODY_MARKER in text, (
+            f"'{self.HYBRID_BODY_MARKER}' not found in query output:\n{text[:600]}"
+        )
+
+    def test_hybrid_query_top_score_above_rrf_baseline(
+        self, mcp_client: McpClient
+    ) -> None:
+        """Even for a multi-package query the top score must be cross-encoder range."""
+        text = mcp_client.tool_text("query", {"query": self.HYBRID_QUERY, "limit": 5})
+        top = _top_score(text)
+        assert top >= 0.50, (
+            f"Top score {top:.3f} below 0.50 — reranker may not be active.\n"
+            f"Output:\n{text[:400]}"
+        )
