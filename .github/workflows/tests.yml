@@ -210,6 +210,11 @@ jobs:
       - name: Create test workspace
         run: mkdir -p /tmp/sempkg-test-workspace
 
+      - name: Initialize sempkg workspace
+        run: ./src/sempkg/target/release/sempkg init --workspace /tmp/sempkg-test-workspace
+        env:
+          SEMPKG_WORKSPACE: /tmp/sempkg-test-workspace
+
       - name: Install codegraph bundle (fresh build with new sembundle)
         run: |
           ./src/sempkg/target/release/sempkg add colbymchenry/codegraph@v0.9.7 \
