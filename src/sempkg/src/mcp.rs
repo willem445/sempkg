@@ -12,15 +12,13 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use std::cell::RefCell;
-
 use crate::packages::PackageRegistry;
-use crate::reranker::{self, Reranker, RerankerConfig};
+use crate::providers::{self, Embed, Expand, Rerank};
+use crate::reranker;
 use crate::store::{list_all_bundles, resolve_bundle, resolve_bundle_spec};
 use crate::{codegraph, embedding, lance, query_expansion};
 
-use crate::embedding::Embedder;
-use crate::query_expansion::{ExpansionKind, QueryExpander};
+use crate::query_expansion::ExpansionKind;
 
 // Minimum reranker score (P(yes) from the Qwen3 cross-encoder) a result must
 // reach to be returned to the agent.  Results below this threshold are
@@ -1181,16 +1179,12 @@ fn merge_complementary(winner: &mut UnifiedHit, donor: &UnifiedHit) {
 struct McpContext {
     workspace_dir: Option<PathBuf>,
     registry: PackageRegistry,
-    /// Optionally-loaded Qwen3 reranker. Wrapped in RefCell so tool methods
-    /// can mutably borrow it through an immutable &McpContext reference.
-    reranker: RefCell<Option<Reranker>>,
-    reranker_cfg: Option<RerankerConfig>,
+    /// Optionally-loaded reranker (local GGUF or remote OpenAI-compatible).
+    reranker: Option<Box<dyn Rerank>>,
     /// Optionally-loaded vector embedder for semantic search.
-    embedder: Option<Embedder>,
-    /// Identifier of the loaded embedding model (for bundle compatibility checks).
-    embed_model_id: Option<String>,
+    embedder: Option<Box<dyn Embed>>,
     /// Optionally-loaded generative query expander.
-    expander: Option<QueryExpander>,
+    expander: Option<Box<dyn Expand>>,
     /// Query-expansion / fusion configuration (used even when the expander
     /// model is absent — the additive-only and anchoring knobs are read here).
     qe_cfg: query_expansion::QueryExpansionConfig,
@@ -1200,90 +1194,57 @@ impl McpContext {
     fn new(workspace_dir: Option<PathBuf>) -> Self {
         let registry = PackageRegistry::load().unwrap_or_default();
 
-        // Try to load reranker config from the workspace manifest.
-        let reranker_cfg: Option<RerankerConfig> = workspace_dir
+        // Load all three configs from the workspace manifest (or use defaults).
+        let manifest = workspace_dir
             .as_deref()
-            .and_then(|d| crate::manifest::load_manifest(d).ok())
-            .and_then(|mf| mf.reranker);
+            .and_then(|d| crate::manifest::load_manifest(d).ok());
 
-        // Eagerly load the model when it's enabled and the files exist.
-        let reranker = reranker_cfg.as_ref().and_then(|cfg| {
-            if cfg.enabled && reranker::model_is_present(cfg) {
-                match Reranker::load(cfg) {
-                    Ok(r) => {
-                        eprintln!(
-                            "sempkg: reranker loaded ({} top_k, {} output_n)",
-                            cfg.top_k, cfg.output_n
-                        );
-                        Some(r)
-                    }
-                    Err(e) => {
-                        eprintln!("sempkg: reranker load error (falling back to BM25): {e}");
-                        None
-                    }
-                }
-            } else {
-                None
-            }
-        });
-
-        // Embedding config + lazy model load (semantic search).
-        let embed_cfg: embedding::EmbeddingConfig = workspace_dir
-            .as_deref()
-            .and_then(|d| crate::manifest::load_manifest(d).ok())
-            .and_then(|mf| mf.embedding)
+        let reranker_cfg = manifest
+            .as_ref()
+            .and_then(|mf| mf.reranker.clone())
             .unwrap_or_default();
 
-        let (embedder, embed_model_id) =
-            if embed_cfg.enabled && embedding::model_is_present(&embed_cfg) {
-                match Embedder::load(&embed_cfg) {
-                    Ok(e) => {
-                        eprintln!(
-                            "sempkg: embedder loaded ({}, dim {})",
-                            e.model_id(),
-                            e.dim()
-                        );
-                        let model_id = e.model_id().to_string();
-                        (Some(e), Some(model_id))
-                    }
-                    Err(e) => {
-                        eprintln!("sempkg: embedder load error (vector search disabled): {e}");
-                        (None, None)
-                    }
-                }
-            } else {
-                (None, None)
-            };
-
-        // Query-expansion config + lazy model load.
-        let qe_cfg: query_expansion::QueryExpansionConfig = workspace_dir
-            .as_deref()
-            .and_then(|d| crate::manifest::load_manifest(d).ok())
-            .and_then(|mf| mf.query_expansion)
+        let embed_cfg: embedding::EmbeddingConfig = manifest
+            .as_ref()
+            .and_then(|mf| mf.embedding.clone())
             .unwrap_or_default();
 
-        let expander = if qe_cfg.enabled && query_expansion::model_is_present(&qe_cfg) {
-            match QueryExpander::load(&qe_cfg) {
-                Ok(e) => {
-                    eprintln!("sempkg: query expander loaded");
-                    Some(e)
-                }
-                Err(e) => {
-                    eprintln!("sempkg: query expander load error (expansion disabled): {e}");
-                    None
-                }
-            }
-        } else {
-            None
-        };
+        let qe_cfg: query_expansion::QueryExpansionConfig = manifest
+            .as_ref()
+            .and_then(|mf| mf.query_expansion.clone())
+            .unwrap_or_default();
+
+        // Build reranker through the provider factory.
+        let reranker: Option<Box<dyn Rerank>> = providers::build_reranker(&reranker_cfg);
+        if let Some(ref r) = reranker {
+            eprintln!(
+                "sempkg: reranker loaded ({} top_k, {} output_n)",
+                r.top_k(),
+                r.output_n()
+            );
+        }
+
+        // Build embedder through the provider factory.
+        let embedder: Option<Box<dyn Embed>> = providers::build_embedder(&embed_cfg);
+        if let Some(ref e) = embedder {
+            eprintln!(
+                "sempkg: embedder loaded ({}, dim {})",
+                e.model_id(),
+                e.dim()
+            );
+        }
+
+        // Build query expander through the provider factory.
+        let expander: Option<Box<dyn Expand>> = providers::build_expander(&qe_cfg);
+        if expander.is_some() {
+            eprintln!("sempkg: query expander loaded");
+        }
 
         Self {
             workspace_dir,
             registry,
-            reranker: RefCell::new(reranker),
-            reranker_cfg,
+            reranker,
             embedder,
-            embed_model_id,
             expander,
             qe_cfg,
         }
@@ -1774,10 +1735,9 @@ impl McpContext {
         // is requested and an embedder is loaded. `None` => vector search is
         // silently skipped and the run degrades to BM25 only.
         let query_vec: Option<Vec<f32>> = if do_vec {
-            match (self.embedder.as_ref(), self.embed_model_id.as_ref()) {
-                (Some(e), Some(_)) => e.embed_query(query).ok(),
-                _ => None,
-            }
+            self.embedder
+                .as_ref()
+                .and_then(|e| e.embed_query(query).ok())
         } else {
             None
         };
@@ -1786,7 +1746,11 @@ impl McpContext {
         let vectors_compatible = |dir: &Path, qlen: usize| -> bool {
             match lance::read_embedding_info(dir) {
                 Some((model, dim)) => {
-                    self.embed_model_id.as_deref() == Some(model.as_str()) && dim as usize == qlen
+                    self.embedder
+                        .as_ref()
+                        .map(|e| e.model_id() == model.as_str())
+                        .unwrap_or(false)
+                        && dim as usize == qlen
                 }
                 None => false,
             }
@@ -2329,8 +2293,7 @@ impl McpContext {
         // budget keep their cheap pass-1 score and are appended as a tail.
         let mut reranker_was_active = false;
         let scored: Vec<(usize, f32)> = {
-            let mut guard = self.reranker.borrow_mut();
-            if let Some(ranker) = guard.as_mut() {
+            if let Some(ranker) = self.reranker.as_ref() {
                 // ── Pass 1: snippet scoring ───────────────────────────────
                 let p1_candidates: Vec<reranker::RerankCandidate> = pool_indices
                     .iter()
@@ -2618,10 +2581,8 @@ impl McpContext {
     /// Returns the candidate fetch limit: top_k from config when a reranker
     /// is available, otherwise the caller-supplied `limit`.
     fn reranker_fetch_limit(&self, limit: usize) -> usize {
-        if let Some(cfg) = &self.reranker_cfg {
-            if cfg.enabled && self.reranker.borrow().is_some() {
-                return cfg.top_k.max(limit);
-            }
+        if let Some(r) = self.reranker.as_ref() {
+            return r.top_k().max(limit);
         }
         limit
     }
@@ -2635,8 +2596,7 @@ impl McpContext {
         raw_json: &str,
         output_n: usize,
     ) -> String {
-        let mut guard = self.reranker.borrow_mut();
-        let Some(ranker) = guard.as_mut() else {
+        let Some(ranker) = self.reranker.as_ref() else {
             return raw_json.to_string();
         };
 
@@ -2698,8 +2658,7 @@ impl McpContext {
     }
 
     fn apply_rerank_to_codegraph(&self, query: &str, raw_json: &str, output_n: usize) -> String {
-        let mut guard = self.reranker.borrow_mut();
-        let Some(ranker) = guard.as_mut() else {
+        let Some(ranker) = self.reranker.as_ref() else {
             return fmt_codegraph_json(raw_json);
         };
 
@@ -2768,8 +2727,7 @@ impl McpContext {
         results: Vec<lance::SearchResult>,
         output_n: usize,
     ) -> String {
-        let mut guard = self.reranker.borrow_mut();
-        let Some(ranker) = guard.as_mut() else {
+        let Some(ranker) = self.reranker.as_ref() else {
             return fmt_lance_results(&results, None);
         };
 

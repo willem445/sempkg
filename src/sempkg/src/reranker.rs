@@ -22,6 +22,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::providers::{OpenAiProviderConfig, ProviderKind, Rerank};
+
 // ---------------------------------------------------------------------------
 // Configuration  (always present — read from [reranker] in sempkg.toml)
 // ---------------------------------------------------------------------------
@@ -33,10 +35,24 @@ pub struct RerankerConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
 
+    /// Which backend to use. `"local"` (default) requires the `reranker` cargo
+    /// feature; `"openai"` uses chat-completion scoring via any OpenAI-compatible
+    /// HTTP endpoint.
+    #[serde(default)]
+    pub provider: ProviderKind,
+
     /// Path to the GGUF model file.
     /// May use `~` for the home directory.
-    /// Defaults to `~/.sempkg/models/Qwen3-Reranker-1.7B-Q4_K_M.gguf`.
+    /// Only used when `provider = "local"`.
     pub model: Option<String>,
+
+    /// HuggingFace (or other) URL to download the GGUF from.
+    /// Overrides the built-in default URL when running `sempkg reranker pull`.
+    /// Only used when `provider = "local"`.
+    pub model_url: Option<String>,
+
+    /// OpenAI-compatible provider settings. Required when `provider = "openai"`.
+    pub openai: Option<OpenAiProviderConfig>,
 
     /// Number of BM25 candidates passed into the model for scoring.
     /// Defaults to 20.
@@ -67,7 +83,10 @@ impl Default for RerankerConfig {
     fn default() -> Self {
         Self {
             enabled: default_true(),
+            provider: ProviderKind::Local,
             model: None,
+            model_url: None,
+            openai: None,
             top_k: default_top_k(),
             output_n: default_output_n(),
         }
@@ -283,7 +302,10 @@ pub fn pull_model(
     gguf_url: Option<&str>,
 ) -> Result<()> {
     let model_path = config.resolved_model_path();
-    let source_url = gguf_url.unwrap_or(DEFAULT_GGUF_URL);
+    // Priority: CLI --gguf-url flag > toml model_url > built-in default
+    let source_url = gguf_url
+        .or_else(|| config.model_url.as_deref())
+        .unwrap_or(DEFAULT_GGUF_URL);
 
     if model_path.is_file() {
         println!("Model already present: {}", model_path.display());
@@ -437,35 +459,20 @@ impl Reranker {
 
         Ok(emb.first().copied().unwrap_or(0.0))
     }
+}
 
-    /// Rerank `candidates`, keeping at most `output_n` results.
-    pub fn rerank(
-        &mut self,
-        query: &str,
-        candidates: Vec<RerankCandidate>,
-    ) -> Result<Vec<RerankResult>> {
-        let pool: Vec<RerankCandidate> = candidates.into_iter().take(self.top_k).collect();
+#[cfg(feature = "reranker")]
+impl Rerank for Reranker {
+    fn score_pair(&self, query: &str, doc: &str) -> Result<f32> {
+        Reranker::score_pair(self, query, doc)
+    }
 
-        let mut scored: Vec<RerankResult> = pool
-            .into_iter()
-            .map(|c| {
-                let score = self.score_pair(query, &c.text).unwrap_or(0.0);
-                RerankResult {
-                    source: c.source,
-                    text: c.text,
-                    origin: c.origin,
-                    score,
-                }
-            })
-            .collect();
+    fn top_k(&self) -> usize {
+        self.top_k
+    }
 
-        scored.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        scored.truncate(self.output_n);
-        Ok(scored)
+    fn output_n(&self) -> usize {
+        self.output_n
     }
 }
 
@@ -488,7 +495,7 @@ impl Reranker {
     }
 
     pub fn rerank(
-        &mut self,
+        &self,
         _query: &str,
         _candidates: Vec<RerankCandidate>,
     ) -> Result<Vec<RerankResult>> {
@@ -498,6 +505,19 @@ impl Reranker {
     /// Stub — always returns 0.0; real scoring requires `--features reranker`.
     pub fn score_pair(&self, _query: &str, _document: &str) -> Result<f32> {
         Ok(0.0)
+    }
+}
+
+#[cfg(not(feature = "reranker"))]
+impl Rerank for Reranker {
+    fn score_pair(&self, query: &str, doc: &str) -> Result<f32> {
+        Reranker::score_pair(self, query, doc)
+    }
+    fn top_k(&self) -> usize {
+        20
+    }
+    fn output_n(&self) -> usize {
+        5
     }
 }
 

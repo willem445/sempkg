@@ -383,13 +383,13 @@ fn search_vector_table(
 pub fn embed_table(
     dir: &Path,
     table_name: &str,
-    embedder: &crate::embedding::Embedder,
-    model_id: &str,
+    embedder: &dyn crate::providers::Embed,
 ) -> crate::error::Result<u64> {
     if !dir.is_dir() {
         return Err(SempkgError::NoLanceIndex(dir.to_string_lossy().to_string()));
     }
 
+    let model_id = embedder.model_id().to_string();
     let dim = embedder.dim();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -462,8 +462,9 @@ pub fn embed_table(
         }
 
         // Embed all rows in one batched pass (context created once inside).
+        let all_text_refs: Vec<&str> = all_texts.iter().map(String::as_str).collect();
         let all_vecs = embedder
-            .embed_documents_batch(&all_texts)
+            .embed_documents_batch(&all_text_refs)
             .map_err(|e| SempkgError::LanceError(format!("batch embedding: {e}")))?;
 
         // Verify dim on the first result.
@@ -521,7 +522,7 @@ pub fn embed_table(
     })?;
 
     // Stamp embedding metadata into the table's metadata.json.
-    stamp_embedding_metadata(dir, model_id, dim as u32)?;
+    stamp_embedding_metadata(dir, &model_id, dim as u32)?;
 
     Ok(row_count)
 }

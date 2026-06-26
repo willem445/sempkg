@@ -9,6 +9,7 @@ mod llama_runtime;
 mod manifest;
 mod mcp;
 mod packages;
+mod providers;
 mod query_expansion;
 mod registry;
 mod reranker;
@@ -892,103 +893,98 @@ fn run_query(
     top_k_override: Option<usize>,
     workspace: Option<&Path>,
 ) -> Result<()> {
-    #[cfg(feature = "reranker")]
-    {
-        let mut cfg: reranker::RerankerConfig = workspace
-            .and_then(|d| manifest::load_manifest(d).ok())
-            .and_then(|mf| mf.reranker)
-            .unwrap_or_default();
+    let mut cfg: reranker::RerankerConfig = workspace
+        .and_then(|d| manifest::load_manifest(d).ok())
+        .and_then(|mf| mf.reranker)
+        .unwrap_or_default();
 
-        if let Some(k) = top_k_override {
-            cfg.top_k = k;
-        }
-        cfg.output_n = limit;
-
-        if !reranker::model_is_present(&cfg) {
-            anyhow::bail!("Reranker model not found. Run `sempkg reranker pull` to download it.");
-        }
-
-        let mut code_candidates: Vec<reranker::RerankCandidate> = Vec::new();
-        if !docs_only {
-            match resolve_codegraph_path(package, workspace) {
-                Ok(path) => match codegraph::query(&path, query, kind, cfg.top_k) {
-                    Ok(raw) => code_candidates.extend(reranker::codegraph_json_to_candidates(&raw)),
-                    Err(e) => eprintln!("Warning: symbol search failed: {e}"),
-                },
-                Err(_) => {} // package may be docs-only; not fatal
-            }
-        }
-
-        let mut doc_candidates: Vec<reranker::RerankCandidate> = Vec::new();
-        if !code_only {
-            if docs_only && kind.is_some() {
-                eprintln!("Note: --kind is ignored when --docs is set.");
-            }
-            match resolve_lance_path(package, workspace) {
-                Ok(lance_dir) => match lance::search(&lance_dir, query, cfg.top_k) {
-                    Ok(results) => {
-                        doc_candidates.extend(reranker::lance_results_to_candidates(&results))
-                    }
-                    Err(e) => eprintln!("Warning: doc search failed: {e}"),
-                },
-                Err(_) => {} // package may be symbols-only; not fatal
-            }
-        }
-
-        // `top_k` is the total reranker budget across the merged hybrid pool,
-        // not per backend. Interleave sources so one side can't monopolize the
-        // pool when both are available.
-        let candidates = merge_query_candidates(code_candidates, doc_candidates, cfg.top_k);
-
-        if candidates.is_empty() {
-            println!("No results for '{query}'.");
-            return Ok(());
-        }
-
-        // `top_k` applies to the fetch size per backend. Once symbol and doc
-        // candidates are merged for hybrid query, score the full combined pool.
-        cfg.top_k = candidates.len();
-
-        // Score the full gathered pool first, then apply source-diversity
-        // selection and final truncation below.
-        cfg.output_n = candidates.len();
-
-        let has_codegraph = candidates
-            .iter()
-            .any(|c| c.origin == reranker::RerankOrigin::Codegraph);
-        let has_docs = candidates
-            .iter()
-            .any(|c| c.origin == reranker::RerankOrigin::Docs);
-
-        eprintln!("Scoring {} candidates...", candidates.len());
-        let mut ranker = reranker::Reranker::load(&cfg)?;
-        let scored = ranker.rerank(query, candidates)?;
-        let scored = diversify_query_results(scored, limit, has_codegraph, has_docs);
-
-        if scored.is_empty() {
-            println!("No results for '{query}'.");
-        } else {
-            println!("{}", reranker::format_reranked_docs(&scored, query));
-        }
-        Ok(())
+    if let Some(k) = top_k_override {
+        cfg.top_k = k;
     }
-    #[cfg(not(feature = "reranker"))]
-    {
-        let _ = (
-            package,
-            query,
-            docs_only,
-            code_only,
-            kind,
-            limit,
-            top_k_override,
-            workspace,
-        );
-        anyhow::bail!(
-            "The `query` command requires reranker support. \
-             Rebuild with `cargo build --features reranker`."
+
+    let ranker = providers::build_reranker(&cfg).ok_or_else(|| {
+        anyhow::anyhow!(
+            "Reranker not available. \
+             For local models: run `sempkg reranker pull` or build with `--features reranker`. \
+             For remote: set `provider = \"openai\"` and configure `[reranker.openai]` in sempkg.toml."
         )
+    })?;
+
+    let fetch_k = ranker.top_k();
+
+    let mut code_candidates: Vec<reranker::RerankCandidate> = Vec::new();
+    if !docs_only {
+        match resolve_codegraph_path(package, workspace) {
+            Ok(path) => match codegraph::query(&path, query, kind, fetch_k) {
+                Ok(raw) => code_candidates.extend(reranker::codegraph_json_to_candidates(&raw)),
+                Err(e) => eprintln!("Warning: symbol search failed: {e}"),
+            },
+            Err(_) => {} // package may be docs-only; not fatal
+        }
     }
+
+    let mut doc_candidates: Vec<reranker::RerankCandidate> = Vec::new();
+    if !code_only {
+        if docs_only && kind.is_some() {
+            eprintln!("Note: --kind is ignored when --docs is set.");
+        }
+        match resolve_lance_path(package, workspace) {
+            Ok(lance_dir) => match lance::search(&lance_dir, query, fetch_k) {
+                Ok(results) => {
+                    doc_candidates.extend(reranker::lance_results_to_candidates(&results))
+                }
+                Err(e) => eprintln!("Warning: doc search failed: {e}"),
+            },
+            Err(_) => {} // package may be symbols-only; not fatal
+        }
+    }
+
+    // Interleave sources so one side can't monopolize the pool.
+    let candidates = merge_query_candidates(code_candidates, doc_candidates, fetch_k);
+
+    if candidates.is_empty() {
+        println!("No results for '{query}'.");
+        return Ok(());
+    }
+
+    let has_codegraph = candidates
+        .iter()
+        .any(|c| c.origin == reranker::RerankOrigin::Codegraph);
+    let has_docs = candidates
+        .iter()
+        .any(|c| c.origin == reranker::RerankOrigin::Docs);
+
+    eprintln!("Scoring {} candidates...", candidates.len());
+    // Score the full pool (override top_k/output_n on the fly).
+    let all_scored: Vec<reranker::RerankResult> = {
+        let pool: Vec<reranker::RerankCandidate> = candidates;
+        let mut scored: Vec<reranker::RerankResult> = pool
+            .into_iter()
+            .map(|c| {
+                let score = ranker.score_pair(query, &c.text).unwrap_or(0.0);
+                reranker::RerankResult {
+                    source: c.source,
+                    text: c.text,
+                    origin: c.origin,
+                    score,
+                }
+            })
+            .collect();
+        scored.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        scored
+    };
+    let scored = diversify_query_results(all_scored, limit, has_codegraph, has_docs);
+
+    if scored.is_empty() {
+        println!("No results for '{query}'.");
+    } else {
+        println!("{}", reranker::format_reranked_docs(&scored, query));
+    }
+    Ok(())
 }
 
 /// Merge code and doc candidates into a single pool with a strict total budget.
@@ -1115,9 +1111,13 @@ fn run_reranker(cmd: RerankerCommands, workspace: Option<&Path>) -> Result<()> {
 
     match cmd {
         RerankerCommands::Pull { gguf_url, hf_token } => {
-            // Allow URL overrides via CLI flags for custom quants / mirrors.
+            if cfg.provider != providers::ProviderKind::Local {
+                anyhow::bail!(
+                    "`sempkg reranker pull` only applies to `provider = \"local\"`. \
+                     Remote providers (openai, copilot) do not require model downloads."
+                );
+            }
             let pull_cfg = cfg.clone();
-
             let token = hf_token.as_deref();
             let source_url = gguf_url.as_deref();
 
@@ -1142,37 +1142,29 @@ fn run_reranker(cmd: RerankerCommands, workspace: Option<&Path>) -> Result<()> {
         }
 
         RerankerCommands::Test { query, document } => {
-            #[cfg(feature = "reranker")]
-            {
-                if !reranker::model_is_present(&cfg) {
-                    anyhow::bail!("Model not found. Run `sempkg reranker pull` first.");
-                }
-                println!("Loading Qwen3-Reranker...");
-                let mut ranker = reranker::Reranker::load(&cfg)?;
-                let candidates = vec![reranker::RerankCandidate {
-                    source: "test-document".to_string(),
-                    text: document.clone(),
-                    origin: reranker::RerankOrigin::Docs,
-                }];
-                let results = ranker.rerank(&query, candidates)?;
-                if let Some(r) = results.first() {
-                    println!(
-                        "Score: {:.4}  (1.0 = highly relevant, 0.0 = not relevant)",
-                        r.score
-                    );
-                } else {
-                    println!("No results.");
-                }
-                Ok(())
-            }
-            #[cfg(not(feature = "reranker"))]
-            {
-                let _ = (query, document);
-                anyhow::bail!(
-                    "Reranker support is not compiled into this binary. \
-                     Rebuild with `cargo build --features reranker`."
+            println!("Loading reranker...");
+            let ranker = providers::build_reranker(&cfg).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Reranker not available. \
+                     For local models: run `sempkg reranker pull` or build with `--features reranker`. \
+                     For remote: set `provider = \"openai\"` in [reranker] config."
                 )
+            })?;
+            let candidates = vec![reranker::RerankCandidate {
+                source: "test-document".to_string(),
+                text: document.clone(),
+                origin: reranker::RerankOrigin::Docs,
+            }];
+            let results = ranker.rerank(&query, candidates)?;
+            if let Some(r) = results.first() {
+                println!(
+                    "Score: {:.4}  (1.0 = highly relevant, 0.0 = not relevant)",
+                    r.score
+                );
+            } else {
+                println!("No results.");
             }
+            Ok(())
         }
     }
 }
@@ -1206,6 +1198,12 @@ fn run_embedding(cmd: EmbeddingCommands, workspace: Option<&Path>) -> Result<()>
             gguf_url,
             hf_token,
         } => {
+            if cfg.provider != providers::ProviderKind::Local {
+                anyhow::bail!(
+                    "`sempkg embedding pull` only applies to `provider = \"local\"`. \
+                     Remote providers (openai, copilot) do not require model downloads."
+                );
+            }
             // `--model` selects a specific model (downloaded to its default
             // path); otherwise pull whatever the workspace is configured to use.
             let (selected, dest) = match model {
@@ -1254,6 +1252,12 @@ fn run_query_expansion(cmd: QueryExpansionCommands, workspace: Option<&Path>) ->
 
     match cmd {
         QueryExpansionCommands::Pull { gguf_url, hf_token } => {
+            if cfg.provider != providers::ProviderKind::Local {
+                anyhow::bail!(
+                    "`sempkg query-expansion pull` only applies to `provider = \"local\"`. \
+                     Remote providers (openai, copilot) do not require model downloads."
+                );
+            }
             println!("Pulling query-expansion GGUF model...");
             query_expansion::pull_model(&cfg, hf_token.as_deref(), gguf_url.as_deref())?;
             println!();
@@ -1265,36 +1269,28 @@ fn run_query_expansion(cmd: QueryExpansionCommands, workspace: Option<&Path>) ->
             Ok(())
         }
         QueryExpansionCommands::Test { query } => {
-            #[cfg(feature = "embeddings")]
-            {
-                if !query_expansion::model_is_present(&cfg) {
-                    anyhow::bail!("Model not found. Run `sempkg query-expansion pull` first.");
+            println!("Loading query-expansion model...");
+            let expander = providers::build_expander(&cfg).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Query expander not available. \
+                         For local models: run `sempkg query-expansion pull` or build with `--features embeddings`. \
+                         For remote: set `provider = \"openai\"` in [query_expansion] config."
+                    )
+                })?;
+            let variants = expander.expand(&query);
+            if variants.is_empty() {
+                println!("(no variants produced — falling back to the original query)");
+            } else {
+                println!("Original: {query}");
+                for v in &variants {
+                    let route = match v.kind {
+                        query_expansion::ExpansionKind::Lexical => "lex",
+                        query_expansion::ExpansionKind::Vector => "vec",
+                    };
+                    println!("  [{route}] {}", v.text);
                 }
-                println!("Loading query-expansion model...");
-                let expander = query_expansion::QueryExpander::load(&cfg)?;
-                let variants = expander.expand(&query);
-                if variants.is_empty() {
-                    println!("(no variants produced — falling back to the original query)");
-                } else {
-                    println!("Original: {query}");
-                    for v in &variants {
-                        let route = match v.kind {
-                            query_expansion::ExpansionKind::Lexical => "lex",
-                            query_expansion::ExpansionKind::Vector => "vec",
-                        };
-                        println!("  [{route}] {}", v.text);
-                    }
-                }
-                Ok(())
             }
-            #[cfg(not(feature = "embeddings"))]
-            {
-                let _ = query;
-                anyhow::bail!(
-                    "Query expansion is not compiled into this binary. \
-                     Rebuild with `cargo build --features embeddings`."
-                )
-            }
+            Ok(())
         }
     }
 }
@@ -1302,108 +1298,97 @@ fn run_query_expansion(cmd: QueryExpansionCommands, workspace: Option<&Path>) ->
 /// Run `sempkg embed`: generate vector embeddings for installed bundles and
 /// local packages so the MCP `query` tool can run semantic search.
 fn run_embed(package: Option<&str>, force: bool, workspace: Option<&Path>) -> Result<()> {
-    #[cfg(feature = "embeddings")]
-    {
-        let cfg = load_embedding_cfg(workspace);
-        if !embedding::model_is_present(&cfg) {
-            anyhow::bail!("Embedding model not found. Run `sempkg embedding pull` to download it.");
-        }
+    let cfg = load_embedding_cfg(workspace);
 
-        let selected_model = cfg.model()?;
-        println!(
-            "Loading embedding model ({})...",
-            selected_model.display_name()
-        );
-        let embedder = embedding::Embedder::load(&cfg)?;
-        let model_id = embedder.model_id();
-
-        // Collect (label, table_dir, table_name) targets.
-        let mut targets: Vec<(String, PathBuf, &'static str)> = Vec::new();
-
-        // Local registered packages (docs index only).
-        let reg = PackageRegistry::load()?;
-        for pkg in reg.list() {
-            if let Some(name) = package {
-                if pkg.name != name {
-                    continue;
-                }
-            }
-            let lance_dir = pkg.abs_path().join(".sempkg").join("lance");
-            if lance_dir.is_dir() {
-                targets.push((format!("{} (docs)", pkg.name), lance_dir, "docs"));
-            }
-        }
-
-        // Installed bundles (docs and/or code).
-        for bundle in list_all_bundles(workspace) {
-            if let Some(name) = package {
-                if bundle.name != name && format!("{}@{}", bundle.name, bundle.version) != name {
-                    continue;
-                }
-            }
-            if bundle.has_lance() {
-                targets.push((
-                    format!("{}@{} (docs)", bundle.name, bundle.version),
-                    bundle.bundle_dir.join("lance"),
-                    "docs",
-                ));
-            }
-            if bundle.has_code() {
-                targets.push((
-                    format!("{}@{} (code)", bundle.name, bundle.version),
-                    bundle.bundle_dir.join("code"),
-                    "code",
-                ));
-            }
-        }
-
-        if targets.is_empty() {
-            if let Some(name) = package {
-                anyhow::bail!("No indexed docs/code tables found for '{name}'.");
-            }
-            println!("No indexed docs/code tables found to embed.");
-            return Ok(());
-        }
-
-        let mut total_rows: u64 = 0;
-        for (label, dir, table) in &targets {
-            // Skip tables already embedded with this model unless --force.
-            if !force {
-                if let Some((existing_model, existing_dim)) = lance::read_embedding_info(dir) {
-                    if existing_model == model_id && existing_dim as usize == embedder.dim() {
-                        println!("  ✓ {label}: already embedded (skipping; use --force to redo)");
-                        continue;
-                    }
-                }
-            }
-
-            print!("  • {label}: embedding... ");
-            use std::io::Write;
-            let _ = std::io::stdout().flush();
-            match lance::embed_table(dir, table, &embedder, model_id) {
-                Ok(n) => {
-                    total_rows += n;
-                    println!("{n} rows");
-                }
-                Err(e) => println!("failed: {e}"),
-            }
-        }
-
-        println!();
-        println!(
-            "Done. Embedded {total_rows} rows across {} table(s).",
-            targets.len()
-        );
-        Ok(())
-    }
-    #[cfg(not(feature = "embeddings"))]
-    {
-        let _ = (package, force, workspace);
-        anyhow::bail!(
-            "The `embed` command requires embedding support. \
-             Rebuild with `cargo build --features embeddings`."
+    let embedder = providers::build_embedder(&cfg).ok_or_else(|| {
+        anyhow::anyhow!(
+            "Embedder not available. \
+             For local models: run `sempkg embedding pull` or build with `--features embeddings`. \
+             For remote: set `provider = \"openai\"` and configure `[embedding.openai]` in sempkg.toml."
         )
+    })?;
+
+    println!("Loading embedding model ({})...", embedder.model_id());
+
+    // Collect (label, table_dir, table_name) targets.
+    let mut targets: Vec<(String, PathBuf, &'static str)> = Vec::new();
+
+    // Local registered packages (docs index only).
+    let reg = PackageRegistry::load()?;
+    for pkg in reg.list() {
+        if let Some(name) = package {
+            if pkg.name != name {
+                continue;
+            }
+        }
+        let lance_dir = pkg.abs_path().join(".sempkg").join("lance");
+        if lance_dir.is_dir() {
+            targets.push((format!("{} (docs)", pkg.name), lance_dir, "docs"));
+        }
     }
+
+    // Installed bundles (docs and/or code).
+    for bundle in list_all_bundles(workspace) {
+        if let Some(name) = package {
+            if bundle.name != name && format!("{}@{}", bundle.name, bundle.version) != name {
+                continue;
+            }
+        }
+        if bundle.has_lance() {
+            targets.push((
+                format!("{}@{} (docs)", bundle.name, bundle.version),
+                bundle.bundle_dir.join("lance"),
+                "docs",
+            ));
+        }
+        if bundle.has_code() {
+            targets.push((
+                format!("{}@{} (code)", bundle.name, bundle.version),
+                bundle.bundle_dir.join("code"),
+                "code",
+            ));
+        }
+    }
+
+    if targets.is_empty() {
+        if let Some(name) = package {
+            anyhow::bail!("No indexed docs/code tables found for '{name}'.");
+        }
+        println!("No indexed docs/code tables found to embed.");
+        return Ok(());
+    }
+
+    let mut total_rows: u64 = 0;
+    for (label, dir, table) in &targets {
+        // Skip tables already embedded with this model unless --force.
+        if !force {
+            if let Some((existing_model, existing_dim)) = lance::read_embedding_info(dir) {
+                if existing_model == embedder.model_id() && existing_dim as usize == embedder.dim()
+                {
+                    println!("  ✓ {label}: already embedded (skipping; use --force to redo)");
+                    continue;
+                }
+            }
+        }
+
+        print!("  • {label}: embedding... ");
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        match lance::embed_table(dir, table, embedder.as_ref()) {
+            Ok(n) => {
+                total_rows += n;
+                println!("{n} rows");
+            }
+            Err(e) => println!("failed: {e}"),
+        }
+    }
+
+    println!();
+    println!(
+        "Done. Embedded {total_rows} rows across {} table(s).",
+        targets.len()
+    );
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
