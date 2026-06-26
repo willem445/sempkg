@@ -20,8 +20,8 @@ pub struct KeygenOptions {
 ///
 /// Returns (private_pem_path, public_pem_path).
 pub fn keygen(opts: KeygenOptions) -> Result<(PathBuf, PathBuf), KeygenError> {
-    use ed25519_dalek::pkcs8::EncodePrivateKey;
     use ed25519_dalek::pkcs8::spki::EncodePublicKey;
+    use ed25519_dalek::pkcs8::EncodePrivateKey;
     use rand::rngs::OsRng;
 
     let signing_key = ed25519_dalek::SigningKey::generate(&mut OsRng);

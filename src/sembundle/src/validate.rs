@@ -57,9 +57,7 @@ pub fn validate_lance_dir(dir: &Path) -> Result<(), PackError> {
     let has_table = std::fs::read_dir(dir)
         .map_err(|e| PackError::Io(e))?
         .filter_map(|e| e.ok())
-        .any(|e| {
-            e.file_name().to_string_lossy().ends_with(".lance") && e.path().is_dir()
-        });
+        .any(|e| e.file_name().to_string_lossy().ends_with(".lance") && e.path().is_dir());
 
     if !has_table {
         return Err(PackError::MissingDirectory("lance/*.lance".to_string()));
@@ -118,9 +116,7 @@ pub fn validate_code_dir(dir: &Path) -> Result<(), PackError> {
     let has_table = std::fs::read_dir(dir)
         .map_err(PackError::Io)?
         .filter_map(|e| e.ok())
-        .any(|e| {
-            e.file_name().to_string_lossy().ends_with(".lance") && e.path().is_dir()
-        });
+        .any(|e| e.file_name().to_string_lossy().ends_with(".lance") && e.path().is_dir());
 
     if !has_table {
         return Err(PackError::MissingDirectory("code/*.lance".to_string()));

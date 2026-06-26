@@ -175,11 +175,7 @@ pub fn pack(opts: PackOptions) -> Result<PathBuf, PackError> {
             header.set_mode(0o644);
             header.set_mtime(0); // deterministic mtime
             header.set_cksum();
-            builder.append_data(
-                &mut header,
-                &archive_path,
-                entry.content.as_slice(),
-            )?;
+            builder.append_data(&mut header, &archive_path, entry.content.as_slice())?;
         }
 
         let gz = builder.into_inner()?;
@@ -363,7 +359,11 @@ mod tests {
             "fts_enabled": true,
             "created_at": "1970-01-01T00:00:00Z"
         });
-        fs::write(dir.join("metadata.json"), serde_json::to_vec_pretty(&meta).unwrap()).unwrap();
+        fs::write(
+            dir.join("metadata.json"),
+            serde_json::to_vec_pretty(&meta).unwrap(),
+        )
+        .unwrap();
     }
 
     /// Extract all entries from a `.sembundle` file.
@@ -395,7 +395,10 @@ mod tests {
             }
         }
 
-        (manifest_bytes.expect("manifest.json not found in archive"), files)
+        (
+            manifest_bytes.expect("manifest.json not found in archive"),
+            files,
+        )
     }
 
     // ── Happy-path ───────────────────────────────────────────────────────────
@@ -518,7 +521,10 @@ mod tests {
         opts.name = "My SDK".to_string(); // uppercase + space
 
         let err = pack(opts).unwrap_err();
-        assert!(matches!(err, PackError::InvalidField { .. }), "unexpected: {err}");
+        assert!(
+            matches!(err, PackError::InvalidField { .. }),
+            "unexpected: {err}"
+        );
     }
 
     #[test]
@@ -530,7 +536,10 @@ mod tests {
         opts.commit_hash = "deadbeef".to_string();
 
         let err = pack(opts).unwrap_err();
-        assert!(matches!(err, PackError::InvalidField { .. }), "unexpected: {err}");
+        assert!(
+            matches!(err, PackError::InvalidField { .. }),
+            "unexpected: {err}"
+        );
     }
 
     // ── Checksum correctness ──────────────────────────────────────────────────
@@ -644,7 +653,10 @@ mod tests {
         pack(opts).unwrap();
 
         let (_, files) = extract_bundle(&output);
-        assert!(files.contains_key("lance/metadata.json"), "lance/metadata.json missing");
+        assert!(
+            files.contains_key("lance/metadata.json"),
+            "lance/metadata.json missing"
+        );
         assert!(
             files.keys().any(|k| k.starts_with("lance/docs.lance/")),
             "no lance/docs.lance/ files"
@@ -665,7 +677,10 @@ mod tests {
 
         let (manifest_bytes, _) = extract_bundle(&output);
         let m: Manifest = serde_json::from_slice(&manifest_bytes).unwrap();
-        assert!(m.extensions.iter().any(|e| e == "lance"), "\"lance\" not in extensions");
+        assert!(
+            m.extensions.iter().any(|e| e == "lance"),
+            "\"lance\" not in extensions"
+        );
     }
 
     #[test]
@@ -678,7 +693,10 @@ mod tests {
 
         let (manifest_bytes, _) = extract_bundle(&output);
         let m: Manifest = serde_json::from_slice(&manifest_bytes).unwrap();
-        assert!(!m.extensions.iter().any(|e| e == "lance"), "\"lance\" should not be in extensions");
+        assert!(
+            !m.extensions.iter().any(|e| e == "lance"),
+            "\"lance\" should not be in extensions"
+        );
     }
 
     #[test]

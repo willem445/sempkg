@@ -104,6 +104,24 @@ pub struct SymbolSource {
     pub end_line: u32,
 }
 
+/// A slice of documentation content for a single file, returned by
+/// [`fetch_doc_lines`]. It concatenates one or more stored doc chunks so an
+/// agent can read wider raw context than the truncated search snippet.
+#[derive(Debug)]
+pub struct DocSlice {
+    pub path: String,
+    pub content: String,
+    /// 1-based first line covered by the returned content (0 = unknown).
+    pub start_line: u32,
+    /// 1-based last line covered by the returned content (0 = unknown).
+    pub end_line: u32,
+    /// Number of stored chunks combined into `content`.
+    pub chunk_count: usize,
+    /// True when the docs table had no line-range columns (e.g. an older
+    /// bundle), so any requested line range could not be applied.
+    pub line_meta_missing: bool,
+}
+
 /// A lightweight description of a symbol candidate used when a name is ambiguous.
 #[derive(Debug, Clone)]
 pub struct SymbolCandidate {
@@ -433,7 +451,10 @@ pub fn embed_table(
         println!("    embedding {total_rows} rows...");
 
         // Validate content column exists in the first non-empty batch.
-        if batches.iter().any(|b| b.column_by_name("content").is_none()) {
+        if batches
+            .iter()
+            .any(|b| b.column_by_name("content").is_none())
+        {
             return Err(SempkgError::LanceError(format!(
                 "table `{table_name}` has no `content` column to embed"
             )));
@@ -894,6 +915,169 @@ fn fetch_at_location_lance_fallback(
     Ok(result)
 }
 
+/// Fetch raw documentation content for `file` from the docs LanceDB table,
+/// optionally restricted to the chunks overlapping a `[start_line, end_line]`
+/// range. This backs the `read_docs` MCP tool: an agent finds a relevant
+/// location with `search_docs`, then reads the surrounding raw content here
+/// without the snippet truncation applied by search.
+///
+/// Resolution notes:
+/// - Doc paths are stored either plain (`api.md`) by the local indexer or with
+///   a per-chunk suffix (`api.md#0`) by `sembundle`; both are matched.
+/// - When `start_line`/`end_line` are `None` the entire file is returned. When
+///   only one bound is given the other is treated as open-ended.
+/// - Chunks are returned in source order. When the table predates line
+///   metadata, the range is ignored and every chunk is returned with
+///   `line_meta_missing = true`.
+///
+/// Returns `Ok(None)` when no chunk matches `file` at all.
+pub fn fetch_doc_lines(
+    lance_dir: &Path,
+    file: &str,
+    start_line: Option<u32>,
+    end_line: Option<u32>,
+) -> crate::error::Result<Option<DocSlice>> {
+    if !lance_dir.is_dir() {
+        return Err(SempkgError::NoLanceIndex(
+            lance_dir.to_string_lossy().to_string(),
+        ));
+    }
+
+    let safe_file = file.replace('\'', "''");
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(SempkgError::Io)?;
+
+    let result = rt.block_on(async {
+        let db = lancedb::connect(lance_dir.to_str().unwrap_or("."))
+            .execute()
+            .await
+            .map_err(|e| SempkgError::LanceError(e.to_string()))?;
+
+        let tbl = db
+            .open_table("docs")
+            .execute()
+            .await
+            .map_err(|e| SempkgError::LanceError(e.to_string()))?;
+
+        // Match the file with or without a per-chunk `#N` suffix, and whether or
+        // not it is stored with a leading directory prefix.
+        let filter = format!(
+            "(path = '{safe_file}' OR path LIKE '{safe_file}#%' \
+             OR path LIKE '%/{safe_file}' OR path LIKE '%/{safe_file}#%')"
+        );
+
+        let batches: Vec<RecordBatch> = tbl
+            .query()
+            .only_if(filter)
+            .execute()
+            .await
+            .map_err(|e| SempkgError::LanceError(e.to_string()))?
+            .try_collect()
+            .await
+            .map_err(|e| SempkgError::LanceError(e.to_string()))?;
+
+        // (chunk_index, start_line, end_line, content) per matched row.
+        let mut rows: Vec<(u32, u32, u32, String)> = Vec::new();
+        let mut resolved_path: Option<String> = None;
+        let mut has_line_meta = false;
+
+        for batch in &batches {
+            let paths = batch
+                .column_by_name("path")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+            let contents = batch
+                .column_by_name("content")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+            let start_lines = batch
+                .column_by_name("start_line")
+                .and_then(|c| c.as_any().downcast_ref::<UInt32Array>());
+            let end_lines = batch
+                .column_by_name("end_line")
+                .and_then(|c| c.as_any().downcast_ref::<UInt32Array>());
+
+            if start_lines.is_some() {
+                has_line_meta = true;
+            }
+
+            if let (Some(p), Some(c)) = (paths, contents) {
+                for i in 0..batch.num_rows() {
+                    let raw_path = p.value(i);
+                    // The display path drops the `#N` chunk suffix.
+                    let (clean_path, chunk_idx) = match raw_path.split_once('#') {
+                        Some((f, idx)) => (f.to_string(), idx.parse::<u32>().unwrap_or(0)),
+                        None => (raw_path.to_string(), i as u32),
+                    };
+                    if resolved_path.is_none() {
+                        resolved_path = Some(clean_path);
+                    }
+                    rows.push((
+                        chunk_idx,
+                        start_lines.map_or(0, |a| a.value(i)),
+                        end_lines.map_or(0, |a| a.value(i)),
+                        c.value(i).to_string(),
+                    ));
+                }
+            }
+        }
+
+        if rows.is_empty() {
+            return Ok::<Option<DocSlice>, SempkgError>(None);
+        }
+
+        // Order chunks by source position: line number when available, else by
+        // the stored `#N` chunk index.
+        if has_line_meta {
+            rows.sort_by_key(|r| (r.1, r.0));
+        } else {
+            rows.sort_by_key(|r| r.0);
+        }
+
+        // Apply the line-range filter when line metadata is present and a bound
+        // was requested. Keep chunks whose range overlaps the request.
+        let range_requested = start_line.is_some() || end_line.is_some();
+        if has_line_meta && range_requested {
+            let lo = start_line.unwrap_or(0);
+            let hi = end_line.unwrap_or(u32::MAX);
+            rows.retain(|&(_, s, e, _)| {
+                // A zero line means "unknown"; never drop such a chunk.
+                (s == 0 && e == 0) || (e >= lo && s <= hi)
+            });
+        }
+
+        if rows.is_empty() {
+            return Ok(None);
+        }
+
+        let chunk_count = rows.len();
+        let covered_start = rows
+            .iter()
+            .map(|r| r.1)
+            .filter(|&s| s > 0)
+            .min()
+            .unwrap_or(0);
+        let covered_end = rows.iter().map(|r| r.2).max().unwrap_or(0);
+        let content = rows
+            .into_iter()
+            .map(|r| r.3)
+            .collect::<Vec<_>>()
+            .join("\n\n");
+
+        Ok(Some(DocSlice {
+            path: resolved_path.unwrap_or_else(|| file.to_string()),
+            content,
+            start_line: covered_start,
+            end_line: covered_end,
+            chunk_count,
+            line_meta_missing: !has_line_meta,
+        }))
+    })?;
+
+    Ok(result)
+}
+
 /// Format search results as Markdown.
 pub fn format_results(results: &[SearchResult], query: &str) -> String {
     if results.is_empty() {
@@ -1252,4 +1436,178 @@ fn chunk_text(text: &str, max_chars: usize) -> Vec<ChunkInfo> {
         });
     }
     chunks
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    /// Row spec for a synthetic docs table: (path, content, start_line, end_line).
+    type DocRow = (&'static str, &'static str, u32, u32);
+
+    /// Write a `docs` LanceDB table at `lance_dir`. When `with_lines` is false
+    /// the line-range columns are omitted, emulating an older bundle.
+    fn build_docs_table(lance_dir: &Path, rows: &[DocRow], with_lines: bool) {
+        std::fs::create_dir_all(lance_dir).unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let mut fields = vec![
+                Field::new("path", DataType::Utf8, false),
+                Field::new("content", DataType::Utf8, false),
+            ];
+            if with_lines {
+                fields.push(Field::new("start_line", DataType::UInt32, false));
+                fields.push(Field::new("end_line", DataType::UInt32, false));
+            }
+            let schema = Arc::new(Schema::new(fields));
+
+            let mut columns: Vec<Arc<dyn Array>> = vec![
+                Arc::new(StringArray::from(
+                    rows.iter().map(|r| r.0).collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(
+                    rows.iter().map(|r| r.1).collect::<Vec<_>>(),
+                )),
+            ];
+            if with_lines {
+                columns.push(Arc::new(UInt32Array::from(
+                    rows.iter().map(|r| r.2).collect::<Vec<_>>(),
+                )));
+                columns.push(Arc::new(UInt32Array::from(
+                    rows.iter().map(|r| r.3).collect::<Vec<_>>(),
+                )));
+            }
+
+            let batch = RecordBatch::try_new(schema, columns).unwrap();
+            let db = lancedb::connect(lance_dir.to_str().unwrap())
+                .execute()
+                .await
+                .unwrap();
+            let _ = db.drop_table("docs", &[]).await;
+            db.create_table("docs", vec![batch])
+                .execute()
+                .await
+                .unwrap();
+        });
+    }
+
+    #[test]
+    fn read_docs_whole_file_concatenates_chunks_in_order() {
+        let dir = tempdir().unwrap();
+        let lance_dir = dir.path();
+        // Two chunks of guide.md (stored with sembundle-style `#N` suffix) plus
+        // an unrelated file. Insert out of order to prove ordering by line.
+        build_docs_table(
+            lance_dir,
+            &[
+                ("other.md#0", "unrelated content", 1, 2),
+                ("guide.md#1", "second chunk body", 5, 7),
+                ("guide.md#0", "first chunk body", 1, 3),
+            ],
+            true,
+        );
+
+        let slice = fetch_doc_lines(lance_dir, "guide.md", None, None)
+            .unwrap()
+            .expect("guide.md should be found");
+
+        assert_eq!(slice.chunk_count, 2);
+        assert_eq!(slice.start_line, 1);
+        assert_eq!(slice.end_line, 7);
+        assert!(!slice.line_meta_missing);
+        // Ordered by line: first chunk precedes the second; no other.md leakage.
+        assert_eq!(slice.content, "first chunk body\n\nsecond chunk body");
+        assert!(!slice.content.contains("unrelated"));
+    }
+
+    #[test]
+    fn read_docs_line_range_keeps_only_overlapping_chunks() {
+        let dir = tempdir().unwrap();
+        let lance_dir = dir.path();
+        build_docs_table(
+            lance_dir,
+            &[
+                ("guide.md#0", "first chunk body", 1, 3),
+                ("guide.md#1", "second chunk body", 5, 7),
+            ],
+            true,
+        );
+
+        // Request lines 5-7 → only the second chunk overlaps.
+        let slice = fetch_doc_lines(lance_dir, "guide.md", Some(5), Some(7))
+            .unwrap()
+            .expect("guide.md should be found");
+        assert_eq!(slice.chunk_count, 1);
+        assert_eq!(slice.content, "second chunk body");
+        assert_eq!(slice.start_line, 5);
+
+        // An open-ended lower bound (lines 2..) overlaps both chunks.
+        let slice = fetch_doc_lines(lance_dir, "guide.md", Some(2), None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(slice.chunk_count, 2);
+    }
+
+    #[test]
+    fn read_docs_unknown_file_returns_none() {
+        let dir = tempdir().unwrap();
+        build_docs_table(dir.path(), &[("guide.md#0", "body", 1, 3)], true);
+        let slice = fetch_doc_lines(dir.path(), "missing.md", None, None).unwrap();
+        assert!(slice.is_none());
+    }
+
+    #[test]
+    fn read_docs_without_line_metadata_returns_all_chunks() {
+        let dir = tempdir().unwrap();
+        let lance_dir = dir.path();
+        // Older bundle: no line columns at all.
+        build_docs_table(
+            lance_dir,
+            &[("guide.md#0", "alpha", 0, 0), ("guide.md#1", "beta", 0, 0)],
+            false,
+        );
+
+        // Even with a requested range, the whole file comes back and the caller
+        // is told line metadata was unavailable.
+        let slice = fetch_doc_lines(lance_dir, "guide.md", Some(100), Some(200))
+            .unwrap()
+            .unwrap();
+        assert!(slice.line_meta_missing);
+        assert_eq!(slice.chunk_count, 2);
+        assert!(slice.content.contains("alpha") && slice.content.contains("beta"));
+    }
+
+    #[test]
+    fn read_docs_end_to_end_via_cli_update() {
+        // Exercises the real indexing path (cli_update writes line metadata) and
+        // the read_docs retrieval against it.
+        let project = tempdir().unwrap();
+        let docs_sub = project.path().join("docs");
+        std::fs::create_dir_all(&docs_sub).unwrap();
+        let md = "# Title\n\nAlpha paragraph about widgets.\n\nBeta paragraph about gadgets.\n";
+        std::fs::write(docs_sub.join("guide.md"), md).unwrap();
+
+        let lance_dir = cli_update(project.path(), "docs", "**/*.md").unwrap();
+
+        let slice = fetch_doc_lines(&lance_dir, "docs/guide.md", None, None)
+            .unwrap()
+            .expect("indexed doc should be found");
+        assert_eq!(slice.start_line, 1);
+        assert!(slice.end_line >= 5, "end_line was {}", slice.end_line);
+        assert!(!slice.line_meta_missing);
+        assert!(slice.content.contains("Alpha"));
+        assert!(slice.content.contains("Beta"));
+
+        assert!(fetch_doc_lines(&lance_dir, "nope.md", None, None)
+            .unwrap()
+            .is_none());
+    }
 }

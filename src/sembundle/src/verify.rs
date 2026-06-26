@@ -9,7 +9,9 @@ pub enum VerifyError {
     InvalidFormat(String),
     #[error("Key load error: {0}")]
     KeyLoad(String),
-    #[error("Signature verification FAILED — bundle may be tampered or signed with a different key")]
+    #[error(
+        "Signature verification FAILED — bundle may be tampered or signed with a different key"
+    )]
     VerificationFailed,
 }
 

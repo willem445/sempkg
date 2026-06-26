@@ -2283,7 +2283,13 @@ fn add_from_local(
         } else {
             source_dirs_override
                 .iter()
-                .map(|d| if d.is_absolute() { d.clone() } else { canonical.join(d) })
+                .map(|d| {
+                    if d.is_absolute() {
+                        d.clone()
+                    } else {
+                        canonical.join(d)
+                    }
+                })
                 .collect()
         },
         docs_dirs: if docs_dirs_override.is_empty() {
@@ -2291,7 +2297,13 @@ fn add_from_local(
         } else {
             docs_dirs_override
                 .iter()
-                .map(|d| if d.is_absolute() { d.clone() } else { canonical.join(d) })
+                .map(|d| {
+                    if d.is_absolute() {
+                        d.clone()
+                    } else {
+                        canonical.join(d)
+                    }
+                })
                 .collect()
         },
         docs_glob: None,
@@ -2299,7 +2311,13 @@ fn add_from_local(
         source_glob: source_glob.clone(),
         exclude_dirs: exclude_dirs
             .iter()
-            .map(|d| if d.is_absolute() { d.clone() } else { canonical.join(d) })
+            .map(|d| {
+                if d.is_absolute() {
+                    d.clone()
+                } else {
+                    canonical.join(d)
+                }
+            })
             .collect(),
     };
 

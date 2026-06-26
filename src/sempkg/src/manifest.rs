@@ -657,7 +657,9 @@ mod tests {
         assert!(saved.contains("gpu_layers = 4"));
 
         let loaded = load_manifest(dir.path()).expect("load manifest");
-        let expansion = loaded.query_expansion.expect("query_expansion section present");
+        let expansion = loaded
+            .query_expansion
+            .expect("query_expansion section present");
         assert!(expansion.enabled);
         assert_eq!(
             expansion.model.as_deref(),
@@ -729,4 +731,3 @@ mod tests {
         assert!(loaded.reranker.is_some());
     }
 }
-
