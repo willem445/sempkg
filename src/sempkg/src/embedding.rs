@@ -376,6 +376,10 @@ impl Embedder {
     pub fn embed_document(&self, _text: &str) -> Result<Vec<f32>> {
         anyhow::bail!("Embedding support is not compiled into this binary.")
     }
+
+    pub fn embed_documents_batch(&self, _texts: &[impl AsRef<str>]) -> Result<Vec<Vec<f32>>> {
+        anyhow::bail!("Embedding support is not compiled into this binary.")
+    }
 }
 
 // ---------------------------------------------------------------------------
