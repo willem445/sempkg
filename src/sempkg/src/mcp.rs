@@ -611,6 +611,22 @@ fn hit_candidate_text_with_body(h: &UnifiedHit, body: &str) -> String {
     }
 }
 
+/// Snap a byte index up to the next UTF-8 char boundary, clamped to `text.len()`.
+///
+/// `KWIC_WINDOW_CHARS` / `KWIC_STRIDE_CHARS` are byte offsets; adding them to a
+/// boundary can land inside a multi-byte char (e.g. a box-drawing `─`, 3 bytes).
+/// Slicing at such an index panics, so every computed offset must be snapped to
+/// a real boundary before it is used to index `text`.
+fn ceil_char_boundary(text: &str, mut idx: usize) -> usize {
+    if idx >= text.len() {
+        return text.len();
+    }
+    while !text.is_char_boundary(idx) {
+        idx += 1;
+    }
+    idx
+}
+
 /// Split `text` into overlapping KWIC windows of at most `KWIC_WINDOW_CHARS`
 /// characters with `KWIC_STRIDE_CHARS` stride (≈ 50 % overlap).
 ///
@@ -625,7 +641,8 @@ fn kwic_windows(text: &str) -> Vec<String> {
     let mut start = 0usize;
     loop {
         // Snap end forward to the next newline so windows never cut mid-line.
-        let raw_end = (start + KWIC_WINDOW_CHARS).min(text.len());
+        // `ceil_char_boundary` guards the slice against landing mid-codepoint.
+        let raw_end = ceil_char_boundary(text, start + KWIC_WINDOW_CHARS);
         let end = if raw_end == text.len() {
             text.len()
         } else {
@@ -640,8 +657,8 @@ fn kwic_windows(text: &str) -> Vec<String> {
             break;
         }
         // Advance stride, snapping forward to the next newline boundary.
-        let raw_next = start + KWIC_STRIDE_CHARS;
-        let next = if raw_next >= text.len() {
+        let raw_next = ceil_char_boundary(text, start + KWIC_STRIDE_CHARS);
+        let next = if raw_next == text.len() {
             text.len()
         } else {
             text[raw_next..]
@@ -3107,6 +3124,51 @@ mod tests {
             "LanceDB",
             Some("0.5.0")
         ));
+    }
+
+    // ── KWIC windowing ───────────────────────────────────────────────────
+
+    #[test]
+    fn kwic_windows_short_text_single_window() {
+        let text = "fn main() {}\n";
+        let windows = kwic_windows(text);
+        assert_eq!(windows, vec![text.to_string()]);
+    }
+
+    #[test]
+    fn kwic_windows_does_not_panic_on_multibyte_at_window_edge() {
+        // Regression for the panic at mcp.rs:633 — a 3-byte box-drawing char
+        // straddling the KWIC_WINDOW_CHARS byte offset made `text[raw_end..]`
+        // slice inside a codepoint and crash the MCP server.
+        //
+        // Place a multi-byte '─' (3 bytes) so that byte index KWIC_WINDOW_CHARS
+        // falls *inside* it, then pad past the window so the windowing loop runs.
+        let mut text = "a".repeat(KWIC_WINDOW_CHARS - 1);
+        text.push('─'); // occupies bytes [KWIC_WINDOW_CHARS-1 .. KWIC_WINDOW_CHARS+2)
+        text.push_str(&"b".repeat(KWIC_WINDOW_CHARS)); // pad beyond one window
+        assert!(
+            !text.is_char_boundary(KWIC_WINDOW_CHARS),
+            "test setup invalid"
+        );
+
+        // Must not panic; windows must reassemble into a prefix-covering set.
+        let windows = kwic_windows(&text);
+        assert!(!windows.is_empty());
+        assert!(text.starts_with(windows.first().unwrap().as_str()));
+    }
+
+    #[test]
+    fn kwic_windows_cover_input_with_newlines() {
+        let line = "let x = compute_value_for_index(i);\n";
+        let text = line.repeat(200); // well over KWIC_WINDOW_CHARS bytes
+        let windows = kwic_windows(&text);
+        assert!(
+            windows.len() > 1,
+            "long text should produce multiple windows"
+        );
+        // First window starts at the beginning; last reaches the end.
+        assert!(text.starts_with(windows.first().unwrap().as_str()));
+        assert!(text.ends_with(windows.last().unwrap().as_str()));
     }
 
     // ── Result combining ─────────────────────────────────────────────────
