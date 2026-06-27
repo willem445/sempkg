@@ -46,6 +46,20 @@ const KWIC_WINDOW_CHARS: usize = 1_500;
 /// one window).
 const KWIC_STRIDE_CHARS: usize = 750;
 
+/// Result-combining thresholds (see `combine_adjacent_hits`). Two ranked hits
+/// from the *same document* are merged into a single result when the number of
+/// lines *between* them is at most this many — i.e. they are contiguous or
+/// near-contiguous. Docs use a tighter gap than code because doc chunks abut
+/// directly, whereas adjacent functions are usually separated by a blank line
+/// or two.
+const DOC_MERGE_GAP_LINES: u32 = 2;
+const CODE_MERGE_GAP_LINES: u32 = 3;
+
+/// Hard cap on the combined-content length of a merged result, so a run of many
+/// large adjacent symbols cannot return an unbounded blob. Beyond this the
+/// content is truncated with a note pointing at `read_code` / `read_docs`.
+const MERGED_CONTENT_CHAR_CAP: usize = 12_000;
+
 // ---------------------------------------------------------------------------
 // JSON-RPC types
 // ---------------------------------------------------------------------------
@@ -494,6 +508,10 @@ struct UnifiedHit {
     /// reinforce original-found documents) and topical anchoring (a package's
     /// anchor strength is the original query's support for it).
     from_original: bool,
+    /// Number of adjacent same-document hits folded into this one by the
+    /// result-combining stage. `1` for an ordinary (un-merged) hit; `>1` when
+    /// this hit's `snippet` holds the combined content of a contiguous run.
+    merged_count: usize,
 }
 
 /// Retrieval counters for one `tool_query` run (original or expanded query).
@@ -702,7 +720,15 @@ fn format_unified_hit(h: &UnifiedHit, query: &str, rank: usize, score: Option<f3
         .map(|k| format!(" ({k})"))
         .unwrap_or_default();
 
-    let header = format!("### {rank}. `{label}`{kind_str}{score_str}");
+    // A combined result folds several adjacent same-document hits; flag it in
+    // the heading so the agent knows the body spans more than one fragment.
+    let merged_str = if h.merged_count > 1 {
+        format!(" · combined ×{}", h.merged_count)
+    } else {
+        String::new()
+    };
+
+    let header = format!("### {rank}. `{label}`{kind_str}{merged_str}{score_str}");
 
     // ── Metadata table ───────────────────────────────────────────────────
     let lines_str = if h.start_line > 0 && h.end_line > 0 {
@@ -713,13 +739,22 @@ fn format_unified_hit(h: &UnifiedHit, query: &str, rank: usize, score: Option<f3
         "—".to_string()
     };
 
+    let combined_row = if h.merged_count > 1 {
+        format!(
+            "\n| **Combined** | {} adjacent segments merged into this result |",
+            h.merged_count
+        )
+    } else {
+        String::new()
+    };
+
     let meta = format!(
         "| Field | Value |\n\
          |-------|-------|\n\
          | **Package** | `{package}` |\n\
          | **Origin** | {origin} |\n\
          | **Source** | `{path}` |\n\
-         | **Lines** | {lines} |",
+         | **Lines** | {lines} |{combined_row}",
         package = h.package,
         origin = h.origin,
         path = h.path,
@@ -818,6 +853,188 @@ fn scope_selects(scope: Option<&str>, name: &str, version: Option<&str>) -> bool
 /// (`src\adc.rs`) and lance paths (`src/adc.rs`) match.
 fn normalise_path(path: &str) -> String {
     path.replace('\\', "/").to_lowercase()
+}
+
+// ---------------------------------------------------------------------------
+// Result combining (fold adjacent same-document hits into one)
+// ---------------------------------------------------------------------------
+
+/// One input row for merge planning: identity + line span. Built in ranked
+/// order, so a row's index into the planning slice *is* its rank (0 = best).
+struct MergeItem {
+    /// Index into the `hits` vector this row refers to.
+    idx: usize,
+    package: String,
+    /// Normalised source path (the document/file identity).
+    path_key: String,
+    /// `true` for doc hits, `false` for code/codegraph — the two classes never
+    /// merge with each other and use different gap thresholds.
+    is_docs: bool,
+    start: u32,
+    end: u32,
+}
+
+/// A planned run of one-or-more adjacent hits to present as a single result.
+#[derive(Debug)]
+struct MergeRun {
+    /// Representative hit index (the best-ranked member of the run).
+    rep: usize,
+    /// All member hit indices, in ascending start-line order (content order).
+    members: Vec<usize>,
+    /// Rank of the representative within the input slice — used to order runs
+    /// so combining never reorders results relative to the reranker.
+    best_rank: usize,
+}
+
+/// Plan how to fold contiguous / near-contiguous same-document hits.
+///
+/// `items` MUST be in ranked order (best first); `items[i]` therefore has rank
+/// `i`. Hits whose line span is unknown (`start == 0` or `end == 0`) are never
+/// merged — they pass through as singleton runs. Two hits merge when they share
+/// a package + document + class and the number of lines *between* them is at
+/// most the class gap threshold (overlap counts as a gap of zero). Returns one
+/// run per emitted result, ordered by the representative's rank.
+fn plan_merge_runs(items: &[MergeItem]) -> Vec<MergeRun> {
+    // Group member positions by (package, path, class), first-seen order.
+    let mut group_order: Vec<(String, String, bool)> = Vec::new();
+    let mut groups: HashMap<(String, String, bool), Vec<usize>> = HashMap::new();
+    for (i, it) in items.iter().enumerate() {
+        let key = (it.package.clone(), it.path_key.clone(), it.is_docs);
+        if !groups.contains_key(&key) {
+            group_order.push(key.clone());
+        }
+        groups.entry(key).or_default().push(i);
+    }
+
+    let mut runs: Vec<MergeRun> = Vec::new();
+    for key in &group_order {
+        let is_docs = key.2;
+        let gap = if is_docs {
+            DOC_MERGE_GAP_LINES
+        } else {
+            CODE_MERGE_GAP_LINES
+        };
+
+        // Split members into those with a known line span (mergeable) and those
+        // without (always singletons).
+        let mut spanned: Vec<usize> = Vec::new();
+        for &p in &groups[key] {
+            if items[p].start > 0 && items[p].end > 0 {
+                spanned.push(p);
+            } else {
+                runs.push(MergeRun {
+                    rep: items[p].idx,
+                    members: vec![items[p].idx],
+                    best_rank: p,
+                });
+            }
+        }
+        // Order by start line (tie: end line) to detect contiguous runs.
+        spanned.sort_by(|&a, &b| {
+            items[a]
+                .start
+                .cmp(&items[b].start)
+                .then(items[a].end.cmp(&items[b].end))
+        });
+
+        let mut i = 0;
+        while i < spanned.len() {
+            let mut positions = vec![spanned[i]];
+            let mut run_max_end = items[spanned[i]].end;
+            let mut j = i + 1;
+            while j < spanned.len() {
+                let nxt = &items[spanned[j]];
+                // Lines strictly between the current run and the next member.
+                let interstitial = nxt.start.saturating_sub(run_max_end.saturating_add(1));
+                if nxt.start <= run_max_end || interstitial <= gap {
+                    positions.push(spanned[j]);
+                    run_max_end = run_max_end.max(nxt.end);
+                    j += 1;
+                } else {
+                    break;
+                }
+            }
+            let best_rank = *positions.iter().min().expect("non-empty run");
+            let members: Vec<usize> = positions.iter().map(|&p| items[p].idx).collect();
+            runs.push(MergeRun {
+                rep: items[best_rank].idx,
+                members,
+                best_rank,
+            });
+            i = j;
+        }
+    }
+
+    runs.sort_by_key(|r| r.best_rank);
+    runs
+}
+
+/// Rewrite the representative hit of a multi-member run to carry the combined
+/// content of the whole run over its full line span. Members are read in
+/// ascending start-line order; for code the fullest available body is used
+/// (`expanded_text` from small-to-big, else the snippet), for docs the chunk
+/// snippets are concatenated. Gaps between segments are marked, and the total
+/// is capped at `MERGED_CONTENT_CHAR_CAP`.
+fn materialize_merged_hit(hits: &mut [UnifiedHit], run: &MergeRun) {
+    let is_docs = hits[run.rep].origin == "docs";
+
+    // Collect (start, end, body) per member without holding a borrow across the
+    // later mutation of the representative.
+    let mut min_start = u32::MAX;
+    let mut max_end = 0u32;
+    let mut parts: Vec<(u32, u32, String)> = Vec::with_capacity(run.members.len());
+    for &m in &run.members {
+        let h = &hits[m];
+        min_start = min_start.min(h.start_line);
+        max_end = max_end.max(h.end_line);
+        let body = if !is_docs {
+            match h.expanded_text.as_deref().filter(|s| !s.is_empty()) {
+                Some(t) => t.to_string(),
+                None => h.snippet.clone(),
+            }
+        } else {
+            h.snippet.clone()
+        };
+        parts.push((h.start_line, h.end_line, body));
+    }
+
+    // Assemble in line order, marking any interstitial gap.
+    let mut content = String::new();
+    let mut prev_end: Option<u32> = None;
+    let mut truncated = false;
+    for (start, end, body) in &parts {
+        if let Some(pe) = prev_end {
+            let gap = start.saturating_sub(pe.saturating_add(1));
+            if gap > 0 {
+                content.push_str(&format!("\n\n… {gap} line(s) omitted …\n\n"));
+            } else if !content.ends_with('\n') {
+                content.push('\n');
+            }
+        }
+        content.push_str(body.trim_end());
+        prev_end = Some(*end);
+        if content.len() >= MERGED_CONTENT_CHAR_CAP {
+            truncated = true;
+            break;
+        }
+    }
+    if truncated {
+        content.truncate(MERGED_CONTENT_CHAR_CAP);
+        content.push_str("\n… (truncated — use read_code / read_docs for the full range)");
+    }
+
+    let count = run.members.len();
+    let h = &mut hits[run.rep];
+    h.start_line = min_start;
+    h.end_line = max_end;
+    h.snippet = content;
+    // Show the combined snippet verbatim: clear the KWIC-window display state so
+    // `format_unified_hit` falls through to the plain-snippet tier.
+    h.best_window = None;
+    h.best_window_first = false;
+    h.kwic_count = 0;
+    h.expanded_text = None;
+    h.merged_count = count;
 }
 
 /// Build the dedup key for a `UnifiedHit`.
@@ -1412,6 +1629,60 @@ impl McpContext {
         }
     }
 
+    /// Fold contiguous / near-contiguous same-document hits in the ranked
+    /// result list into single combined results.
+    ///
+    /// Retrieval frequently surfaces several high-scoring fragments of the *same*
+    /// region — adjacent doc chunks of one section, or neighbouring functions in
+    /// one file — because they are all semantically close to the query. Returning
+    /// them as separate results wastes the agent's attention on near-duplicates.
+    /// This stage detects runs of same-document hits whose line spans are
+    /// contiguous (or within a small gap) and merges each run into one result
+    /// that carries the combined content over the full line span, ranked at the
+    /// position of its best-scoring member.
+    ///
+    /// Operates on the floor-filtered ranked list *before* the `limit` cut, so a
+    /// run split across the cut is still folded and the agent gets up to `limit`
+    /// distinct results. Returns the rewritten ranked list (one entry per run).
+    fn combine_adjacent_hits(
+        &self,
+        hits: &mut [UnifiedHit],
+        ranked: Vec<(usize, f32)>,
+    ) -> Vec<(usize, f32)> {
+        if std::env::var("SEMPKG_NO_COMBINE").is_ok() || ranked.len() < 2 {
+            return ranked;
+        }
+
+        let items: Vec<MergeItem> = ranked
+            .iter()
+            .map(|&(idx, _)| MergeItem {
+                idx,
+                package: hits[idx].package.clone(),
+                path_key: normalise_path(&hits[idx].path),
+                is_docs: hits[idx].origin == "docs",
+                start: hits[idx].start_line,
+                end: hits[idx].end_line,
+            })
+            .collect();
+        let score_of: HashMap<usize, f32> = ranked.iter().copied().collect();
+
+        let runs = plan_merge_runs(&items);
+
+        runs.into_iter()
+            .map(|run| {
+                let max_score = run
+                    .members
+                    .iter()
+                    .map(|i| score_of.get(i).copied().unwrap_or(0.0))
+                    .fold(f32::NEG_INFINITY, f32::max);
+                if run.members.len() > 1 {
+                    materialize_merged_hit(hits, &run);
+                }
+                (run.rep, max_score)
+            })
+            .collect()
+    }
+
     /// Unified cross-package search: queries code, docs, and codegraph across
     /// all installed bundles and local packages, then reranks everything together.
     /// Retrieve BM25 (+ optional vector) hits for a single (possibly expanded)
@@ -1478,6 +1749,7 @@ impl McpContext {
                     best_window_first: false,
                     kwic_count: 0,
                     from_original: is_original,
+                    merged_count: 1,
                 });
             }
         };
@@ -1534,6 +1806,7 @@ impl McpContext {
                         best_window_first: false,
                         kwic_count: 0,
                         from_original: is_original,
+                        merged_count: 1,
                     });
                 }
                 arr.len()
@@ -2115,12 +2388,14 @@ impl McpContext {
                 // pass-1 order, appended after the expanded set.  This backfills
                 // the output if expanded hits are later dropped by the floor.
                 final_scored.extend(p1_scored.iter().skip(pass2_budget).copied());
-                final_scored.into_iter().take(limit).collect()
+                // NB: not truncated to `limit` here — the combiner stage below
+                // folds adjacent same-document hits first, so a run straddling
+                // the cut is still merged before the final `limit` is applied.
+                final_scored
             } else {
-                // No reranker — return top N from the diversity-selected pool, scored by RRF.
+                // No reranker — rank the whole diversity-selected pool by RRF.
                 pool_indices
                     .iter()
-                    .take(limit)
                     .map(|&i| (i, hits[i].rrf_score))
                     .collect()
             }
@@ -2129,7 +2404,7 @@ impl McpContext {
         // ── Relevance floor ──────────────────────────────────────────────
         // Drop results the reranker considers irrelevant.  Only applied when
         // the reranker ran; RRF scores are not a relevance signal.
-        let scored: Vec<(usize, f32)> = if reranker_was_active {
+        let ranked: Vec<(usize, f32)> = if reranker_was_active {
             scored
                 .into_iter()
                 .filter(|&(_, s)| s >= RERANKER_SCORE_FLOOR)
@@ -2138,7 +2413,7 @@ impl McpContext {
             scored
         };
 
-        if scored.is_empty() {
+        if ranked.is_empty() {
             return if reranker_was_active {
                 format!(
                     "No relevant results for: `{query}`\n\n\
@@ -2149,6 +2424,20 @@ impl McpContext {
             } else {
                 format!("No results for: `{query}`.")
             };
+        }
+
+        // ── Combine adjacent same-document hits ──────────────────────────
+        // Fold contiguous / near-contiguous fragments of one document (adjacent
+        // doc chunks, neighbouring functions) into a single result, then cut to
+        // the requested `limit`.
+        let mut scored = self.combine_adjacent_hits(&mut hits, ranked);
+        scored.truncate(limit);
+        if debug {
+            eprintln!(
+                "sempkg: query combiner — results_after_combine={} (limit={})",
+                scored.len(),
+                limit
+            );
         }
 
         // ── Format ───────────────────────────────────────────────────────
@@ -2771,5 +3060,96 @@ mod tests {
             "LanceDB",
             Some("0.5.0")
         ));
+    }
+
+    // ── Result combining ─────────────────────────────────────────────────
+
+    fn item(idx: usize, pkg: &str, path: &str, is_docs: bool, start: u32, end: u32) -> MergeItem {
+        MergeItem {
+            idx,
+            package: pkg.to_string(),
+            path_key: normalise_path(path),
+            is_docs,
+            start,
+            end,
+        }
+    }
+
+    #[test]
+    fn merges_contiguous_doc_chunks_in_same_file() {
+        // Three abutting chunks of one doc + one unrelated hit elsewhere.
+        let items = vec![
+            item(10, "pkg", "guide.md", true, 1, 20),
+            item(11, "pkg", "guide.md", true, 21, 40),
+            item(12, "pkg", "guide.md", true, 41, 60),
+            item(13, "pkg", "other.md", true, 5, 9),
+        ];
+        let runs = plan_merge_runs(&items);
+        assert_eq!(runs.len(), 2, "one merged run + one singleton: {runs:?}");
+        let merged = &runs[0];
+        assert_eq!(merged.rep, 10, "best-ranked member represents the run");
+        assert_eq!(merged.members, vec![10, 11, 12]);
+        assert_eq!(merged.best_rank, 0);
+        assert_eq!(runs[1].members, vec![13]);
+    }
+
+    #[test]
+    fn near_contiguous_within_gap_merges_but_far_apart_does_not() {
+        // Functions 1-10 and 13-20 are 2 lines apart (≤ CODE gap of 3) → merge.
+        // 13-20 and 200-210 are far apart → separate.
+        let items = vec![
+            item(1, "pkg@1", "src/a.rs", false, 1, 10),
+            item(2, "pkg@1", "src/a.rs", false, 13, 20),
+            item(3, "pkg@1", "src/a.rs", false, 200, 210),
+        ];
+        let runs = plan_merge_runs(&items);
+        assert_eq!(runs.len(), 2, "{runs:?}");
+        assert_eq!(runs[0].members, vec![1, 2]);
+        assert_eq!(runs[1].members, vec![3]);
+    }
+
+    #[test]
+    fn docs_and_code_never_merge_even_in_same_path() {
+        let items = vec![
+            item(1, "pkg", "x", false, 1, 10),
+            item(2, "pkg", "x", true, 11, 20),
+        ];
+        let runs = plan_merge_runs(&items);
+        assert_eq!(runs.len(), 2, "different classes stay separate: {runs:?}");
+    }
+
+    #[test]
+    fn unknown_line_spans_are_never_merged() {
+        let items = vec![
+            item(1, "pkg", "f", false, 0, 0),
+            item(2, "pkg", "f", false, 0, 0),
+        ];
+        let runs = plan_merge_runs(&items);
+        assert_eq!(runs.len(), 2, "zero-span hits pass through as singletons");
+    }
+
+    #[test]
+    fn representative_is_best_ranked_regardless_of_line_order() {
+        // The higher-ranked hit (rank 0) is physically *after* the lower-ranked
+        // one; the representative must still be the best-ranked (idx 1, rank 0).
+        let items = vec![
+            item(1, "pkg", "f.rs", false, 30, 40), // rank 0, best
+            item(2, "pkg", "f.rs", false, 18, 29), // rank 1, immediately precedes
+        ];
+        let runs = plan_merge_runs(&items);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].rep, 1, "best-ranked member represents");
+        assert_eq!(runs[0].members, vec![2, 1], "members in line order");
+        assert_eq!(runs[0].best_rank, 0);
+    }
+
+    #[test]
+    fn distinct_packages_do_not_merge() {
+        let items = vec![
+            item(1, "pkg-a", "f.rs", false, 1, 10),
+            item(2, "pkg-b", "f.rs", false, 11, 20),
+        ];
+        let runs = plan_merge_runs(&items);
+        assert_eq!(runs.len(), 2);
     }
 }
