@@ -74,10 +74,20 @@ class McpClient:
     the request-response tools exposed by ``sempkg mcp``.
     """
 
-    def __init__(self, proc: subprocess.Popen, timeout: float = 30.0) -> None:
+    def __init__(
+        self,
+        proc: subprocess.Popen,
+        timeout: float = 30.0,
+        stderr_path: Path | None = None,
+    ) -> None:
         self._proc = proc
         self._timeout = timeout
         self._id = 0
+        # File the server's stderr is redirected to.  Captured (instead of
+        # discarded) so a server panic — which exits the process and would
+        # otherwise surface only as an opaque BrokenPipe to later tests — can
+        # be reported with its actual Rust panic message.
+        self._stderr_path = stderr_path
 
     # ------------------------------------------------------------------
     # Core transport
@@ -87,6 +97,30 @@ class McpClient:
         self._id += 1
         return self._id
 
+    def _read_stderr_tail(self, max_chars: int = 4000) -> str:
+        """Return the tail of the server's captured stderr, if available."""
+        if self._stderr_path is None:
+            return ""
+        try:
+            text = self._stderr_path.read_text(errors="replace")
+        except OSError:
+            return ""
+        text = text.strip()
+        if not text:
+            return ""
+        if len(text) > max_chars:
+            text = "…(truncated)…\n" + text[-max_chars:]
+        return text
+
+    def _server_died(self, context: str) -> RuntimeError:
+        """Build a RuntimeError describing a dead server, including stderr."""
+        rc = self._proc.poll()
+        stderr = self._read_stderr_tail()
+        msg = f"MCP server {context} (exit code {rc})"
+        if stderr:
+            msg += f"\n--- server stderr ---\n{stderr}"
+        return RuntimeError(msg)
+
     def send(self, method: str, params: dict | None = None) -> dict:
         """Send one JSON-RPC request and return the parsed response object."""
         msg = {
@@ -95,17 +129,23 @@ class McpClient:
             "method": method,
             "params": params or {},
         }
+        # If the server has already crashed (e.g. a panic on a previous call),
+        # surface its stderr immediately rather than letting the write raise a
+        # bare BrokenPipeError that hides the real cause.
+        if self._proc.poll() is not None:
+            raise self._server_died("is not running")
+
         assert self._proc.stdin is not None, "stdin closed"
-        self._proc.stdin.write(json.dumps(msg) + "\n")
-        self._proc.stdin.flush()
+        try:
+            self._proc.stdin.write(json.dumps(msg) + "\n")
+            self._proc.stdin.flush()
+        except BrokenPipeError:
+            raise self._server_died("closed stdin unexpectedly") from None
 
         assert self._proc.stdout is not None, "stdout closed"
         line = self._proc.stdout.readline()
         if not line:
-            rc = self._proc.poll()
-            raise RuntimeError(
-                f"MCP server closed stdout unexpectedly (exit code {rc})"
-            )
+            raise self._server_died("closed stdout unexpectedly")
         return json.loads(line)
 
     # ------------------------------------------------------------------
@@ -140,7 +180,12 @@ class McpClient:
 
     def close(self) -> None:
         if self._proc.stdin:
-            self._proc.stdin.close()
+            try:
+                self._proc.stdin.close()
+            except BrokenPipeError:
+                # Server already exited (e.g. panicked mid-session); flushing
+                # buffered stdin bytes into the dead pipe is expected to fail.
+                pass
         try:
             self._proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
@@ -192,31 +237,40 @@ def workspace_dir() -> Path:
 
 
 @pytest.fixture(scope="session")
-def mcp_client(sempkg_bin: str, workspace_dir: Path) -> Generator[McpClient, None, None]:
+def mcp_client(
+    sempkg_bin: str, workspace_dir: Path, tmp_path_factory: pytest.TempPathFactory
+) -> Generator[McpClient, None, None]:
     """Start a sempkg MCP server session and perform the JSON-RPC handshake.
 
     The session is shared across all tests in the session for speed.
+
+    The server's stderr is captured to a temp file rather than discarded so a
+    server-side panic (which exits the process and would otherwise surface only
+    as an opaque BrokenPipe to subsequent tests) is reported with its actual
+    panic message.
     """
-    proc = subprocess.Popen(
-        [sempkg_bin, "mcp", "--workspace", str(workspace_dir)],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        text=True,
-        bufsize=1,
-    )
-    client = McpClient(proc)
-    resp = client.send(
-        "initialize",
-        {
-            "protocolVersion": "2024-11-05",
-            "capabilities": {},
-            "clientInfo": {"name": "pytest-functional", "version": "0"},
-        },
-    )
-    assert "result" in resp, f"MCP initialize failed: {resp}"
-    yield client
-    client.close()
+    stderr_path = tmp_path_factory.mktemp("mcp") / "server-stderr.log"
+    with open(stderr_path, "w") as stderr_file:
+        proc = subprocess.Popen(
+            [sempkg_bin, "mcp", "--workspace", str(workspace_dir)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=stderr_file,
+            text=True,
+            bufsize=1,
+        )
+        client = McpClient(proc, stderr_path=stderr_path)
+        resp = client.send(
+            "initialize",
+            {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "pytest-functional", "version": "0"},
+            },
+        )
+        assert "result" in resp, f"MCP initialize failed: {resp}"
+        yield client
+        client.close()
 
 
 # ---------------------------------------------------------------------------
