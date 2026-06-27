@@ -28,11 +28,14 @@ Add an optional **hybrid retrieval** stage in front of the existing reranker:
    rewrites the query into typed sub-queries. `lex:` variants route to BM25;
    `vec:`/`hyde:` variants route to vector search. The original query always
    runs against **both** backends with double RRF weight.
-2. **Vector search** — document/code chunks are embedded with
-   `Qwen3-Embedding-0.6B` (1024-dim, L2-normalized) and stored in a `vector`
-   `FixedSizeList<Float32>` column added to the existing LanceDB tables. Queries
-   are embedded with the same model (Qwen3 instruct prefix) and searched via
-   LanceDB cosine kNN.
+2. **Vector search** — document/code chunks are embedded (L2-normalized) and
+   stored in a `vector` `FixedSizeList<Float32>` column added to the existing
+   LanceDB tables, then searched via LanceDB cosine kNN. The embedder is
+   pluggable (`model_id` in `[embedding]`): **EmbeddingGemma-300M** (default,
+   768-dim, mean pooling, `task:`/`title:` prompts) or **Qwen3-Embedding-0.6B**
+   (1024-dim, last-token pooling, instruct prefix). The model id + dimension are
+   stamped into each table's metadata so a query is only vector-searched against
+   tables embedded with the same model.
 3. **RRF fusion** — every (run × backend × source) hit contributes
    `weight / (60 + rank)`; duplicates are summed so multi-signal agreement
    boosts ranking. The fused pool then flows into the unchanged diversity →
@@ -66,3 +69,40 @@ independent of the existing `reranker` feature (they can be enabled together).
 - **New commands:** `sempkg embed`, `sempkg embedding pull|status`, and
   `sempkg query-expansion pull|status|test`; new `[embedding]` and
   `[query_expansion]` sections in `sempkg.toml`.
+
+---
+
+## Addendum (2026-06-26): Expansion-quality guards
+
+The initial rollout exposed a regression: the expansion model sometimes emits
+**generic query-reformulation clichés** ("best practices for …", "recommended
+approaches") instead of domain paraphrases. Routed at weight 1.0, those variants
+match boilerplate in *every* package and — because cross-package RRF has no
+notion of topical relevance and the diversity cap guarantees slots to every
+package — flood the candidate pool, crowding the one on-topic hit out before it
+ever reaches the reranker. A query that the original-only path answered returned
+empty once expansion was enabled.
+
+Four compounding guards were added; all are on by default and degrade safely:
+
+1. **Output guard (`parse_variants`)** — a variant is rejected when it is too
+   short, ends in a dangling preposition/article ("… for", "… with"), or shares
+   no content token with the original query. This drops content-free filler at
+   the source while keeping genuine domain paraphrases.
+2. **Additive-only fusion (`additive_only`, default `true`)** — expansion
+   variants may only **reinforce** documents the original query already
+   retrieved; a document found *solely* by an expansion variant is dropped
+   before pool selection. When disabled, expansion-introduced documents are
+   admitted but capped at `max_expansion_pool_fraction` of the pool, so they can
+   never dominate.
+3. **Prompt tuning** — the expansion prompt now carries a system instruction
+   that requires each variant to reuse the query's domain terms and explicitly
+   bans generic filler.
+4. **Topical anchoring (`topical_anchoring`, default `true`)** — during fusion
+   each package's anchor strength is the original query's summed RRF support for
+   it; hits in weakly/un-anchored packages are scaled toward `anchor_floor`, so
+   a bare lexical match in an unrelated package cannot outrank an on-topic
+   semantic match. Engaged only when expansion actually ran.
+
+New `[query_expansion]` keys: `additive_only`, `max_expansion_pool_fraction`,
+`topical_anchoring`, `anchor_floor`.

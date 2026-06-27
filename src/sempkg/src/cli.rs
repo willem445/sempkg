@@ -474,12 +474,17 @@ pub enum RerankerCommands {
 
 #[derive(Subcommand)]
 pub enum EmbeddingCommands {
-    /// Download the Qwen3-Embedding-0.6B GGUF model to ~/.sempkg/models/
-    /// (or the path configured in [embedding] in sempkg.toml).
+    /// Download an embedding GGUF model to ~/.sempkg/models/.
     ///
-    /// The default source (Qwen/Qwen3-Embedding-0.6B-GGUF on HuggingFace) is
-    /// public and does not require authentication.
+    /// With no `--model`, pulls the model configured in [embedding] in
+    /// sempkg.toml (default: embeddinggemma-300m). Both default sources are
+    /// public GGUF repos on HuggingFace and do not require authentication.
     Pull {
+        /// Which model to download: `embeddinggemma-300m` (default) or
+        /// `qwen3-embedding-0.6b`. Defaults to the configured model.
+        #[arg(long)]
+        model: Option<String>,
+
         /// Override the GGUF download URL.
         #[arg(long)]
         gguf_url: Option<String>,

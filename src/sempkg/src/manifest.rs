@@ -589,6 +589,7 @@ mod tests {
         );
         manifest.embedding = Some(crate::embedding::EmbeddingConfig {
             enabled: true,
+            model_id: "qwen3-embedding-0.6b".to_string(),
             model: Some("~/.sempkg/models/custom-embedding.gguf".to_string()),
             n_ctx: 1024,
             gpu_layers: 2,
@@ -644,6 +645,7 @@ mod tests {
             n_ctx: 4096,
             gpu_layers: 4,
             temperature: 0.5,
+            ..Default::default()
         });
 
         save_manifest(&manifest, dir.path()).expect("save manifest");
@@ -697,6 +699,7 @@ mod tests {
         );
         manifest.embedding = Some(crate::embedding::EmbeddingConfig {
             enabled: true,
+            model_id: "embeddinggemma-300m".to_string(),
             model: None,
             n_ctx: 2048,
             gpu_layers: 0,
@@ -709,6 +712,7 @@ mod tests {
             n_ctx: 2048,
             gpu_layers: 0,
             temperature: 0.7,
+            ..Default::default()
         });
         manifest.reranker = Some(crate::reranker::RerankerConfig {
             enabled: true,

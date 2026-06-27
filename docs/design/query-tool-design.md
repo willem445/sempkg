@@ -317,7 +317,41 @@ exists.
 
 ---
 
-## 9. Output Format — Tiered Display Snippet
+## 9. Result Combining
+
+Semantic retrieval frequently returns several high-scoring fragments of the **same region** of a
+document: adjacent chunks of one doc section, or neighbouring functions in one file, all score
+highly because they are all close to the query.  Returned separately they read as near-duplicates
+and waste the agent's attention.
+
+After the relevance floor — and **before** the `limit` cut — a combining pass folds runs of
+same-document hits into a single result:
+
+1. **Group** the floor-filtered ranked list by `(package, normalise(path), class)`, where *class*
+   is docs vs. code (code and codegraph share a class; docs never merge with code).
+2. **Detect runs** within each group: members are sorted by start line and split into runs where
+   the number of lines *between* consecutive members is at most the class gap threshold
+   (`DOC_MERGE_GAP_LINES = 2`, `CODE_MERGE_GAP_LINES = 3`; overlap counts as a zero gap).  Hits
+   with an unknown line span (`start == 0` or `end == 0`) are never merged.
+3. **Materialise** each multi-member run into its best-ranked member (the *representative*): the
+   line span becomes `[min start, max end]`, and the content is the members' bodies concatenated
+   in line order — the fullest available body for code (`expanded_text` from small-to-big, else
+   the snippet), the chunk snippets for docs.  Overlap is de-duplicated by line number against the
+   running end line: a member fully contained in what's already emitted is dropped, a partially
+   overlapping one (common when a nested symbol precedes its enclosing function, or two chunks
+   share a boundary line) is clipped to the lines *past* the running end, and a disjoint one is
+   appended whole with the interstitial gap marked.  The combined content is capped at
+   `MERGED_CONTENT_CHAR_CAP = 12 000` chars (on a UTF-8 boundary).
+
+A run is ranked at the position of its representative, so combining never reorders results.
+Because it runs before the `limit` cut, a run split across that boundary is still folded and the
+agent still receives up to `limit` distinct results.  The representative is flagged with
+`merged_count > 1`, surfaced in the heading (`· combined ×N`) and a **Combined** metadata row.
+Set `SEMPKG_NO_COMBINE` to disable the stage for debugging.
+
+---
+
+## 10. Output Format — Tiered Display Snippet
 
 Instead of always showing the same truncated 600-char snippet, the display adapts to **where the
 query lexically matched** — not to how large the body happens to be:
@@ -348,7 +382,7 @@ Agents that need the full body after seeing a KWIC window can call `read_code` i
 
 ---
 
-## 10. Pipeline Summary
+## 11. Pipeline Summary
 
 ```
 query string
@@ -389,6 +423,12 @@ query string
                                         │
                               relevance floor 0.10 (reranker mode only)
                                         │
+                              combine adjacent same-document hits
+                              runs within DOC/CODE_MERGE_GAP_LINES
+                              → one result over the full line span
+                                        │
+                              truncate to `limit`
+                                        │
                               tiered display snippet
                               sig-only / KWIC window / raw snippet
                               +N more lines → read_code affordance
@@ -396,7 +436,7 @@ query string
 
 ---
 
-## 11. Future Directions
+## 12. Future Directions
 
 The query tool is designed to be a stable insertion point for improved retrieval.  Planned
 enhancements (tracked in the roadmap):

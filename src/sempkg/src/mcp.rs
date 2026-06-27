@@ -46,6 +46,20 @@ const KWIC_WINDOW_CHARS: usize = 1_500;
 /// one window).
 const KWIC_STRIDE_CHARS: usize = 750;
 
+/// Result-combining thresholds (see `combine_adjacent_hits`). Two ranked hits
+/// from the *same document* are merged into a single result when the number of
+/// lines *between* them is at most this many — i.e. they are contiguous or
+/// near-contiguous. Docs use a tighter gap than code because doc chunks abut
+/// directly, whereas adjacent functions are usually separated by a blank line
+/// or two.
+const DOC_MERGE_GAP_LINES: u32 = 2;
+const CODE_MERGE_GAP_LINES: u32 = 3;
+
+/// Hard cap on the combined-content length of a merged result, so a run of many
+/// large adjacent symbols cannot return an unbounded blob. Beyond this the
+/// content is truncated with a note pointing at `read_code` / `read_docs`.
+const MERGED_CONTENT_CHAR_CAP: usize = 12_000;
+
 // ---------------------------------------------------------------------------
 // JSON-RPC types
 // ---------------------------------------------------------------------------
@@ -291,11 +305,15 @@ fn all_tools() -> Value {
              all candidates together with the local reranker (when available). \
              Returns rich markdown with package provenance, relevance score, source file, \
              line range, and a source snippet for each hit. \
+             Optionally restrict the search to a single package with `package` when you \
+             already know where to look — this focuses the whole retrieval+reranking pipeline \
+             on that package for a deeper, less diluted search. \
              Use the other MCP tools (read_code, read_symbol, search_symbols, …) to drill \
              into specific results.",
             json!({
-                "query": { "type": "string", "description": "Natural-language or keyword search query" },
-                "limit": { "type": "integer", "description": "Max results to return after reranking (default 10)" }
+                "query":   { "type": "string", "description": "Natural-language or keyword search query" },
+                "package": { "type": "string", "description": "Optional. Restrict the search to a single package or bundle, by name (e.g. 'lancedb') or exact 'name@version'. Omit to search every installed package. Use list_packages to see available names." },
+                "limit":   { "type": "integer", "description": "Max results to return after reranking (default 10)" }
             }),
             &["query"]
         ),
@@ -484,6 +502,16 @@ struct UnifiedHit {
     /// Total number of KWIC windows the body was split into during pass-2.
     /// 0 = not windowed; 1 = body fits in a single window; >1 = multi-window.
     kwic_count: usize,
+    /// `true` when this hit was retrieved by the original (un-expanded) query
+    /// on at least one run. Set per-run during collection and OR-ed across
+    /// runs during dedup. Drives the additive-only guard (expansion may only
+    /// reinforce original-found documents) and topical anchoring (a package's
+    /// anchor strength is the original query's support for it).
+    from_original: bool,
+    /// Number of adjacent same-document hits folded into this one by the
+    /// result-combining stage. `1` for an ordinary (un-merged) hit; `>1` when
+    /// this hit's `snippet` holds the combined content of a contiguous run.
+    merged_count: usize,
 }
 
 /// Retrieval counters for one `tool_query` run (original or expanded query).
@@ -583,6 +611,22 @@ fn hit_candidate_text_with_body(h: &UnifiedHit, body: &str) -> String {
     }
 }
 
+/// Snap a byte index up to the next UTF-8 char boundary, clamped to `text.len()`.
+///
+/// `KWIC_WINDOW_CHARS` / `KWIC_STRIDE_CHARS` are byte offsets; adding them to a
+/// boundary can land inside a multi-byte char (e.g. a box-drawing `─`, 3 bytes).
+/// Slicing at such an index panics, so every computed offset must be snapped to
+/// a real boundary before it is used to index `text`.
+fn ceil_char_boundary(text: &str, mut idx: usize) -> usize {
+    if idx >= text.len() {
+        return text.len();
+    }
+    while !text.is_char_boundary(idx) {
+        idx += 1;
+    }
+    idx
+}
+
 /// Split `text` into overlapping KWIC windows of at most `KWIC_WINDOW_CHARS`
 /// characters with `KWIC_STRIDE_CHARS` stride (≈ 50 % overlap).
 ///
@@ -597,7 +641,8 @@ fn kwic_windows(text: &str) -> Vec<String> {
     let mut start = 0usize;
     loop {
         // Snap end forward to the next newline so windows never cut mid-line.
-        let raw_end = (start + KWIC_WINDOW_CHARS).min(text.len());
+        // `ceil_char_boundary` guards the slice against landing mid-codepoint.
+        let raw_end = ceil_char_boundary(text, start + KWIC_WINDOW_CHARS);
         let end = if raw_end == text.len() {
             text.len()
         } else {
@@ -612,8 +657,8 @@ fn kwic_windows(text: &str) -> Vec<String> {
             break;
         }
         // Advance stride, snapping forward to the next newline boundary.
-        let raw_next = start + KWIC_STRIDE_CHARS;
-        let next = if raw_next >= text.len() {
+        let raw_next = ceil_char_boundary(text, start + KWIC_STRIDE_CHARS);
+        let next = if raw_next == text.len() {
             text.len()
         } else {
             text[raw_next..]
@@ -692,7 +737,15 @@ fn format_unified_hit(h: &UnifiedHit, query: &str, rank: usize, score: Option<f3
         .map(|k| format!(" ({k})"))
         .unwrap_or_default();
 
-    let header = format!("### {rank}. `{label}`{kind_str}{score_str}");
+    // A combined result folds several adjacent same-document hits; flag it in
+    // the heading so the agent knows the body spans more than one fragment.
+    let merged_str = if h.merged_count > 1 {
+        format!(" · combined ×{}", h.merged_count)
+    } else {
+        String::new()
+    };
+
+    let header = format!("### {rank}. `{label}`{kind_str}{merged_str}{score_str}");
 
     // ── Metadata table ───────────────────────────────────────────────────
     let lines_str = if h.start_line > 0 && h.end_line > 0 {
@@ -703,13 +756,22 @@ fn format_unified_hit(h: &UnifiedHit, query: &str, rank: usize, score: Option<f3
         "—".to_string()
     };
 
+    let combined_row = if h.merged_count > 1 {
+        format!(
+            "\n| **Combined** | {} adjacent segments merged into this result |",
+            h.merged_count
+        )
+    } else {
+        String::new()
+    };
+
     let meta = format!(
         "| Field | Value |\n\
          |-------|-------|\n\
          | **Package** | `{package}` |\n\
          | **Origin** | {origin} |\n\
          | **Source** | `{path}` |\n\
-         | **Lines** | {lines} |",
+         | **Lines** | {lines} |{combined_row}",
         package = h.package,
         origin = h.origin,
         path = h.path,
@@ -783,11 +845,260 @@ fn format_unified_hit(h: &UnifiedHit, query: &str, rank: usize, score: Option<f3
 // Dedup helpers for tool_query
 // ---------------------------------------------------------------------------
 
+/// Returns `true` when an optional `query` package scope selects the package
+/// identified by `name` (a local package) or `name`/`version` (a bundle).
+///
+/// A `None` scope selects everything. A bundle matches either its bare name
+/// (`lancedb`) or its exact versioned form (`lancedb@0.5.0`); a local package
+/// matches its name only. Matching is case-insensitive so it tolerates the
+/// casing an agent copies from `list_packages` output.
+fn scope_selects(scope: Option<&str>, name: &str, version: Option<&str>) -> bool {
+    let Some(scope) = scope else {
+        return true;
+    };
+    if scope.eq_ignore_ascii_case(name) {
+        return true;
+    }
+    match version {
+        Some(v) => scope.eq_ignore_ascii_case(&format!("{name}@{v}")),
+        None => false,
+    }
+}
+
 /// Normalise a file path to a canonical dedup key component:
 /// lowercase + forward-slash separators so that Windows codegraph paths
 /// (`src\adc.rs`) and lance paths (`src/adc.rs`) match.
 fn normalise_path(path: &str) -> String {
     path.replace('\\', "/").to_lowercase()
+}
+
+// ---------------------------------------------------------------------------
+// Result combining (fold adjacent same-document hits into one)
+// ---------------------------------------------------------------------------
+
+/// One input row for merge planning: identity + line span. Built in ranked
+/// order, so a row's index into the planning slice *is* its rank (0 = best).
+struct MergeItem {
+    /// Index into the `hits` vector this row refers to.
+    idx: usize,
+    package: String,
+    /// Normalised source path (the document/file identity).
+    path_key: String,
+    /// `true` for doc hits, `false` for code/codegraph — the two classes never
+    /// merge with each other and use different gap thresholds.
+    is_docs: bool,
+    start: u32,
+    end: u32,
+}
+
+/// A planned run of one-or-more adjacent hits to present as a single result.
+#[derive(Debug)]
+struct MergeRun {
+    /// Representative hit index (the best-ranked member of the run).
+    rep: usize,
+    /// All member hit indices, in ascending start-line order (content order).
+    members: Vec<usize>,
+    /// Rank of the representative within the input slice — used to order runs
+    /// so combining never reorders results relative to the reranker.
+    best_rank: usize,
+}
+
+/// Plan how to fold contiguous / near-contiguous same-document hits.
+///
+/// `items` MUST be in ranked order (best first); `items[i]` therefore has rank
+/// `i`. Hits whose line span is unknown (`start == 0` or `end == 0`) are never
+/// merged — they pass through as singleton runs. Two hits merge when they share
+/// a package + document + class and the number of lines *between* them is at
+/// most the class gap threshold (overlap counts as a gap of zero). Returns one
+/// run per emitted result, ordered by the representative's rank.
+fn plan_merge_runs(items: &[MergeItem]) -> Vec<MergeRun> {
+    // Group member positions by (package, path, class), first-seen order.
+    let mut group_order: Vec<(String, String, bool)> = Vec::new();
+    let mut groups: HashMap<(String, String, bool), Vec<usize>> = HashMap::new();
+    for (i, it) in items.iter().enumerate() {
+        let key = (it.package.clone(), it.path_key.clone(), it.is_docs);
+        if !groups.contains_key(&key) {
+            group_order.push(key.clone());
+        }
+        groups.entry(key).or_default().push(i);
+    }
+
+    let mut runs: Vec<MergeRun> = Vec::new();
+    for key in &group_order {
+        let is_docs = key.2;
+        let gap = if is_docs {
+            DOC_MERGE_GAP_LINES
+        } else {
+            CODE_MERGE_GAP_LINES
+        };
+
+        // Split members into those with a known line span (mergeable) and those
+        // without (always singletons).
+        let mut spanned: Vec<usize> = Vec::new();
+        for &p in &groups[key] {
+            if items[p].start > 0 && items[p].end > 0 {
+                spanned.push(p);
+            } else {
+                runs.push(MergeRun {
+                    rep: items[p].idx,
+                    members: vec![items[p].idx],
+                    best_rank: p,
+                });
+            }
+        }
+        // Order by start line (tie: end line) to detect contiguous runs.
+        spanned.sort_by(|&a, &b| {
+            items[a]
+                .start
+                .cmp(&items[b].start)
+                .then(items[a].end.cmp(&items[b].end))
+        });
+
+        let mut i = 0;
+        while i < spanned.len() {
+            let mut positions = vec![spanned[i]];
+            let mut run_max_end = items[spanned[i]].end;
+            let mut j = i + 1;
+            while j < spanned.len() {
+                let nxt = &items[spanned[j]];
+                // Lines strictly between the current run and the next member.
+                let interstitial = nxt.start.saturating_sub(run_max_end.saturating_add(1));
+                if nxt.start <= run_max_end || interstitial <= gap {
+                    positions.push(spanned[j]);
+                    run_max_end = run_max_end.max(nxt.end);
+                    j += 1;
+                } else {
+                    break;
+                }
+            }
+            let best_rank = *positions.iter().min().expect("non-empty run");
+            let members: Vec<usize> = positions.iter().map(|&p| items[p].idx).collect();
+            runs.push(MergeRun {
+                rep: items[best_rank].idx,
+                members,
+                best_rank,
+            });
+            i = j;
+        }
+    }
+
+    runs.sort_by_key(|r| r.best_rank);
+    runs
+}
+
+/// Concatenate run-member bodies (in ascending start-line order) into one
+/// combined body, de-duplicating overlapping content by line number.
+///
+/// `parts` is `(start_line, end_line, body)` per member. Adjacent symbols and
+/// chunks frequently overlap (a nested symbol inside its parent, two chunks that
+/// share a boundary line), and appending each body whole would duplicate the
+/// shared lines. For each member, given the running maximum end line `prev_end`:
+/// - **fully contained** (`end <= prev_end`) → skipped entirely;
+/// - **partial overlap** (`start <= prev_end < end`) → clipped to the lines
+///   *after* `prev_end` (drop the first `prev_end - start + 1` lines, which
+///   duplicate already-emitted content);
+/// - **disjoint** → appended whole, with any interstitial line gap marked.
+///
+/// The result is capped at `MERGED_CONTENT_CHAR_CAP` (on a UTF-8 boundary).
+fn assemble_merged_content(parts: &[(u32, u32, String)]) -> String {
+    let mut content = String::new();
+    let mut prev_end: Option<u32> = None;
+
+    for (start, end, body) in parts {
+        // Decide what slice of this member's body is new.
+        let segment: String = match prev_end {
+            None => body.clone(),
+            Some(pe) => {
+                if *end <= pe {
+                    // Fully contained in what we've already emitted — skip.
+                    continue;
+                } else if *start <= pe {
+                    // Partial overlap — drop the lines that duplicate prior
+                    // content, keeping only those past `prev_end`.
+                    let skip = (pe - *start + 1) as usize;
+                    let remainder: String = body.lines().skip(skip).collect::<Vec<_>>().join("\n");
+                    if remainder.trim().is_empty() {
+                        // Nothing new once the overlap is removed.
+                        prev_end = Some((*end).max(pe));
+                        continue;
+                    }
+                    remainder
+                } else {
+                    body.clone()
+                }
+            }
+        };
+
+        // Separator: a gap marker for disjoint members, else a newline.
+        if let Some(pe) = prev_end {
+            let gap = start.saturating_sub(pe.saturating_add(1));
+            if *start > pe && gap > 0 {
+                content.push_str(&format!("\n\n… {gap} line(s) omitted …\n\n"));
+            } else if !content.is_empty() && !content.ends_with('\n') {
+                content.push('\n');
+            }
+        }
+
+        content.push_str(segment.trim_end());
+        prev_end = Some((*end).max(prev_end.unwrap_or(0)));
+
+        if content.len() >= MERGED_CONTENT_CHAR_CAP {
+            let mut cut = MERGED_CONTENT_CHAR_CAP;
+            while cut > 0 && !content.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            content.truncate(cut);
+            content.push_str("\n… (truncated — use read_code / read_docs for the full range)");
+            break;
+        }
+    }
+
+    content
+}
+
+/// Rewrite the representative hit of a multi-member run to carry the combined
+/// content of the whole run over its full line span. Members are read in
+/// ascending start-line order; for code the fullest available body is used
+/// (`expanded_text` from small-to-big, else the snippet), for docs the chunk
+/// snippets are concatenated. Gaps between segments are marked, and the total
+/// is capped at `MERGED_CONTENT_CHAR_CAP`.
+fn materialize_merged_hit(hits: &mut [UnifiedHit], run: &MergeRun) {
+    let is_docs = hits[run.rep].origin == "docs";
+
+    // Collect (start, end, body) per member without holding a borrow across the
+    // later mutation of the representative.
+    let mut min_start = u32::MAX;
+    let mut max_end = 0u32;
+    let mut parts: Vec<(u32, u32, String)> = Vec::with_capacity(run.members.len());
+    for &m in &run.members {
+        let h = &hits[m];
+        min_start = min_start.min(h.start_line);
+        max_end = max_end.max(h.end_line);
+        let body = if !is_docs {
+            match h.expanded_text.as_deref().filter(|s| !s.is_empty()) {
+                Some(t) => t.to_string(),
+                None => h.snippet.clone(),
+            }
+        } else {
+            h.snippet.clone()
+        };
+        parts.push((h.start_line, h.end_line, body));
+    }
+
+    let content = assemble_merged_content(&parts);
+
+    let count = run.members.len();
+    let h = &mut hits[run.rep];
+    h.start_line = min_start;
+    h.end_line = max_end;
+    h.snippet = content;
+    // Show the combined snippet verbatim: clear the KWIC-window display state so
+    // `format_unified_hit` falls through to the plain-snippet tier.
+    h.best_window = None;
+    h.best_window_first = false;
+    h.kwic_count = 0;
+    h.expanded_text = None;
+    h.merged_count = count;
 }
 
 /// Build the dedup key for a `UnifiedHit`.
@@ -880,6 +1191,9 @@ struct McpContext {
     embed_model_id: Option<String>,
     /// Optionally-loaded generative query expander.
     expander: Option<QueryExpander>,
+    /// Query-expansion / fusion configuration (used even when the expander
+    /// model is absent — the additive-only and anchoring knobs are read here).
+    qe_cfg: query_expansion::QueryExpansionConfig,
 }
 
 impl McpContext {
@@ -926,10 +1240,11 @@ impl McpContext {
                     Ok(e) => {
                         eprintln!(
                             "sempkg: embedder loaded ({}, dim {})",
-                            embedding::EMBED_MODEL_ID,
+                            e.model_id(),
                             e.dim()
                         );
-                        (Some(e), Some(embedding::EMBED_MODEL_ID.to_string()))
+                        let model_id = e.model_id().to_string();
+                        (Some(e), Some(model_id))
                     }
                     Err(e) => {
                         eprintln!("sempkg: embedder load error (vector search disabled): {e}");
@@ -970,6 +1285,7 @@ impl McpContext {
             embedder,
             embed_model_id,
             expander,
+            qe_cfg,
         }
     }
 
@@ -1378,6 +1694,60 @@ impl McpContext {
         }
     }
 
+    /// Fold contiguous / near-contiguous same-document hits in the ranked
+    /// result list into single combined results.
+    ///
+    /// Retrieval frequently surfaces several high-scoring fragments of the *same*
+    /// region — adjacent doc chunks of one section, or neighbouring functions in
+    /// one file — because they are all semantically close to the query. Returning
+    /// them as separate results wastes the agent's attention on near-duplicates.
+    /// This stage detects runs of same-document hits whose line spans are
+    /// contiguous (or within a small gap) and merges each run into one result
+    /// that carries the combined content over the full line span, ranked at the
+    /// position of its best-scoring member.
+    ///
+    /// Operates on the floor-filtered ranked list *before* the `limit` cut, so a
+    /// run split across the cut is still folded and the agent gets up to `limit`
+    /// distinct results. Returns the rewritten ranked list (one entry per run).
+    fn combine_adjacent_hits(
+        &self,
+        hits: &mut [UnifiedHit],
+        ranked: Vec<(usize, f32)>,
+    ) -> Vec<(usize, f32)> {
+        if std::env::var("SEMPKG_NO_COMBINE").is_ok() || ranked.len() < 2 {
+            return ranked;
+        }
+
+        let items: Vec<MergeItem> = ranked
+            .iter()
+            .map(|&(idx, _)| MergeItem {
+                idx,
+                package: hits[idx].package.clone(),
+                path_key: normalise_path(&hits[idx].path),
+                is_docs: hits[idx].origin == "docs",
+                start: hits[idx].start_line,
+                end: hits[idx].end_line,
+            })
+            .collect();
+        let score_of: HashMap<usize, f32> = ranked.iter().copied().collect();
+
+        let runs = plan_merge_runs(&items);
+
+        runs.into_iter()
+            .map(|run| {
+                let max_score = run
+                    .members
+                    .iter()
+                    .map(|i| score_of.get(i).copied().unwrap_or(0.0))
+                    .fold(f32::NEG_INFINITY, f32::max);
+                if run.members.len() > 1 {
+                    materialize_merged_hit(hits, &run);
+                }
+                (run.rep, max_score)
+            })
+            .collect()
+    }
+
     /// Unified cross-package search: queries code, docs, and codegraph across
     /// all installed bundles and local packages, then reranks everything together.
     /// Retrieve BM25 (+ optional vector) hits for a single (possibly expanded)
@@ -1394,6 +1764,8 @@ impl McpContext {
         weight: f32,
         do_lex: bool,
         do_vec: bool,
+        is_original: bool,
+        scope: Option<&str>,
         fetch_limit: usize,
         hits: &mut Vec<UnifiedHit>,
     ) -> QueryRunStats {
@@ -1441,6 +1813,8 @@ impl McpContext {
                     best_window: None,
                     best_window_first: false,
                     kwic_count: 0,
+                    from_original: is_original,
+                    merged_count: 1,
                 });
             }
         };
@@ -1496,6 +1870,8 @@ impl McpContext {
                         best_window: None,
                         best_window_first: false,
                         kwic_count: 0,
+                        from_original: is_original,
+                        merged_count: 1,
                     });
                 }
                 arr.len()
@@ -1504,6 +1880,9 @@ impl McpContext {
         // ── Installed bundles ────────────────────────────────────────────
         let bundles = list_all_bundles(self.workspace().map(|p| p.as_path()));
         for bundle in &bundles {
+            if !scope_selects(scope, &bundle.name, Some(&bundle.version)) {
+                continue;
+            }
             let pkg_name = format!("{}@{}", bundle.name, bundle.version);
 
             // Source-code index
@@ -1558,6 +1937,9 @@ impl McpContext {
 
         // ── Local packages ───────────────────────────────────────────────
         for pkg in self.registry.list() {
+            if !scope_selects(scope, &pkg.name, None) {
+                continue;
+            }
             let pkg_name = pkg.name.clone();
 
             // Lance docs index at <pkg>/.sempkg/lance/
@@ -1592,11 +1974,35 @@ impl McpContext {
         stats
     }
 
-    fn tool_query(&self, query: &str, limit: usize) -> String {
+    fn tool_query(&self, query: &str, scope: Option<&str>, limit: usize) -> String {
         let debug = std::env::var("SEMPKG_DEBUG").is_ok();
         let debug_list_limit = debug_hit_list_limit();
         let fetch_limit = self.reranker_fetch_limit(limit).max(20);
         let mut hits: Vec<UnifiedHit> = Vec::new();
+
+        // ── Optional package scope ────────────────────────────────────────
+        // When the agent restricts the search to a single package, validate the
+        // name up front so a typo fails loudly with the available names rather
+        // than silently returning "no results".
+        if let Some(s) = scope {
+            let matches_any = self
+                .registry
+                .list()
+                .iter()
+                .any(|p| scope_selects(scope, &p.name, None))
+                || list_all_bundles(self.workspace().map(|p| p.as_path()))
+                    .iter()
+                    .any(|b| scope_selects(scope, &b.name, Some(&b.version)));
+            if !matches_any {
+                let available = self.available_names();
+                let hint = if available.is_empty() {
+                    " No packages or bundles installed yet.".to_string()
+                } else {
+                    format!(" Available: {}", available.join(", "))
+                };
+                return format!("Package scope '{s}' not found.{hint}");
+            }
+        }
 
         // ── Query expansion → retrieval runs ─────────────────────────────
         // The original query always runs against BOTH backends with double
@@ -1636,8 +2042,18 @@ impl McpContext {
 
         for (run_idx, (q, weight, do_lex, do_vec)) in runs.iter().enumerate() {
             let before = hits.len();
-            let stats =
-                self.collect_query_hits(q, *weight, *do_lex, *do_vec, fetch_limit, &mut hits);
+            // Run 0 is always the original query; later runs are expansions.
+            let is_original = run_idx == 0;
+            let stats = self.collect_query_hits(
+                q,
+                *weight,
+                *do_lex,
+                *do_vec,
+                is_original,
+                scope,
+                fetch_limit,
+                &mut hits,
+            );
             if debug {
                 eprintln!(
                     "sempkg: query run[{run_idx}] route={{lex:{do_lex}, vec:{do_vec}}} weight={weight:.1} q={q:?} added={} lex(code/docs/codegraph)={}/{}/{} vec(code/docs)={}/{} vec_tables(compatible/checked)={}/{}",
@@ -1663,11 +2079,18 @@ impl McpContext {
         }
 
         if hits.is_empty() {
-            return format!(
-                "No results found for: `{query}`\n\n\
-                 Make sure at least one package is indexed or a bundle with a code/docs \
-                 index is installed (`sempkg list`)."
-            );
+            return match scope {
+                Some(s) => format!(
+                    "No results found for: `{query}` in package `{s}`\n\n\
+                     The package is installed but its index returned nothing for this query. \
+                     Try a broader query, or omit `package` to search every installed package."
+                ),
+                None => format!(
+                    "No results found for: `{query}`\n\n\
+                     Make sure at least one package is indexed or a bundle with a code/docs \
+                     index is installed (`sempkg list`)."
+                ),
+            };
         }
 
         // ── Dedup ────────────────────────────────────────────────────────
@@ -1702,6 +2125,11 @@ impl McpContext {
                         // RRF fusion: a hit found by multiple runs/sources
                         // accumulates their reciprocal-rank contributions.
                         deduped[idx].rrf_score += old.rrf_score;
+                        // Provenance is the OR across every run that found it:
+                        // a doc seen by the original query stays "original" even
+                        // when an expansion variant also (and now primarily)
+                        // surfaced it.
+                        deduped[idx].from_original |= old.from_original;
                     } else {
                         if debug {
                             duplicate_logs.push(format!(
@@ -1714,8 +2142,10 @@ impl McpContext {
                         // Existing wins; harvest complementary fields and add
                         // this run's RRF contribution to the running total.
                         let new_rrf = hit.rrf_score;
+                        let new_from_original = hit.from_original;
                         merge_complementary(&mut deduped[idx], &hit);
                         deduped[idx].rrf_score += new_rrf;
+                        deduped[idx].from_original |= new_from_original;
                     }
                 } else {
                     key_map.insert(key, deduped.len());
@@ -1749,6 +2179,49 @@ impl McpContext {
             debug_print_stage_hits("query post-dedup hits", &hits, debug_list_limit);
         }
 
+        // ── Topical anchoring ─────────────────────────────────────────────
+        // Cross-package RRF on its own has no notion of *which* packages the
+        // query is actually about, so a bare lexical match of a generic term
+        // (e.g. "wait") in an unrelated package can out-rank the one on-topic
+        // semantic hit. Anchor the fusion to the packages the ORIGINAL query
+        // surfaced: each package's anchor strength is the summed original-query
+        // RRF it received, normalised to the strongest package. Hits in weakly-
+        // or un-anchored packages have their score scaled toward `anchor_floor`.
+        //
+        // Only engaged when expansion actually ran — without extra variants the
+        // ranking is the original query's own, and we leave it untouched.
+        if self.qe_cfg.topical_anchoring && expanded_variants > 0 {
+            let mut anchor: HashMap<String, f32> = HashMap::new();
+            for h in &hits {
+                if h.from_original {
+                    *anchor.entry(h.package.clone()).or_insert(0.0) += h.rrf_score;
+                }
+            }
+            let max_anchor = anchor.values().copied().fold(0.0_f32, f32::max);
+            if max_anchor > 0.0 {
+                let floor = self.qe_cfg.anchor_floor.clamp(0.0, 1.0);
+                for h in &mut hits {
+                    let strength =
+                        anchor.get(h.package.as_str()).copied().unwrap_or(0.0) / max_anchor;
+                    h.rrf_score *= floor + (1.0 - floor) * strength;
+                }
+                if debug {
+                    let mut pkgs: Vec<(&str, f32)> = anchor
+                        .iter()
+                        .map(|(k, v)| (k.as_str(), *v / max_anchor))
+                        .collect();
+                    pkgs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                    eprintln!(
+                        "sempkg: topical anchoring — floor={floor:.2} anchored_packages={}",
+                        pkgs.len()
+                    );
+                    for (pkg, s) in pkgs.iter().take(debug_list_limit) {
+                        eprintln!("sempkg:   anchor[{pkg}] strength={s:.3}");
+                    }
+                }
+            }
+        }
+
         // ── Global RRF sort ───────────────────────────────────────────────
         // All sources used the same RRF formula so this sort is apples-to-apples.
         // Rank-1 from every (package, origin) pair competes fairly.
@@ -1771,16 +2244,38 @@ impl McpContext {
         // codegraph) each get roughly equal representation.
         let pool_size = fetch_limit;
         let max_per_bucket = (pool_size / 3).max(3);
+        // Additive-only / never-pool-dominating guard. Documents *introduced*
+        // by an expansion variant (never seen by the original query) may take
+        // at most `expansion_cap` pool slots:
+        //   • `additive_only` (default) → cap is 0: expansion may only
+        //     reinforce documents the original already found, never introduce
+        //     new ones. This is the high-leverage fix for the pool-poisoning
+        //     regression.
+        //   • otherwise → cap is `max_expansion_pool_fraction` of the pool, so
+        //     novel expansion hits can contribute but can never dominate.
+        let expansion_cap = if self.qe_cfg.additive_only {
+            0
+        } else {
+            ((pool_size as f32) * self.qe_cfg.max_expansion_pool_fraction.clamp(0.0, 1.0)) as usize
+        };
+        let mut expansion_used = 0usize;
         let mut bucket_counts: HashMap<(String, &'static str), usize> = HashMap::new();
         let pool_indices: Vec<usize> = hits
             .iter()
             .enumerate()
             .filter_map(|(i, h)| {
+                // Reject expansion-introduced docs once their budget is spent.
+                if !h.from_original && expansion_used >= expansion_cap {
+                    return None;
+                }
                 let count = bucket_counts
                     .entry((h.package.clone(), h.origin))
                     .or_insert(0);
                 if *count < max_per_bucket {
                     *count += 1;
+                    if !h.from_original {
+                        expansion_used += 1;
+                    }
                     Some(i)
                 } else {
                     None
@@ -1790,8 +2285,11 @@ impl McpContext {
             .collect();
         if debug {
             eprintln!(
-                "sempkg: query diversity-selected pool count={}",
-                pool_indices.len()
+                "sempkg: query diversity-selected pool count={} (additive_only={} expansion_introduced={}/{} cap)",
+                pool_indices.len(),
+                self.qe_cfg.additive_only,
+                expansion_used,
+                expansion_cap
             );
             for (i, hi) in pool_indices.iter().take(debug_list_limit).enumerate() {
                 eprintln!("sempkg:   [pool:{i}] {}", debug_hit_preview(&hits[*hi]));
@@ -1955,12 +2453,14 @@ impl McpContext {
                 // pass-1 order, appended after the expanded set.  This backfills
                 // the output if expanded hits are later dropped by the floor.
                 final_scored.extend(p1_scored.iter().skip(pass2_budget).copied());
-                final_scored.into_iter().take(limit).collect()
+                // NB: not truncated to `limit` here — the combiner stage below
+                // folds adjacent same-document hits first, so a run straddling
+                // the cut is still merged before the final `limit` is applied.
+                final_scored
             } else {
-                // No reranker — return top N from the diversity-selected pool, scored by RRF.
+                // No reranker — rank the whole diversity-selected pool by RRF.
                 pool_indices
                     .iter()
-                    .take(limit)
                     .map(|&i| (i, hits[i].rrf_score))
                     .collect()
             }
@@ -1969,7 +2469,7 @@ impl McpContext {
         // ── Relevance floor ──────────────────────────────────────────────
         // Drop results the reranker considers irrelevant.  Only applied when
         // the reranker ran; RRF scores are not a relevance signal.
-        let scored: Vec<(usize, f32)> = if reranker_was_active {
+        let ranked: Vec<(usize, f32)> = if reranker_was_active {
             scored
                 .into_iter()
                 .filter(|&(_, s)| s >= RERANKER_SCORE_FLOOR)
@@ -1978,7 +2478,7 @@ impl McpContext {
             scored
         };
 
-        if scored.is_empty() {
+        if ranked.is_empty() {
             return if reranker_was_active {
                 format!(
                     "No relevant results for: `{query}`\n\n\
@@ -1989,6 +2489,20 @@ impl McpContext {
             } else {
                 format!("No results for: `{query}`.")
             };
+        }
+
+        // ── Combine adjacent same-document hits ──────────────────────────
+        // Fold contiguous / near-contiguous fragments of one document (adjacent
+        // doc chunks, neighbouring functions) into a single result, then cut to
+        // the requested `limit`.
+        let mut scored = self.combine_adjacent_hits(&mut hits, ranked);
+        scored.truncate(limit);
+        if debug {
+            eprintln!(
+                "sempkg: query combiner — results_after_combine={} (limit={})",
+                scored.len(),
+                limit
+            );
         }
 
         // ── Format ───────────────────────────────────────────────────────
@@ -2461,7 +2975,7 @@ impl McpContext {
                 let line = args.get("line").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
                 self.tool_read_code(str_arg("package"), str_arg("file"), line)
             }
-            "query" => self.tool_query(str_arg("query"), int_arg("limit", 10)),
+            "query" => self.tool_query(str_arg("query"), opt_str("package"), int_arg("limit", 10)),
             _ => format!("Unknown tool: {name}"),
         }
     }
@@ -2563,5 +3077,257 @@ fn handle_message(ctx: &McpContext, line: &str) -> Option<RpcResponse> {
             -32601,
             format!("Method not found: {}", req.method),
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scope_none_selects_everything() {
+        assert!(scope_selects(None, "lancedb", Some("0.5.0")));
+        assert!(scope_selects(None, "local-pkg", None));
+    }
+
+    #[test]
+    fn scope_matches_bare_name_for_bundle_and_local() {
+        assert!(scope_selects(Some("lancedb"), "lancedb", Some("0.5.0")));
+        assert!(scope_selects(Some("local-pkg"), "local-pkg", None));
+    }
+
+    #[test]
+    fn scope_matches_exact_versioned_bundle() {
+        assert!(scope_selects(
+            Some("lancedb@0.5.0"),
+            "lancedb",
+            Some("0.5.0")
+        ));
+    }
+
+    #[test]
+    fn scope_rejects_wrong_name_or_version() {
+        assert!(!scope_selects(Some("qmd"), "lancedb", Some("0.5.0")));
+        assert!(!scope_selects(
+            Some("lancedb@9.9.9"),
+            "lancedb",
+            Some("0.5.0")
+        ));
+        // A versioned scope never matches a local package (which has no version).
+        assert!(!scope_selects(Some("local-pkg@1.0.0"), "local-pkg", None));
+    }
+
+    #[test]
+    fn scope_matching_is_case_insensitive() {
+        assert!(scope_selects(Some("LanceDB"), "lancedb", Some("0.5.0")));
+        assert!(scope_selects(
+            Some("lancedb@0.5.0"),
+            "LanceDB",
+            Some("0.5.0")
+        ));
+    }
+
+    // ── KWIC windowing ───────────────────────────────────────────────────
+
+    #[test]
+    fn kwic_windows_short_text_single_window() {
+        let text = "fn main() {}\n";
+        let windows = kwic_windows(text);
+        assert_eq!(windows, vec![text.to_string()]);
+    }
+
+    #[test]
+    fn kwic_windows_does_not_panic_on_multibyte_at_window_edge() {
+        // Regression for the panic at mcp.rs:633 — a 3-byte box-drawing char
+        // straddling the KWIC_WINDOW_CHARS byte offset made `text[raw_end..]`
+        // slice inside a codepoint and crash the MCP server.
+        //
+        // Place a multi-byte '─' (3 bytes) so that byte index KWIC_WINDOW_CHARS
+        // falls *inside* it, then pad past the window so the windowing loop runs.
+        let mut text = "a".repeat(KWIC_WINDOW_CHARS - 1);
+        text.push('─'); // occupies bytes [KWIC_WINDOW_CHARS-1 .. KWIC_WINDOW_CHARS+2)
+        text.push_str(&"b".repeat(KWIC_WINDOW_CHARS)); // pad beyond one window
+        assert!(
+            !text.is_char_boundary(KWIC_WINDOW_CHARS),
+            "test setup invalid"
+        );
+
+        // Must not panic; windows must reassemble into a prefix-covering set.
+        let windows = kwic_windows(&text);
+        assert!(!windows.is_empty());
+        assert!(text.starts_with(windows.first().unwrap().as_str()));
+    }
+
+    #[test]
+    fn kwic_windows_cover_input_with_newlines() {
+        let line = "let x = compute_value_for_index(i);\n";
+        let text = line.repeat(200); // well over KWIC_WINDOW_CHARS bytes
+        let windows = kwic_windows(&text);
+        assert!(
+            windows.len() > 1,
+            "long text should produce multiple windows"
+        );
+        // First window starts at the beginning; last reaches the end.
+        assert!(text.starts_with(windows.first().unwrap().as_str()));
+        assert!(text.ends_with(windows.last().unwrap().as_str()));
+    }
+
+    // ── Result combining ─────────────────────────────────────────────────
+
+    fn item(idx: usize, pkg: &str, path: &str, is_docs: bool, start: u32, end: u32) -> MergeItem {
+        MergeItem {
+            idx,
+            package: pkg.to_string(),
+            path_key: normalise_path(path),
+            is_docs,
+            start,
+            end,
+        }
+    }
+
+    #[test]
+    fn merges_contiguous_doc_chunks_in_same_file() {
+        // Three abutting chunks of one doc + one unrelated hit elsewhere.
+        let items = vec![
+            item(10, "pkg", "guide.md", true, 1, 20),
+            item(11, "pkg", "guide.md", true, 21, 40),
+            item(12, "pkg", "guide.md", true, 41, 60),
+            item(13, "pkg", "other.md", true, 5, 9),
+        ];
+        let runs = plan_merge_runs(&items);
+        assert_eq!(runs.len(), 2, "one merged run + one singleton: {runs:?}");
+        let merged = &runs[0];
+        assert_eq!(merged.rep, 10, "best-ranked member represents the run");
+        assert_eq!(merged.members, vec![10, 11, 12]);
+        assert_eq!(merged.best_rank, 0);
+        assert_eq!(runs[1].members, vec![13]);
+    }
+
+    #[test]
+    fn near_contiguous_within_gap_merges_but_far_apart_does_not() {
+        // Functions 1-10 and 13-20 are 2 lines apart (≤ CODE gap of 3) → merge.
+        // 13-20 and 200-210 are far apart → separate.
+        let items = vec![
+            item(1, "pkg@1", "src/a.rs", false, 1, 10),
+            item(2, "pkg@1", "src/a.rs", false, 13, 20),
+            item(3, "pkg@1", "src/a.rs", false, 200, 210),
+        ];
+        let runs = plan_merge_runs(&items);
+        assert_eq!(runs.len(), 2, "{runs:?}");
+        assert_eq!(runs[0].members, vec![1, 2]);
+        assert_eq!(runs[1].members, vec![3]);
+    }
+
+    #[test]
+    fn docs_and_code_never_merge_even_in_same_path() {
+        let items = vec![
+            item(1, "pkg", "x", false, 1, 10),
+            item(2, "pkg", "x", true, 11, 20),
+        ];
+        let runs = plan_merge_runs(&items);
+        assert_eq!(runs.len(), 2, "different classes stay separate: {runs:?}");
+    }
+
+    #[test]
+    fn unknown_line_spans_are_never_merged() {
+        let items = vec![
+            item(1, "pkg", "f", false, 0, 0),
+            item(2, "pkg", "f", false, 0, 0),
+        ];
+        let runs = plan_merge_runs(&items);
+        assert_eq!(runs.len(), 2, "zero-span hits pass through as singletons");
+    }
+
+    #[test]
+    fn representative_is_best_ranked_regardless_of_line_order() {
+        // The higher-ranked hit (rank 0) is physically *after* the lower-ranked
+        // one; the representative must still be the best-ranked (idx 1, rank 0).
+        let items = vec![
+            item(1, "pkg", "f.rs", false, 30, 40), // rank 0, best
+            item(2, "pkg", "f.rs", false, 18, 29), // rank 1, immediately precedes
+        ];
+        let runs = plan_merge_runs(&items);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].rep, 1, "best-ranked member represents");
+        assert_eq!(runs[0].members, vec![2, 1], "members in line order");
+        assert_eq!(runs[0].best_rank, 0);
+    }
+
+    #[test]
+    fn distinct_packages_do_not_merge() {
+        let items = vec![
+            item(1, "pkg-a", "f.rs", false, 1, 10),
+            item(2, "pkg-b", "f.rs", false, 11, 20),
+        ];
+        let runs = plan_merge_runs(&items);
+        assert_eq!(runs.len(), 2);
+    }
+
+    // ── Combined-content assembly (overlap de-duplication) ────────────────
+
+    #[test]
+    fn assembly_appends_disjoint_bodies_with_gap_marker() {
+        let parts = vec![
+            (10, 12, "L10\nL11\nL12".to_string()),
+            (20, 22, "L20\nL21\nL22".to_string()),
+        ];
+        let out = assemble_merged_content(&parts);
+        assert_eq!(
+            out,
+            "L10\nL11\nL12\n\n… 7 line(s) omitted …\n\nL20\nL21\nL22"
+        );
+    }
+
+    #[test]
+    fn assembly_clips_partial_overlap_to_new_lines_only() {
+        // Second member shares lines 11–12 with the first; only 13–14 are new.
+        let parts = vec![
+            (10, 12, "L10\nL11\nL12".to_string()),
+            (11, 14, "L11\nL12\nL13\nL14".to_string()),
+        ];
+        let out = assemble_merged_content(&parts);
+        assert_eq!(out, "L10\nL11\nL12\nL13\nL14");
+        assert_eq!(out.matches("L11").count(), 1, "no duplicated lines");
+        assert_eq!(out.matches("L12").count(), 1, "no duplicated lines");
+    }
+
+    #[test]
+    fn assembly_skips_fully_contained_body() {
+        // Second member (12–15) sits entirely inside the first (10–20).
+        let parts = vec![(10, 20, "BIG".to_string()), (12, 15, "INNER".to_string())];
+        let out = assemble_merged_content(&parts);
+        assert_eq!(out, "BIG", "contained member contributes nothing");
+    }
+
+    #[test]
+    fn assembly_handles_nested_then_enclosing_order() {
+        // A small symbol (10–12) ranked before its enclosing function (10–20):
+        // the enclosing body is clipped past line 12 so nothing duplicates.
+        let parts = vec![
+            (10, 12, "fn a {\n  x\n}".to_string()),
+            (
+                10,
+                20,
+                "fn a {\n  x\n}\nfn b {\n  y\n}\n// 14..20".to_string(),
+            ),
+        ];
+        let out = assemble_merged_content(&parts);
+        // First 3 lines come from the inner part; the enclosing part is clipped
+        // to its lines after 12.
+        assert_eq!(out, "fn a {\n  x\n}\nfn b {\n  y\n}\n// 14..20");
+    }
+
+    #[test]
+    fn assembly_contiguous_bodies_join_without_marker() {
+        let parts = vec![
+            (10, 12, "L10\nL11\nL12".to_string()),
+            (13, 15, "L13\nL14\nL15".to_string()),
+        ];
+        let out = assemble_merged_content(&parts);
+        assert_eq!(out, "L10\nL11\nL12\nL13\nL14\nL15");
+        assert!(
+            !out.contains("omitted"),
+            "abutting ranges need no gap marker"
+        );
     }
 }

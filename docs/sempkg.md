@@ -106,15 +106,18 @@ The MCP `query` tool runs hybrid retrieval: BM25 (full-text) **and** vector
 reranker. Two optional GGUF models power this, both behind the `embeddings`
 build feature (`cargo build --features embeddings`):
 
-- **Embedding** (`Qwen3-Embedding-0.6B`) — embeds document chunks and queries
-  for vector search.
+- **Embedding** — embeds document chunks and queries for vector search.
+  Two models are supported, selected by `model_id`:
+  - `embeddinggemma-300m` (**default**) — Google EmbeddingGemma-300M, 768-dim, mean pooling.
+  - `qwen3-embedding-0.6b` — Qwen3-Embedding-0.6B, 1024-dim, last-token pooling.
 - **Query expansion** (`qmd-query-expansion-1.7B`) — rewrites the query into
   typed sub-queries (`lex` → BM25, `vec`/`hyde` → vector) for broader recall.
 
 ```toml
 [embedding]
 enabled    = true
-# model    = "~/.sempkg/models/qwen3-embedding-0.6b-q8_0.gguf"  # default path
+model_id   = "embeddinggemma-300m"   # or "qwen3-embedding-0.6b"
+# model    = "~/.sempkg/models/custom.gguf"  # optional explicit GGUF path override
 n_ctx      = 2048
 gpu_layers = 0    # >0 offloads layers to GPU (needs a GPU llama.cpp build)
 
@@ -129,11 +132,16 @@ Download the models, then build the vector indexes for installed bundles and
 local packages:
 
 ```bash
-sempkg embedding pull          # download the embedding model
-sempkg query-expansion pull    # download the query-expansion model
-sempkg embed                   # embed docs/code tables (add --force to redo)
-sempkg embed <package>         # embed a single package/bundle
+sempkg embedding pull                          # download the configured model (default: EmbeddingGemma)
+sempkg embedding pull --model qwen3-embedding-0.6b   # download Qwen instead
+sempkg query-expansion pull                    # download the query-expansion model
+sempkg embed                                   # embed docs/code tables (add --force to redo)
+sempkg embed <package>                         # embed a single package/bundle
 ```
+
+> Switching `model_id` changes the vector dimension, so bundles embedded with
+> the previous model no longer match. Re-run `sempkg embed` to re-embed them
+> (mismatched tables are re-embedded automatically; identical ones are skipped).
 
 Status / test helpers:
 
@@ -481,6 +489,7 @@ falling back to global bundles. Omit `-C` to use only the global bundle store.
 | Tool | Required params | Optional params | Description |
 |------|-----------------|-----------------|-------------|
 | `list_packages` | — | — | List all local packages and installed bundles with index and docs status |
+| `query` | `query` | `package`, `limit` | Unified hybrid search (BM25 + vector + CodeGraph, RRF-fused, reranked). Searches every installed package by default; pass `package` (name or `name@version`) to focus the whole pipeline on one package for a deeper, less-diluted search |
 | `search_symbols` | `package`, `query` | `kind`, `limit` | FTS symbol search via CodeGraph |
 | `get_context` | `package`, `task` | — | AI-optimised code context for a natural-language task |
 | `get_callers` | `package`, `symbol` | `limit` | Find all callers of a symbol |
@@ -488,6 +497,7 @@ falling back to global bundles. Omit `-C` to use only the global bundle store.
 | `get_impact` | `package`, `symbol` | `depth` | Downstream impact of changing a symbol |
 | `list_files` | `package` | `filter` | List source files tracked by CodeGraph |
 | `search_docs` | `package`, `query` | `limit` | BM25 full-text search over LanceDB docs index |
+| `read_docs` | `package`, `file` | `start_line`, `end_line` | Read raw documentation content for a file. When a line range is given it returns exactly those whole lines (resolved to line boundaries, never mid-line) — the follow-up to a `search_docs` hit |
 | `docs_metadata` | `package` | — | LanceDB index stats: document count, chunk count, FTS status |
 
 All tools accept a `package` name that can be:

@@ -76,6 +76,35 @@ pub struct QueryExpansionConfig {
     /// Sampling temperature. Defaults to 0.7 (matches QMD).
     #[serde(default = "default_temperature")]
     pub temperature: f32,
+
+    /// When true (default), expanded variants may only **reinforce** documents
+    /// the original query already retrieved — a document found *solely* by an
+    /// expansion variant is dropped before pool selection. This is the primary
+    /// guard against generic variants ("best practices for …") introducing and
+    /// then dominating off-topic candidates. When false, expansion-introduced
+    /// documents are admitted but capped by `max_expansion_pool_fraction`.
+    #[serde(default = "default_true")]
+    pub additive_only: bool,
+
+    /// When `additive_only` is false, the maximum fraction of the candidate
+    /// pool that expansion-*introduced* (not original-found) documents may
+    /// occupy. Keeps expansion strictly non–pool-dominating even when it is
+    /// allowed to contribute novel documents. Clamped to `[0.0, 1.0]`.
+    #[serde(default = "default_expansion_pool_fraction")]
+    pub max_expansion_pool_fraction: f32,
+
+    /// Enable topical anchoring during cross-package fusion. Hits in packages
+    /// the original query did not surface are down-weighted toward
+    /// `anchor_floor`, so a bare lexical match in an unrelated package cannot
+    /// outrank an on-topic semantic match in the right one.
+    #[serde(default = "default_true")]
+    pub topical_anchoring: bool,
+
+    /// Lowest anchor multiplier applied to a package the original query never
+    /// retrieved. `1.0` disables the effect; lower values penalise harder.
+    /// Clamped to `[0.0, 1.0]`.
+    #[serde(default = "default_anchor_floor")]
+    pub anchor_floor: f32,
 }
 
 fn default_true() -> bool {
@@ -93,6 +122,12 @@ fn default_n_ctx() -> u32 {
 fn default_temperature() -> f32 {
     0.7
 }
+fn default_expansion_pool_fraction() -> f32 {
+    0.34
+}
+fn default_anchor_floor() -> f32 {
+    0.5
+}
 
 impl Default for QueryExpansionConfig {
     fn default() -> Self {
@@ -104,6 +139,10 @@ impl Default for QueryExpansionConfig {
             n_ctx: default_n_ctx(),
             gpu_layers: 0,
             temperature: default_temperature(),
+            additive_only: default_true(),
+            max_expansion_pool_fraction: default_expansion_pool_fraction(),
+            topical_anchoring: default_true(),
+            anchor_floor: default_anchor_floor(),
         }
     }
 }
@@ -164,6 +203,134 @@ pub fn pull_model(
 // Output parsing (shared between the real impl and tests)
 // ---------------------------------------------------------------------------
 
+/// Function words that carry no topical signal. Used both to extract the
+/// *content* tokens of a query/variant and to detect dangling trailing words.
+/// Kept deliberately small — domain identifiers (`fs`, `io`, `wait`) must NOT
+/// appear here, only natural-language glue and the generative-cliché filler the
+/// expansion model is prone to emit.
+const STOPWORDS: &[&str] = &[
+    "a",
+    "an",
+    "and",
+    "the",
+    "to",
+    "of",
+    "for",
+    "with",
+    "in",
+    "on",
+    "at",
+    "by",
+    "from",
+    "as",
+    "into",
+    "than",
+    "that",
+    "this",
+    "these",
+    "those",
+    "or",
+    "nor",
+    "but",
+    "is",
+    "are",
+    "be",
+    "how",
+    "what",
+    "when",
+    "where",
+    "which",
+    "who",
+    "why",
+    "do",
+    "does",
+    "using",
+    "use",
+    "via",
+    "about",
+    "best",
+    "practices",
+    "practice",
+    "recommended",
+    "approach",
+    "approaches",
+    "common",
+    "general",
+    "way",
+    "ways",
+    "guide",
+    "tutorial",
+    "example",
+    "examples",
+    "overview",
+    "introduction",
+    "tips",
+];
+
+/// Words that must not be the *last* token of a usable variant. A query ending
+/// in one of these is a truncated fragment ("expand the search for", "abort
+/// communication with") that matches boilerplate everywhere.
+const TRAILING_BANNED: &[&str] = &[
+    "a", "an", "the", "to", "of", "for", "with", "in", "on", "at", "by", "from", "as", "into",
+    "than", "that", "and", "or", "nor", "but", "is", "are", "be", "how", "what", "when", "which",
+    "this", "these", "those", "using", "via", "about",
+];
+
+/// Minimum character length (trimmed) for a variant to be considered usable.
+const MIN_VARIANT_CHARS: usize = 4;
+
+/// Lowercase alphanumeric content tokens of `s`, with function words removed.
+fn content_tokens(s: &str) -> Vec<String> {
+    s.split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .map(|t| t.to_ascii_lowercase())
+        .filter(|t| !STOPWORDS.contains(&t.as_str()))
+        .collect()
+}
+
+/// Decide whether an expansion `variant` is safe to add for `original`.
+///
+/// Rejects three failure modes that poison the candidate pool with generic,
+/// content-free matches (see `docs/design/query-tool-design.md`):
+/// 1. **Too short** — empty, sub-`MIN_VARIANT_CHARS`, or no content tokens.
+/// 2. **Dangling trailing word** — ends in a preposition/conjunction/article
+///    (e.g. "best practices for"), i.e. a truncated fragment.
+/// 3. **Topically unrelated** — shares no content token with the original
+///    query, i.e. a query-reformulation cliché rather than a paraphrase.
+///
+/// When the original has no content tokens of its own (all function words),
+/// the overlap check is skipped — there is nothing to anchor against.
+fn variant_is_acceptable(variant: &str, original_tokens: &[String]) -> bool {
+    let trimmed = variant.trim();
+    if trimmed.chars().count() < MIN_VARIANT_CHARS {
+        return false;
+    }
+
+    // (b) dangling trailing preposition/conjunction/article.
+    if let Some(last) = trimmed
+        .split(|c: char| !c.is_alphanumeric())
+        .rfind(|t| !t.is_empty())
+    {
+        if TRAILING_BANNED.contains(&last.to_ascii_lowercase().as_str()) {
+            return false;
+        }
+    }
+
+    let variant_tokens = content_tokens(trimmed);
+    // (a) no content tokens at all → pure filler.
+    if variant_tokens.is_empty() {
+        return false;
+    }
+
+    // (c) share at least one content token with the original (when the
+    // original has any). Anchors the variant to the query's domain.
+    if !original_tokens.is_empty() && !variant_tokens.iter().any(|t| original_tokens.contains(t)) {
+        return false;
+    }
+
+    true
+}
+
 /// Strip a leading `<think>...</think>` block (Qwen3 emits one even with
 /// `/no_think`) and return the remaining text.
 fn strip_think(text: &str) -> &str {
@@ -185,6 +352,7 @@ fn strip_think(text: &str) -> &str {
 fn parse_variants(raw: &str, original: &str, max_variants: usize) -> Vec<ExpandedQuery> {
     let body = strip_think(raw);
     let original_norm = original.trim().to_lowercase();
+    let original_tokens = content_tokens(original);
 
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     seen.insert(original_norm);
@@ -219,6 +387,12 @@ fn parse_variants(raw: &str, original: &str, max_variants: usize) -> Vec<Expande
             continue;
         }
 
+        // Guard: drop generic / fragmentary / topically-unrelated variants
+        // before they can flood the candidate pool with content-free matches.
+        if !variant_is_acceptable(content, &original_tokens) {
+            continue;
+        }
+
         let norm = content.to_lowercase();
         if !seen.insert(norm) {
             continue;
@@ -234,9 +408,26 @@ fn parse_variants(raw: &str, original: &str, max_variants: usize) -> Vec<Expande
 }
 
 /// Build the Qwen3 chat-templated prompt for the expansion model.
+///
+/// The instruction steers the model toward **domain paraphrases** of the
+/// query's own concepts and away from generative query-reformulation clichés
+/// ("best practices for …", "recommended approaches to …"). Those fillers match
+/// boilerplate in every package and crowd the on-topic answer out of the pool,
+/// so the prompt explicitly bans them and requires each variant to reuse the
+/// query's domain terms or a close synonym. Output stays in the typed-line
+/// format (`lex:` / `vec:` / `hyde:`) the parser expects.
 fn build_prompt(query: &str) -> String {
     format!(
-        "<|im_start|>user\n/no_think Expand this search query: {query}<|im_end|>\n<|im_start|>assistant\n"
+        "<|im_start|>system\nYou rewrite a code/documentation search query into a few \
+         search variants that preserve its specific technical meaning. Each variant MUST \
+         reuse the query's domain terms (identifiers, API names, concepts) or a precise \
+         synonym. Do NOT add generic filler such as \"best practices\", \"recommended \
+         approaches\", \"how to\", \"overview\", or \"examples\". Do NOT broaden the topic. \
+         Output one variant per line, each prefixed with `lex:` (keyword terms), `vec:` (a \
+         semantic paraphrase), or `hyde:` (one sentence a matching doc/comment would \
+         contain). No prose, no numbering.<|im_end|>\n\
+         <|im_start|>user\n/no_think Expand this search query: {query}<|im_end|>\n\
+         <|im_start|>assistant\n"
     )
 }
 
@@ -246,7 +437,6 @@ fn build_prompt(query: &str) -> String {
 
 #[cfg(feature = "embeddings")]
 pub struct QueryExpander {
-    backend: llama_cpp_2::llama_backend::LlamaBackend,
     model: llama_cpp_2::model::LlamaModel,
     n_ctx: u32,
     max_tokens: i32,
@@ -258,9 +448,8 @@ pub struct QueryExpander {
 impl QueryExpander {
     /// Load the GGUF model from disk using llama.cpp.
     pub fn load(config: &QueryExpansionConfig) -> Result<Self> {
-        use llama_cpp_2::llama_backend::LlamaBackend;
         use llama_cpp_2::model::{params::LlamaModelParams, LlamaModel};
-        use llama_cpp_2::{send_logs_to_tracing, LlamaCppError, LogOptions};
+        use llama_cpp_2::{send_logs_to_tracing, LogOptions};
 
         static LOG_INIT: std::sync::Once = std::sync::Once::new();
         LOG_INIT.call_once(|| {
@@ -275,20 +464,16 @@ impl QueryExpander {
             );
         }
 
-        // Backend init is process-global. If another model already initialized
-        // it, reuse the initialized backend proof token.
-        let backend = match LlamaBackend::init() {
-            Ok(b) => b,
-            Err(LlamaCppError::BackendAlreadyInitialized) => LlamaBackend {},
-            Err(e) => return Err(anyhow::anyhow!("llama backend init: {e}")),
-        };
+        // Use the process-wide shared backend (created once, never dropped) so
+        // the expander can coexist with the embedder/reranker without a
+        // double-free panic in `LlamaBackend::drop` at shutdown.
+        let backend = crate::llama_runtime::shared()?;
 
         let model_params = LlamaModelParams::default().with_n_gpu_layers(config.gpu_layers);
-        let model = LlamaModel::load_from_file(&backend, &model_path, &model_params)
+        let model = LlamaModel::load_from_file(backend, &model_path, &model_params)
             .map_err(|e| anyhow::anyhow!("loading model from {}: {e}", model_path.display()))?;
 
         Ok(Self {
-            backend,
             model,
             n_ctx: config.n_ctx,
             max_tokens: config.max_tokens,
@@ -321,7 +506,7 @@ impl QueryExpander {
 
         let mut ctx = self
             .model
-            .new_context(&self.backend, ctx_params)
+            .new_context(crate::llama_runtime::shared()?, ctx_params)
             .map_err(|e| anyhow::anyhow!("creating context: {e}"))?;
 
         let tokens = self
@@ -424,6 +609,13 @@ pub fn print_status(config: &QueryExpansionConfig) {
     println!("  n_ctx        : {}", config.n_ctx);
     println!("  gpu_layers   : {}", config.gpu_layers);
     println!("  temperature  : {}", config.temperature);
+    println!("  additive_only: {}", config.additive_only);
+    println!(
+        "  max_expansion_pool_fraction : {}",
+        config.max_expansion_pool_fraction
+    );
+    println!("  topical_anchoring : {}", config.topical_anchoring);
+    println!("  anchor_floor : {}", config.anchor_floor);
     println!();
 
     let model_ok = model_path.is_file();
@@ -468,9 +660,11 @@ mod tests {
 
     #[test]
     fn parses_typed_lines() {
+        // Every variant shares a domain token with the original so the topical
+        // guard keeps them; the test exercises lex/vec/hyde routing.
         let raw =
             "lex: tokio runtime\nvec: async executor internals\nhyde: Tokio is an async runtime\n";
-        let v = parse_variants(raw, "tokio runtime spawn", 10);
+        let v = parse_variants(raw, "tokio async runtime executor spawn", 10);
         assert_eq!(v.len(), 3);
         assert_eq!(v[0].kind, ExpansionKind::Lexical);
         assert_eq!(v[1].kind, ExpansionKind::Vector);
@@ -480,7 +674,7 @@ mod tests {
     #[test]
     fn dedups_and_caps() {
         let raw = "vec: alpha\nvec: alpha\nvec: beta\nvec: gamma";
-        let v = parse_variants(raw, "query", 2);
+        let v = parse_variants(raw, "alpha beta gamma delta", 2);
         assert_eq!(v.len(), 2);
         assert_eq!(v[0].text, "alpha");
         assert_eq!(v[1].text, "beta");
@@ -488,9 +682,54 @@ mod tests {
 
     #[test]
     fn skips_original_query_duplicate() {
-        let raw = "lex: same query\nvec: different";
+        let raw = "lex: same query\nvec: different query";
         let v = parse_variants(raw, "same query", 10);
         assert_eq!(v.len(), 1);
-        assert_eq!(v[0].text, "different");
+        assert_eq!(v[0].text, "different query");
+    }
+
+    #[test]
+    fn rejects_generic_filler_with_no_overlap() {
+        // The exact regression: the expander emits query-reformulation clichés
+        // that share no content token with the original. All must be dropped.
+        let raw =
+            "lex: best practices for\nvec: recommended approaches\nhyde: common ways to use this";
+        let v = parse_variants(raw, "abort communication with FS unit", 10);
+        assert!(v.is_empty(), "generic filler must not survive: {v:?}");
+    }
+
+    #[test]
+    fn rejects_dangling_trailing_preposition() {
+        // Shares a token ("communication") but ends in a dangling preposition.
+        let raw = "lex: abort communication with";
+        let v = parse_variants(raw, "abort communication with FS unit", 10);
+        assert!(v.is_empty(), "dangling fragment must be dropped: {v:?}");
+    }
+
+    #[test]
+    fn rejects_too_short_variant() {
+        let raw = "vec: io\nlex: a";
+        let v = parse_variants(raw, "io completion port wait", 10);
+        // "io" overlaps but is < MIN_VARIANT_CHARS; "a" is a stopword fragment.
+        assert!(v.is_empty(), "too-short variants must be dropped: {v:?}");
+    }
+
+    #[test]
+    fn keeps_on_topic_domain_paraphrase() {
+        // A genuine domain paraphrase that reuses a query term survives.
+        let raw = "lex: wait_for_index completion\nvec: block until the index is ready\nhyde: the call waits for index ingestion to finish";
+        let v = parse_variants(raw, "wait for index ready", 10);
+        assert_eq!(v.len(), 3, "on-topic paraphrases must survive: {v:?}");
+        assert_eq!(v[0].kind, ExpansionKind::Lexical);
+    }
+
+    #[test]
+    fn overlap_check_skipped_when_original_has_no_content_tokens() {
+        // Original is all stopwords → nothing to anchor against, so the
+        // overlap guard is bypassed (length / dangling guards still apply).
+        let raw = "vec: tokio async runtime";
+        let v = parse_variants(raw, "how to do this", 10);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].text, "tokio async runtime");
     }
 }
