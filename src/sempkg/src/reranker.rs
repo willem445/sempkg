@@ -338,7 +338,6 @@ fn build_rerank_prompt(query: &str, document: &str) -> String {
 /// Loaded reranker ready to score (query, document) pairs.
 #[cfg(feature = "reranker")]
 pub struct Reranker {
-    backend: llama_cpp_2::llama_backend::LlamaBackend,
     model: llama_cpp_2::model::LlamaModel,
     top_k: usize,
     output_n: usize,
@@ -348,9 +347,8 @@ pub struct Reranker {
 impl Reranker {
     /// Load the GGUF model from disk using llama.cpp.
     pub fn load(config: &RerankerConfig) -> Result<Self> {
-        use llama_cpp_2::llama_backend::LlamaBackend;
         use llama_cpp_2::model::{params::LlamaModelParams, LlamaModel};
-        use llama_cpp_2::{send_logs_to_tracing, LlamaCppError, LogOptions};
+        use llama_cpp_2::{send_logs_to_tracing, LogOptions};
 
         // Silence llama.cpp's extremely verbose stderr logging. Routing logs to
         // `tracing` with logging disabled drops them entirely (sempkg installs
@@ -368,19 +366,15 @@ impl Reranker {
             );
         }
 
-        // Backend init is process-global and idempotent.
-        let backend = match LlamaBackend::init() {
-            Ok(b) => b,
-            Err(LlamaCppError::BackendAlreadyInitialized) => LlamaBackend {},
-            Err(e) => return Err(anyhow::anyhow!("llama backend init: {e}")),
-        };
+        // Use the process-wide shared backend (created once, never dropped) so
+        // multiple llama models can coexist without a double-free at shutdown.
+        let backend = crate::llama_runtime::shared()?;
 
         let model_params = LlamaModelParams::default();
-        let model = LlamaModel::load_from_file(&backend, &model_path, &model_params)
+        let model = LlamaModel::load_from_file(backend, &model_path, &model_params)
             .map_err(|e| anyhow::anyhow!("loading model from {}: {e}", model_path.display()))?;
 
         Ok(Self {
-            backend,
             model,
             top_k: config.top_k,
             output_n: config.output_n,
@@ -410,7 +404,7 @@ impl Reranker {
 
         let mut ctx = self
             .model
-            .new_context(&self.backend, ctx_params)
+            .new_context(crate::llama_runtime::shared()?, ctx_params)
             .map_err(|e| anyhow::anyhow!("creating context: {e}"))?;
 
         let mut tokens = self

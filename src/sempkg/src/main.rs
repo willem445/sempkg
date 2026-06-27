@@ -4,6 +4,8 @@ mod embedding;
 mod error;
 mod github;
 mod lance;
+#[cfg(any(feature = "reranker", feature = "embeddings"))]
+mod llama_runtime;
 mod manifest;
 mod mcp;
 mod packages;

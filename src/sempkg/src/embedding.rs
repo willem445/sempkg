@@ -168,7 +168,6 @@ pub fn normalize(v: &mut [f32]) {
 /// Loaded embedder ready to turn text into normalized vectors.
 #[cfg(feature = "embeddings")]
 pub struct Embedder {
-    backend: llama_cpp_2::llama_backend::LlamaBackend,
     model: llama_cpp_2::model::LlamaModel,
     n_ctx: u32,
     /// Embedding dimension reported by the loaded model (`n_embd`).
@@ -179,9 +178,8 @@ pub struct Embedder {
 impl Embedder {
     /// Load the GGUF model from disk using llama.cpp.
     pub fn load(config: &EmbeddingConfig) -> Result<Self> {
-        use llama_cpp_2::llama_backend::LlamaBackend;
         use llama_cpp_2::model::{params::LlamaModelParams, LlamaModel};
-        use llama_cpp_2::{send_logs_to_tracing, LlamaCppError, LogOptions};
+        use llama_cpp_2::{send_logs_to_tracing, LogOptions};
 
         // Silence llama.cpp's verbose stderr logging (see reranker.rs).
         static LOG_INIT: std::sync::Once = std::sync::Once::new();
@@ -197,23 +195,18 @@ impl Embedder {
             );
         }
 
-        // llama.cpp backend init is process-global; repeated init attempts
-        // return BackendAlreadyInitialized. Treat that as success so multiple
-        // model components (reranker/embedder/expander) can coexist.
-        let backend = match LlamaBackend::init() {
-            Ok(b) => b,
-            Err(LlamaCppError::BackendAlreadyInitialized) => LlamaBackend {},
-            Err(e) => return Err(anyhow::anyhow!("llama backend init: {e}")),
-        };
+        // Use the process-wide shared backend (created once, never dropped) so
+        // the reranker, embedder, and expander can coexist without a
+        // double-free panic in `LlamaBackend::drop` at shutdown.
+        let backend = crate::llama_runtime::shared()?;
 
         let model_params = LlamaModelParams::default().with_n_gpu_layers(config.gpu_layers);
-        let model = LlamaModel::load_from_file(&backend, &model_path, &model_params)
+        let model = LlamaModel::load_from_file(backend, &model_path, &model_params)
             .map_err(|e| anyhow::anyhow!("loading model from {}: {e}", model_path.display()))?;
 
         let dim = model.n_embd() as usize;
 
         Ok(Self {
-            backend,
             model,
             n_ctx: config.n_ctx,
             dim,
@@ -236,7 +229,7 @@ impl Embedder {
             .with_embeddings(true)
             .with_pooling_type(LlamaPoolingType::Last);
         self.model
-            .new_context(&self.backend, ctx_params)
+            .new_context(crate::llama_runtime::shared()?, ctx_params)
             .map_err(|e| anyhow::anyhow!("creating embedding context: {e}"))
     }
 

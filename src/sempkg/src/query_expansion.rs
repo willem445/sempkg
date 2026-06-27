@@ -437,7 +437,6 @@ fn build_prompt(query: &str) -> String {
 
 #[cfg(feature = "embeddings")]
 pub struct QueryExpander {
-    backend: llama_cpp_2::llama_backend::LlamaBackend,
     model: llama_cpp_2::model::LlamaModel,
     n_ctx: u32,
     max_tokens: i32,
@@ -449,9 +448,8 @@ pub struct QueryExpander {
 impl QueryExpander {
     /// Load the GGUF model from disk using llama.cpp.
     pub fn load(config: &QueryExpansionConfig) -> Result<Self> {
-        use llama_cpp_2::llama_backend::LlamaBackend;
         use llama_cpp_2::model::{params::LlamaModelParams, LlamaModel};
-        use llama_cpp_2::{send_logs_to_tracing, LlamaCppError, LogOptions};
+        use llama_cpp_2::{send_logs_to_tracing, LogOptions};
 
         static LOG_INIT: std::sync::Once = std::sync::Once::new();
         LOG_INIT.call_once(|| {
@@ -466,20 +464,16 @@ impl QueryExpander {
             );
         }
 
-        // Backend init is process-global. If another model already initialized
-        // it, reuse the initialized backend proof token.
-        let backend = match LlamaBackend::init() {
-            Ok(b) => b,
-            Err(LlamaCppError::BackendAlreadyInitialized) => LlamaBackend {},
-            Err(e) => return Err(anyhow::anyhow!("llama backend init: {e}")),
-        };
+        // Use the process-wide shared backend (created once, never dropped) so
+        // the expander can coexist with the embedder/reranker without a
+        // double-free panic in `LlamaBackend::drop` at shutdown.
+        let backend = crate::llama_runtime::shared()?;
 
         let model_params = LlamaModelParams::default().with_n_gpu_layers(config.gpu_layers);
-        let model = LlamaModel::load_from_file(&backend, &model_path, &model_params)
+        let model = LlamaModel::load_from_file(backend, &model_path, &model_params)
             .map_err(|e| anyhow::anyhow!("loading model from {}: {e}", model_path.display()))?;
 
         Ok(Self {
-            backend,
             model,
             n_ctx: config.n_ctx,
             max_tokens: config.max_tokens,
@@ -512,7 +506,7 @@ impl QueryExpander {
 
         let mut ctx = self
             .model
-            .new_context(&self.backend, ctx_params)
+            .new_context(crate::llama_runtime::shared()?, ctx_params)
             .map_err(|e| anyhow::anyhow!("creating context: {e}"))?;
 
         let tokens = self
