@@ -336,8 +336,12 @@ same-document hits into a single result:
 3. **Materialise** each multi-member run into its best-ranked member (the *representative*): the
    line span becomes `[min start, max end]`, and the content is the members' bodies concatenated
    in line order — the fullest available body for code (`expanded_text` from small-to-big, else
-   the snippet), the chunk snippets for docs — with any interstitial gap marked.  The combined
-   content is capped at `MERGED_CONTENT_CHAR_CAP = 12 000` chars.
+   the snippet), the chunk snippets for docs.  Overlap is de-duplicated by line number against the
+   running end line: a member fully contained in what's already emitted is dropped, a partially
+   overlapping one (common when a nested symbol precedes its enclosing function, or two chunks
+   share a boundary line) is clipped to the lines *past* the running end, and a disjoint one is
+   appended whole with the interstitial gap marked.  The combined content is capped at
+   `MERGED_CONTENT_CHAR_CAP = 12 000` chars (on a UTF-8 boundary).
 
 A run is ranked at the position of its representative, so combining never reorders results.
 Because it runs before the `limit` cut, a run split across that boundary is still folded and the

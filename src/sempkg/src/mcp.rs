@@ -969,6 +969,76 @@ fn plan_merge_runs(items: &[MergeItem]) -> Vec<MergeRun> {
     runs
 }
 
+/// Concatenate run-member bodies (in ascending start-line order) into one
+/// combined body, de-duplicating overlapping content by line number.
+///
+/// `parts` is `(start_line, end_line, body)` per member. Adjacent symbols and
+/// chunks frequently overlap (a nested symbol inside its parent, two chunks that
+/// share a boundary line), and appending each body whole would duplicate the
+/// shared lines. For each member, given the running maximum end line `prev_end`:
+/// - **fully contained** (`end <= prev_end`) → skipped entirely;
+/// - **partial overlap** (`start <= prev_end < end`) → clipped to the lines
+///   *after* `prev_end` (drop the first `prev_end - start + 1` lines, which
+///   duplicate already-emitted content);
+/// - **disjoint** → appended whole, with any interstitial line gap marked.
+///
+/// The result is capped at `MERGED_CONTENT_CHAR_CAP` (on a UTF-8 boundary).
+fn assemble_merged_content(parts: &[(u32, u32, String)]) -> String {
+    let mut content = String::new();
+    let mut prev_end: Option<u32> = None;
+
+    for (start, end, body) in parts {
+        // Decide what slice of this member's body is new.
+        let segment: String = match prev_end {
+            None => body.clone(),
+            Some(pe) => {
+                if *end <= pe {
+                    // Fully contained in what we've already emitted — skip.
+                    continue;
+                } else if *start <= pe {
+                    // Partial overlap — drop the lines that duplicate prior
+                    // content, keeping only those past `prev_end`.
+                    let skip = (pe - *start + 1) as usize;
+                    let remainder: String = body.lines().skip(skip).collect::<Vec<_>>().join("\n");
+                    if remainder.trim().is_empty() {
+                        // Nothing new once the overlap is removed.
+                        prev_end = Some((*end).max(pe));
+                        continue;
+                    }
+                    remainder
+                } else {
+                    body.clone()
+                }
+            }
+        };
+
+        // Separator: a gap marker for disjoint members, else a newline.
+        if let Some(pe) = prev_end {
+            let gap = start.saturating_sub(pe.saturating_add(1));
+            if *start > pe && gap > 0 {
+                content.push_str(&format!("\n\n… {gap} line(s) omitted …\n\n"));
+            } else if !content.is_empty() && !content.ends_with('\n') {
+                content.push('\n');
+            }
+        }
+
+        content.push_str(segment.trim_end());
+        prev_end = Some((*end).max(prev_end.unwrap_or(0)));
+
+        if content.len() >= MERGED_CONTENT_CHAR_CAP {
+            let mut cut = MERGED_CONTENT_CHAR_CAP;
+            while cut > 0 && !content.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            content.truncate(cut);
+            content.push_str("\n… (truncated — use read_code / read_docs for the full range)");
+            break;
+        }
+    }
+
+    content
+}
+
 /// Rewrite the representative hit of a multi-member run to carry the combined
 /// content of the whole run over its full line span. Members are read in
 /// ascending start-line order; for code the fullest available body is used
@@ -998,30 +1068,7 @@ fn materialize_merged_hit(hits: &mut [UnifiedHit], run: &MergeRun) {
         parts.push((h.start_line, h.end_line, body));
     }
 
-    // Assemble in line order, marking any interstitial gap.
-    let mut content = String::new();
-    let mut prev_end: Option<u32> = None;
-    let mut truncated = false;
-    for (start, end, body) in &parts {
-        if let Some(pe) = prev_end {
-            let gap = start.saturating_sub(pe.saturating_add(1));
-            if gap > 0 {
-                content.push_str(&format!("\n\n… {gap} line(s) omitted …\n\n"));
-            } else if !content.ends_with('\n') {
-                content.push('\n');
-            }
-        }
-        content.push_str(body.trim_end());
-        prev_end = Some(*end);
-        if content.len() >= MERGED_CONTENT_CHAR_CAP {
-            truncated = true;
-            break;
-        }
-    }
-    if truncated {
-        content.truncate(MERGED_CONTENT_CHAR_CAP);
-        content.push_str("\n… (truncated — use read_code / read_docs for the full range)");
-    }
+    let content = assemble_merged_content(&parts);
 
     let count = run.members.len();
     let h = &mut hits[run.rep];
@@ -3151,5 +3198,73 @@ mod tests {
         ];
         let runs = plan_merge_runs(&items);
         assert_eq!(runs.len(), 2);
+    }
+
+    // ── Combined-content assembly (overlap de-duplication) ────────────────
+
+    #[test]
+    fn assembly_appends_disjoint_bodies_with_gap_marker() {
+        let parts = vec![
+            (10, 12, "L10\nL11\nL12".to_string()),
+            (20, 22, "L20\nL21\nL22".to_string()),
+        ];
+        let out = assemble_merged_content(&parts);
+        assert_eq!(
+            out,
+            "L10\nL11\nL12\n\n… 7 line(s) omitted …\n\nL20\nL21\nL22"
+        );
+    }
+
+    #[test]
+    fn assembly_clips_partial_overlap_to_new_lines_only() {
+        // Second member shares lines 11–12 with the first; only 13–14 are new.
+        let parts = vec![
+            (10, 12, "L10\nL11\nL12".to_string()),
+            (11, 14, "L11\nL12\nL13\nL14".to_string()),
+        ];
+        let out = assemble_merged_content(&parts);
+        assert_eq!(out, "L10\nL11\nL12\nL13\nL14");
+        assert_eq!(out.matches("L11").count(), 1, "no duplicated lines");
+        assert_eq!(out.matches("L12").count(), 1, "no duplicated lines");
+    }
+
+    #[test]
+    fn assembly_skips_fully_contained_body() {
+        // Second member (12–15) sits entirely inside the first (10–20).
+        let parts = vec![(10, 20, "BIG".to_string()), (12, 15, "INNER".to_string())];
+        let out = assemble_merged_content(&parts);
+        assert_eq!(out, "BIG", "contained member contributes nothing");
+    }
+
+    #[test]
+    fn assembly_handles_nested_then_enclosing_order() {
+        // A small symbol (10–12) ranked before its enclosing function (10–20):
+        // the enclosing body is clipped past line 12 so nothing duplicates.
+        let parts = vec![
+            (10, 12, "fn a {\n  x\n}".to_string()),
+            (
+                10,
+                20,
+                "fn a {\n  x\n}\nfn b {\n  y\n}\n// 14..20".to_string(),
+            ),
+        ];
+        let out = assemble_merged_content(&parts);
+        // First 3 lines come from the inner part; the enclosing part is clipped
+        // to its lines after 12.
+        assert_eq!(out, "fn a {\n  x\n}\nfn b {\n  y\n}\n// 14..20");
+    }
+
+    #[test]
+    fn assembly_contiguous_bodies_join_without_marker() {
+        let parts = vec![
+            (10, 12, "L10\nL11\nL12".to_string()),
+            (13, 15, "L13\nL14\nL15".to_string()),
+        ];
+        let out = assemble_merged_content(&parts);
+        assert_eq!(out, "L10\nL11\nL12\nL13\nL14\nL15");
+        assert!(
+            !out.contains("omitted"),
+            "abutting ranges need no gap marker"
+        );
     }
 }
