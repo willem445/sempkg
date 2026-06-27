@@ -1223,10 +1223,11 @@ impl McpContext {
                     Ok(e) => {
                         eprintln!(
                             "sempkg: embedder loaded ({}, dim {})",
-                            embedding::EMBED_MODEL_ID,
+                            e.model_id(),
                             e.dim()
                         );
-                        (Some(e), Some(embedding::EMBED_MODEL_ID.to_string()))
+                        let model_id = e.model_id().to_string();
+                        (Some(e), Some(model_id))
                     }
                     Err(e) => {
                         eprintln!("sempkg: embedder load error (vector search disabled): {e}");

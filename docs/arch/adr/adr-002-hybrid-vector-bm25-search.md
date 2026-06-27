@@ -28,11 +28,14 @@ Add an optional **hybrid retrieval** stage in front of the existing reranker:
    rewrites the query into typed sub-queries. `lex:` variants route to BM25;
    `vec:`/`hyde:` variants route to vector search. The original query always
    runs against **both** backends with double RRF weight.
-2. **Vector search** — document/code chunks are embedded with
-   `Qwen3-Embedding-0.6B` (1024-dim, L2-normalized) and stored in a `vector`
-   `FixedSizeList<Float32>` column added to the existing LanceDB tables. Queries
-   are embedded with the same model (Qwen3 instruct prefix) and searched via
-   LanceDB cosine kNN.
+2. **Vector search** — document/code chunks are embedded (L2-normalized) and
+   stored in a `vector` `FixedSizeList<Float32>` column added to the existing
+   LanceDB tables, then searched via LanceDB cosine kNN. The embedder is
+   pluggable (`model_id` in `[embedding]`): **EmbeddingGemma-300M** (default,
+   768-dim, mean pooling, `task:`/`title:` prompts) or **Qwen3-Embedding-0.6B**
+   (1024-dim, last-token pooling, instruct prefix). The model id + dimension are
+   stamped into each table's metadata so a query is only vector-searched against
+   tables embedded with the same model.
 3. **RRF fusion** — every (run × backend × source) hit contributes
    `weight / (60 + rank)`; duplicates are summed so multi-signal agreement
    boosts ranking. The fused pool then flows into the unchanged diversity →

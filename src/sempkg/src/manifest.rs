@@ -589,6 +589,7 @@ mod tests {
         );
         manifest.embedding = Some(crate::embedding::EmbeddingConfig {
             enabled: true,
+            model_id: "qwen3-embedding-0.6b".to_string(),
             model: Some("~/.sempkg/models/custom-embedding.gguf".to_string()),
             n_ctx: 1024,
             gpu_layers: 2,
@@ -698,6 +699,7 @@ mod tests {
         );
         manifest.embedding = Some(crate::embedding::EmbeddingConfig {
             enabled: true,
+            model_id: "embeddinggemma-300m".to_string(),
             model: None,
             n_ctx: 2048,
             gpu_layers: 0,

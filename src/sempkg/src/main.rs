@@ -1201,11 +1201,45 @@ fn run_embedding(cmd: EmbeddingCommands, workspace: Option<&Path>) -> Result<()>
     let cfg = load_embedding_cfg(workspace);
 
     match cmd {
-        EmbeddingCommands::Pull { gguf_url, hf_token } => {
-            println!("Pulling Qwen3-Embedding-0.6B GGUF model...");
-            embedding::pull_model(&cfg, hf_token.as_deref(), gguf_url.as_deref())?;
+        EmbeddingCommands::Pull {
+            model,
+            gguf_url,
+            hf_token,
+        } => {
+            // `--model` selects a specific model (downloaded to its default
+            // path); otherwise pull whatever the workspace is configured to use.
+            let (selected, dest) = match model {
+                Some(id) => {
+                    let m = embedding::EmbeddingModel::from_id(&id).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "unknown embedding model '{id}'. Known models: {}",
+                            embedding::EmbeddingModel::KNOWN_IDS.join(", ")
+                        )
+                    })?;
+                    (m, embedding::default_model_dir().join(m.default_filename()))
+                }
+                None => (cfg.model()?, cfg.resolved_model_path()),
+            };
+
+            println!("Pulling {} GGUF model...", selected.display_name());
+            embedding::pull_model(selected, &dest, hf_token.as_deref(), gguf_url.as_deref())?;
             println!();
-            println!("Model ready. Run `sempkg embed` to build vector indexes for your bundles.");
+
+            // If the pulled model differs from the configured one, tell the user
+            // how to activate it.
+            let configured = cfg.model().unwrap_or(embedding::EmbeddingModel::DEFAULT);
+            if selected != configured {
+                println!(
+                    "To use {}, set `model_id = \"{}\"` under [embedding] in sempkg.toml,",
+                    selected.display_name(),
+                    selected.id()
+                );
+                println!("then run `sempkg embed --force` to re-embed your bundles.");
+            } else {
+                println!(
+                    "Model ready. Run `sempkg embed` to build vector indexes for your bundles."
+                );
+            }
             Ok(())
         }
         EmbeddingCommands::Status => {
@@ -1275,9 +1309,13 @@ fn run_embed(package: Option<&str>, force: bool, workspace: Option<&Path>) -> Re
             anyhow::bail!("Embedding model not found. Run `sempkg embedding pull` to download it.");
         }
 
-        println!("Loading embedding model ({})...", embedding::EMBED_MODEL_ID);
+        let selected_model = cfg.model()?;
+        println!(
+            "Loading embedding model ({})...",
+            selected_model.display_name()
+        );
         let embedder = embedding::Embedder::load(&cfg)?;
-        let model_id = embedding::EMBED_MODEL_ID;
+        let model_id = embedder.model_id();
 
         // Collect (label, table_dir, table_name) targets.
         let mut targets: Vec<(String, PathBuf, &'static str)> = Vec::new();

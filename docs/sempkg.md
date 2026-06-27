@@ -106,15 +106,18 @@ The MCP `query` tool runs hybrid retrieval: BM25 (full-text) **and** vector
 reranker. Two optional GGUF models power this, both behind the `embeddings`
 build feature (`cargo build --features embeddings`):
 
-- **Embedding** (`Qwen3-Embedding-0.6B`) — embeds document chunks and queries
-  for vector search.
+- **Embedding** — embeds document chunks and queries for vector search.
+  Two models are supported, selected by `model_id`:
+  - `embeddinggemma-300m` (**default**) — Google EmbeddingGemma-300M, 768-dim, mean pooling.
+  - `qwen3-embedding-0.6b` — Qwen3-Embedding-0.6B, 1024-dim, last-token pooling.
 - **Query expansion** (`qmd-query-expansion-1.7B`) — rewrites the query into
   typed sub-queries (`lex` → BM25, `vec`/`hyde` → vector) for broader recall.
 
 ```toml
 [embedding]
 enabled    = true
-# model    = "~/.sempkg/models/qwen3-embedding-0.6b-q8_0.gguf"  # default path
+model_id   = "embeddinggemma-300m"   # or "qwen3-embedding-0.6b"
+# model    = "~/.sempkg/models/custom.gguf"  # optional explicit GGUF path override
 n_ctx      = 2048
 gpu_layers = 0    # >0 offloads layers to GPU (needs a GPU llama.cpp build)
 
@@ -129,11 +132,16 @@ Download the models, then build the vector indexes for installed bundles and
 local packages:
 
 ```bash
-sempkg embedding pull          # download the embedding model
-sempkg query-expansion pull    # download the query-expansion model
-sempkg embed                   # embed docs/code tables (add --force to redo)
-sempkg embed <package>         # embed a single package/bundle
+sempkg embedding pull                          # download the configured model (default: EmbeddingGemma)
+sempkg embedding pull --model qwen3-embedding-0.6b   # download Qwen instead
+sempkg query-expansion pull                    # download the query-expansion model
+sempkg embed                                   # embed docs/code tables (add --force to redo)
+sempkg embed <package>                         # embed a single package/bundle
 ```
+
+> Switching `model_id` changes the vector dimension, so bundles embedded with
+> the previous model no longer match. Re-run `sempkg embed` to re-embed them
+> (mismatched tables are re-embedded automatically; identical ones are skipped).
 
 Status / test helpers:
 
