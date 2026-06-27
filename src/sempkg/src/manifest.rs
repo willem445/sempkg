@@ -543,6 +543,7 @@ mod tests {
             model: Some("~/.sempkg/models/custom.gguf".to_string()),
             top_k: 42,
             output_n: 7,
+            ..Default::default()
         });
 
         save_manifest(&manifest, dir.path()).expect("save manifest");
@@ -593,6 +594,7 @@ mod tests {
             model: Some("~/.sempkg/models/custom-embedding.gguf".to_string()),
             n_ctx: 1024,
             gpu_layers: 2,
+            ..Default::default()
         });
 
         save_manifest(&manifest, dir.path()).expect("save manifest");
@@ -703,6 +705,7 @@ mod tests {
             model: None,
             n_ctx: 2048,
             gpu_layers: 0,
+            ..Default::default()
         });
         manifest.query_expansion = Some(crate::query_expansion::QueryExpansionConfig {
             enabled: true,
@@ -719,6 +722,7 @@ mod tests {
             model: None,
             top_k: 20,
             output_n: 5,
+            ..Default::default()
         });
 
         save_manifest(&manifest, dir.path()).expect("save manifest");
