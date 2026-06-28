@@ -1,0 +1,25 @@
+# Local / on-prem deployment of sempkg-agent.
+#
+# Mount a synced sempkg workspace (sempkg.toml + installed bundles) and the
+# sempkg binary, then bring it up. For production prefer one transport per
+# service so each can scale independently.
+services:
+  sempkg-agent:
+    build:
+      context: .
+    image: sempkg-agent:0.1.0
+    environment:
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:?set OPENROUTER_API_KEY}
+      SEMPKG_AGENT_MODEL: ${SEMPKG_AGENT_MODEL:-anthropic/claude-3.5-sonnet}
+      SEMPKG_AGENT_MCP_WORKSPACE: /workspace
+      SEMPKG_AGENT_PUBLIC_URL: ${SEMPKG_AGENT_PUBLIC_URL:-http://localhost:8900}
+      SEMPKG_AGENT_LOG_LEVEL: ${SEMPKG_AGENT_LOG_LEVEL:-INFO}
+    command: ["serve", "--transport", "a2a"]
+    ports:
+      - "8900:8900"
+    volumes:
+      # A synced workspace: contains sempkg.toml and the installed bundles.
+      - ${SEMPKG_WORKSPACE:-./workspace}:/workspace:ro
+      # The sempkg binary (skip if you baked it into the image).
+      - ${SEMPKG_BIN:-/usr/local/bin/sempkg}:/usr/local/bin/sempkg:ro
+    restart: unless-stopped
