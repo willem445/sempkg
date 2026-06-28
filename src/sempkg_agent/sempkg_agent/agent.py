@@ -10,12 +10,14 @@ history is replayed so the agent continues where it left off.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import uuid
 from collections.abc import AsyncIterator
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.tools import BaseTool
 from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.errors import GraphRecursionError
@@ -24,11 +26,12 @@ from langgraph.prebuilt import create_react_agent
 from .config import Settings
 from .mcp_tools import SempkgToolProvider
 from .models import is_allowed
-from .prompts import SYSTEM_PROMPT, build_user_message
+from .prompts import build_user_message, system_prompt_for
 from .render import render_result_markdown
 from .schemas import AgentAnswer, ContextRequest
 from .streaming import StreamCallback
 from .tracing import AgentTracer
+from .verify import verify_findings
 
 logger = logging.getLogger(__name__)
 
@@ -81,12 +84,21 @@ class KnowledgeAgent:
     def __init__(self, settings: Settings, tool_provider: SempkgToolProvider) -> None:
         self._settings = settings
         self._tool_provider = tool_provider
-        self._tools = None  # loaded in setup()
+        self._tools: list[BaseTool] | None = None  # loaded in setup()
         self._checkpointer = None  # shared across per-model graphs
-        # One ReAct graph per model id (tools + checkpointer shared).
+        self._checkpointer_stack = contextlib.AsyncExitStack()
+        # One ReAct graph per model id (tools + checkpointer + prompt shared).
         self._graphs: dict[str, object] = {}
         self._models: dict[str, ChatOpenAI] = {}
         self._default_model_name = settings.llm.model
+        # System prompt: a host-supplied custom prompt if configured, else the
+        # built-in persona prompt for the mode (human vs agent).
+        self._system_prompt = system_prompt_for(
+            settings.agent.mode,
+            settings.agent.ui_title,
+            settings.agent.system_prompt,
+        )
+        self._installed_text: str | None = None  # cached list_packages output
 
     @classmethod
     async def create(cls, settings: Settings) -> KnowledgeAgent:
@@ -100,14 +112,40 @@ class KnowledgeAgent:
         if self._tools is not None:
             return
         self._tools = await self._tool_provider.load()
-        # MemorySaver keeps per-session conversation state in-process, shared
-        # across models so switching model mid-conversation keeps history. For a
-        # horizontally-scaled deployment, swap in a persistent checkpointer
-        # (e.g. langgraph's Postgres/Redis saver) — the interface is identical.
-        self._checkpointer = MemorySaver()
+        self._checkpointer = await self._build_checkpointer()
         self._ensure_api_key()
         self._graph_for(self._default_model_name)  # warm the default
-        logger.info("KnowledgeAgent ready (default model=%s)", self._default_model_name)
+        logger.info(
+            "KnowledgeAgent ready (mode=%s, default model=%s)",
+            self._settings.agent.mode,
+            self._default_model_name,
+        )
+
+    async def _build_checkpointer(self):
+        """Pick the conversation-state store.
+
+        Default is an in-process ``MemorySaver`` (state lost on restart). When
+        ``SEMPKG_AGENT_STATE_DB`` is set we use a persistent SQLite checkpointer so
+        multi-turn sessions survive restarts — important for a long-lived hosted
+        human assistant. The saver requires the optional
+        ``langgraph-checkpoint-sqlite`` package; we fall back to memory if absent.
+        """
+        db_path = self._settings.agent.state_db
+        if not db_path:
+            return MemorySaver()
+        try:
+            from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+        except ImportError:
+            logger.warning(
+                "SEMPKG_AGENT_STATE_DB is set but langgraph-checkpoint-sqlite is not "
+                "installed; falling back to in-memory state. Install the '[persist]' extra."
+            )
+            return MemorySaver()
+        saver = await self._checkpointer_stack.enter_async_context(
+            AsyncSqliteSaver.from_conn_string(db_path)
+        )
+        logger.info("Using persistent conversation state at %s", db_path)
+        return saver
 
     def _ensure_api_key(self) -> None:
         if not self._settings.llm.api_key_value:
@@ -138,7 +176,7 @@ class KnowledgeAgent:
             self._graphs[model_name] = create_react_agent(
                 model,
                 self._tools,
-                prompt=SYSTEM_PROMPT,
+                prompt=self._system_prompt,
                 response_format=AgentAnswer,
                 checkpointer=self._checkpointer,
             )
@@ -182,19 +220,20 @@ class KnowledgeAgent:
         model_name = self._resolve_model_name(request)
         graph, model = self._graph_for(model_name)
         thread_id = request.session_id or f"oneshot-{uuid.uuid4().hex}"
-        user_text = build_user_message(request.prompt, request.package)
+        user_text = build_user_message(request.prompt, request.package, request.version)
 
         logger.info(
-            "ask: thread=%s model=%s package=%s prompt=%r",
+            "ask: thread=%s model=%s package=%s version=%s prompt=%r",
             thread_id,
             model_name,
             request.package,
+            request.version,
             request.prompt[:200],
         )
 
         config = self._make_config(thread_id)
         answer = await self._invoke(graph, model, config, user_text)
-        return self._postprocess(answer, request)
+        return await self._finalize(answer, request, graph, config)
 
     async def astream(self, request: ContextRequest) -> AsyncIterator[dict]:
         """Run one turn, yielding live events (reasoning / tool calls / result).
@@ -210,7 +249,7 @@ class KnowledgeAgent:
         model_name = self._resolve_model_name(request)
         graph, model = self._graph_for(model_name)
         thread_id = request.session_id or f"oneshot-{uuid.uuid4().hex}"
-        user_text = build_user_message(request.prompt, request.package)
+        user_text = build_user_message(request.prompt, request.package, request.version)
         logger.info(
             "astream: thread=%s model=%s prompt=%r", thread_id, model_name, request.prompt[:200]
         )
@@ -225,7 +264,7 @@ class KnowledgeAgent:
         async def _run() -> None:
             try:
                 answer = await self._invoke(graph, model, config, user_text)
-                outcome["answer"] = self._postprocess(answer, request)
+                outcome["answer"] = await self._finalize(answer, request, graph, config)
             except Exception as exc:  # noqa: BLE001 - surfaced as an error event
                 logger.exception("Streaming run failed")
                 outcome["error"] = str(exc)
@@ -259,6 +298,7 @@ class KnowledgeAgent:
                 yield {
                     "type": "final",
                     "result": result.model_dump(),
+                    "answer": result.answer or result.summary,
                     "markdown": render_result_markdown(result),
                     "session_id": thread_id,
                 }
@@ -317,7 +357,7 @@ class KnowledgeAgent:
             ev_text = "(no tool results were gathered)"
 
         synth_messages = [
-            SystemMessage(content=SYSTEM_PROMPT),
+            SystemMessage(content=self._system_prompt),
             HumanMessage(
                 content=(
                     f"{request_text}\n\n"
@@ -340,8 +380,36 @@ class KnowledgeAgent:
         return _coerce_to_result(answer)
 
     async def aclose(self) -> None:
-        """Release the persistent sempkg MCP session (warm subprocess)."""
+        """Release the warm sempkg MCP session and any persistent state store."""
         await self._tool_provider.aclose()
+        with contextlib.suppress(Exception):
+            await self._checkpointer_stack.aclose()
+
+    async def _finalize(
+        self, answer: AgentAnswer, request: ContextRequest, graph, config: dict
+    ) -> AgentAnswer:
+        """Cap findings and run the deterministic citation check before returning."""
+        if answer.is_clarification():
+            return answer
+        answer = self._postprocess(answer, request)
+        if self._settings.agent.verify_citations and answer.findings:
+            answer = await self._verify_citations(answer, graph, config)
+        return answer
+
+    async def _verify_citations(self, answer: AgentAnswer, graph, config: dict) -> AgentAnswer:
+        """Mark each finding verified/unverified against the retrieved evidence."""
+        try:
+            snapshot = await graph.aget_state(config)
+            messages = list(snapshot.values.get("messages", []))
+            evidence_texts = [content for _, _, content in _collect_tool_evidence(messages)]
+            verified = verify_findings(answer.findings, evidence_texts)
+            n_bad = sum(1 for f in verified if f.verified is False)
+            if n_bad:
+                logger.warning("%d/%d findings could not be verified.", n_bad, len(verified))
+            return answer.model_copy(update={"findings": verified})
+        except Exception:  # noqa: BLE001 - verification is best-effort, never fatal
+            logger.exception("Citation verification failed; returning unverified findings")
+            return answer
 
     def _postprocess(self, answer: AgentAnswer, request: ContextRequest) -> AgentAnswer:
         """Apply server-side guardrails (e.g. cap findings)."""
@@ -352,3 +420,26 @@ class KnowledgeAgent:
             logger.info("Trimming findings %d -> %d", len(answer.findings), cap)
             answer = answer.model_copy(update={"findings": answer.findings[:cap]})
         return answer
+
+    # -- introspection helpers (used by the chat UI + raw MCP passthrough) --------
+
+    def raw_tools(self) -> list[BaseTool]:
+        """The underlying sempkg MCP tools (for re-exposing over the MCP mount)."""
+        return list(self._tools or [])
+
+    async def call_tool(self, name: str, arguments: dict) -> str:
+        """Invoke one sempkg tool by name (passthrough for the MCP transport)."""
+        tool = next((t for t in (self._tools or []) if t.name == name), None)
+        if tool is None:
+            raise KeyError(f"sempkg tool {name!r} is not available")
+        return await tool.ainvoke(arguments)
+
+    async def list_installed(self) -> str:
+        """Return the sempkg `list_packages` output (cached). Empty string on failure."""
+        if self._installed_text is None:
+            try:
+                self._installed_text = str(await self.call_tool("list_packages", {}))
+            except Exception:  # noqa: BLE001 - non-fatal; UI degrades gracefully
+                logger.exception("list_packages failed")
+                self._installed_text = ""
+        return self._installed_text

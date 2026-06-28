@@ -40,6 +40,10 @@ dev = [
     "pytest-cov>=4.1",
     "ruff>=0.5",
 ]
+# Persistent multi-turn conversation state (set SEMPKG_AGENT_STATE_DB to use).
+persist = [
+    "langgraph-checkpoint-sqlite>=2.0,<3",
+]
 
 [project.scripts]
 sempkg-agent = "sempkg_agent.cli:main"

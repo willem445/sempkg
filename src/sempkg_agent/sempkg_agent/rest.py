@@ -36,6 +36,7 @@ _UI_PATH = Path(__file__).resolve().parent / "static" / "index.html"
 class AskRequest(BaseModel):
     prompt: str = Field(..., min_length=1)
     package: str | None = None
+    version: str | None = None
     session_id: str | None = None
     max_findings: int | None = Field(default=None, ge=1, le=50)
     model: str | None = None
@@ -86,12 +87,30 @@ def build_rest_app(agent: KnowledgeAgent, settings: Settings) -> FastAPI:
     def list_models() -> dict:
         return {"default": default_model, "models": catalog_as_dicts(default_model)}
 
+    @app.get("/v1/config")
+    async def ui_config() -> dict:
+        """Branding + persona + installed-knowledge info for the chat UI."""
+        installed = ""
+        try:
+            installed = await agent.list_installed()
+        except Exception:  # noqa: BLE001 - UI still works without the package list
+            logger.exception("Failed to list installed packages for /v1/config")
+        return {
+            "mode": settings.agent.mode,
+            "title": settings.agent.ui_title,
+            "subtitle": settings.agent.ui_subtitle,
+            "default_model": default_model,
+            "verify_citations": settings.agent.verify_citations,
+            "installed": installed,
+        }
+
     @app.post("/v1/ask", response_model=AskResponse, dependencies=[Depends(require_auth)])
     async def ask(body: AskRequest) -> AskResponse:
         session_id = body.session_id or f"rest-{uuid.uuid4().hex}"
         request = ContextRequest(
             prompt=body.prompt,
             package=body.package,
+            version=body.version,
             session_id=session_id,
             max_findings=body.max_findings,
             model=body.model,
@@ -124,6 +143,7 @@ def build_rest_app(agent: KnowledgeAgent, settings: Settings) -> FastAPI:
         request = ContextRequest(
             prompt=body.prompt,
             package=body.package,
+            version=body.version,
             session_id=session_id,
             max_findings=body.max_findings,
             model=body.model,

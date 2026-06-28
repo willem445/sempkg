@@ -197,6 +197,54 @@ async def test_synthesis_coerces_stray_clarification() -> None:
     assert out.summary == "actually found ExpansionKind"
 
 
+class _GraphWithState:
+    """Returns a preset answer and exposes a tool-message history for verification."""
+
+    def __init__(self, answer: AgentAnswer, messages: list) -> None:
+        self._answer = answer
+        self._messages = messages
+
+    async def ainvoke(self, state, config):
+        return {"structured_response": self._answer}
+
+    async def aget_state(self, config):
+        class _Snap:
+            pass
+
+        snap = _Snap()
+        snap.values = {"messages": self._messages}
+        return snap
+
+
+async def test_citation_verification_marks_findings() -> None:
+    snippet = "fn parse_variants(input: &str) -> Vec<Variant> {"
+    answer = AgentAnswer(
+        kind="context_result",
+        summary="found it",
+        reasoning="queried",
+        findings=[
+            Finding(package="p", file="f.rs", start_line=1, end_line=2,
+                    snippet=snippet, explanation="why"),
+            Finding(package="p", file="g.rs", start_line=9, end_line=9,
+                    snippet="fn hallucinated_symbol() { nope() }", explanation="why"),
+        ],
+    )
+    history = [
+        HumanMessage(content="q"),
+        AIMessage(content="", tool_calls=[{"name": "query", "args": {}, "id": "a"}]),
+        ToolMessage(content=f"results...\n{snippet}\n    body\n}}", tool_call_id="a"),
+    ]
+    agent = KnowledgeAgent(Settings(), tool_provider=None)
+    _install(agent, _GraphWithState(answer, history))
+    out = await agent.ask(ContextRequest(prompt="x"))
+    assert out.findings[0].verified is True   # snippet present in evidence
+    assert out.findings[1].verified is False  # fabricated snippet flagged
+
+
+async def test_default_mode_is_human() -> None:
+    assert Settings().agent.mode == "human"
+
+
 def test_collect_tool_evidence_pairs_calls_with_results() -> None:
     msgs = [
         HumanMessage(content="q"),

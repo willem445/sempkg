@@ -71,6 +71,58 @@ agent's reasoning and every sempkg tool call/result live over SSE
 curated, tiered set of OpenRouter models. Per-request model selection is validated
 against the catalog so callers can't route arbitrary expensive models.
 
+## Human knowledge-agent mode (default)
+
+The agent runs in one of two personas (`SEMPKG_AGENT_MODE`, default `human`):
+
+- **human** — an assistant in front of installed code + docs. It returns a prose
+  Markdown `answer` (the body a person reads) plus structured `findings` as cited
+  sources, and is disciplined to say "I don't know" rather than answer from general
+  knowledge when the bundles don't cover it. The chat UI renders the Markdown answer
+  and source cards (with `package@version`, line ranges, and a ✓/⚠ citation-check
+  badge). This is the "team agent in front of code + docs" use case.
+- **agent** — the original machine-to-machine persona: compact structured findings
+  for a *calling agent*.
+
+Any deployment can replace the built-in prompt wholesale with
+`SEMPKG_AGENT_SYSTEM_PROMPT` / `SEMPKG_AGENT_SYSTEM_PROMPT_FILE` (the code+docs
+assistant is only the default), and brand the UI via `SEMPKG_AGENT_UI_TITLE` /
+`SEMPKG_AGENT_UI_SUBTITLE` (surfaced through `GET /v1/config`).
+
+**Recommended improvements now built in:**
+- *Deterministic citation verification* (`verify.py`) — each finding's snippet is
+  checked against the retrieved evidence (no extra LLM/tool calls) and flagged
+  `verified` true/false, turning "grounded" from a prompt instruction into an
+  enforced property.
+- *Persistent conversation state* — `SEMPKG_AGENT_STATE_DB` swaps the in-process
+  `MemorySaver` for a SQLite checkpointer so sessions survive restarts.
+
+## Raw MCP passthrough (for calling agents)
+
+The MCP mount (`--transport mcp`, port `+2` under `all`) now re-exports the
+**standard sempkg retrieval tools** (`query`, `read_code`, `read_docs`,
+`read_symbol`, the call-graph tools) over streamable-HTTP — in addition to the
+high-level `ask` tool — by proxying the agent's warm sempkg session. This gives the
+"just expose MCP" path (a capable agent drives retrieval itself) and the
+"distilled answer" path from one hosted process, against the same curated bundles.
+
+## Versioned retrieval — open core dependency
+
+To let users ask both "how does X work?" (latest) and "in v14.2.0, how did X work?"
+(a specific release), multiple versions of the same bundle may be installed at once.
+The agent forwards a `version` scope (UI release box / REST+MCP `version` field) and
+the prompt favours the latest by default — but the underlying `query`/`search_*`
+tools don't yet accept a `version` filter, so a raw query spans **all** installed
+versions. Clean versioned retrieval needs two things in the sempkg core query layer:
+
+1. **default-to-latest** — with no filter, search only the newest installed version
+   of each package; and
+2. a **`version` filter** argument honoured by `query`/`search_*`.
+
+Until then, the release scope is a soft hint. Interim options (single-version
+install, or distinct package names per release) are documented in
+[`deploy/README.md`](../../deploy/README.md).
+
 ## Deliberately deferred (see plan doc)
 
 - **Bundle cache (hot/cold tiering)** and the **package/version router** — this

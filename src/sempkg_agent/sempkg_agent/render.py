@@ -10,39 +10,55 @@ from __future__ import annotations
 from .schemas import ClarificationRequest, ContextResult
 
 
+def _location(f) -> str:
+    """`pkg@version path:line-range` for a finding."""
+    pkg = f.package
+    if f.version:
+        pkg += f"@{f.version}"
+    loc = f.file
+    if f.start_line:
+        loc += f":{f.start_line}"
+        if f.end_line and f.end_line != f.start_line:
+            loc += f"-{f.end_line}"
+    return f"{pkg} {loc}"
+
+
 def render_result_markdown(result: ContextResult) -> str:
-    """Render a grounded context result as markdown."""
+    """Render a grounded context result as markdown.
+
+    In human mode the model supplies a prose ``answer`` (Markdown); we lead with it
+    and append a **Sources** section from the findings. In agent mode (no ``answer``)
+    we fall back to a compact summary + findings listing.
+    """
     lines: list[str] = []
-    lines.append("## Context result")
-    lines.append("")
-    lines.append(f"**Summary:** {result.summary}")
-    lines.append("")
-    if result.packages_searched:
-        lines.append(f"**Packages searched:** {', '.join(result.packages_searched)}")
-    if result.files:
-        lines.append(f"**Files with relevant context:** {', '.join(result.files)}")
-    lines.append("")
-    lines.append(f"**Reasoning:** {result.reasoning}")
-    lines.append("")
+
+    if result.answer:
+        lines.append(result.answer.rstrip("\n"))
+    else:
+        lines.append(f"**Summary:** {result.summary}")
+        lines.append("")
+        lines.append(f"**Reasoning:** {result.reasoning}")
 
     if not result.findings:
-        lines.append("_No grounded context was found for this request._")
+        if not result.answer:
+            lines.append("")
+            lines.append("_No grounded context was found in the installed bundles._")
         return "\n".join(lines)
 
-    lines.append(f"### Findings ({len(result.findings)})")
+    lines.append("")
+    lines.append(f"### Sources ({len(result.findings)})")
     for i, f in enumerate(result.findings, start=1):
-        loc = f.file
-        if f.start_line:
-            loc += f":{f.start_line}"
-            if f.end_line and f.end_line != f.start_line:
-                loc += f"-{f.end_line}"
-        title = f"{i}. `{f.symbol}`" if f.symbol else f"{i}. `{loc}`"
+        badge = ""
+        if f.verified is True:
+            badge = " ✓ verified"
+        elif f.verified is False:
+            badge = " ⚠ unverified"
+        title = f.symbol or _location(f)
         lines.append("")
-        lines.append(f"#### {title}")
-        lines.append("")
-        lines.append(f"- **Package:** `{f.package}`")
-        lines.append(f"- **Location:** `{loc}`  ({f.kind})")
-        lines.append(f"- **Why:** {f.explanation}")
+        lines.append(f"**{i}. `{title}`**{badge}")
+        lines.append(f"`{_location(f)}` · {f.kind}")
+        if f.explanation:
+            lines.append(f"> {f.explanation}")
         lines.append("")
         lines.append("```")
         lines.append(f.snippet.rstrip("\n"))

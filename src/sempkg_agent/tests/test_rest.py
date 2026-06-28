@@ -23,6 +23,9 @@ class _StubAgent:
         self.last_request = request
         return self._answer
 
+    async def list_installed(self) -> str:
+        return "ourcode  v14.2.0\nourcode  v14.1.0"
+
     async def astream(self, request: ContextRequest):
         self.last_request = request
         sid = request.session_id or "rest-x"
@@ -124,7 +127,24 @@ def test_chat_ui_is_served() -> None:
     resp = client.get("/")
     assert resp.status_code == 200
     assert "text/html" in resp.headers["content-type"]
-    assert "sempkg-agent" in resp.text
+    assert "knowledge agent" in resp.text.lower()
+
+
+def test_config_endpoint_exposes_branding_and_installed() -> None:
+    settings = Settings()
+    settings.agent.ui_title = "Acme Knowledge"
+    client, _ = _client(AgentAnswer(kind="context_result", summary="s", reasoning="r"), settings)
+    data = client.get("/v1/config").json()
+    assert data["mode"] == "human"
+    assert data["title"] == "Acme Knowledge"
+    assert "v14.2.0" in data["installed"]
+    assert data["verify_citations"] is True
+
+
+def test_version_scope_is_forwarded() -> None:
+    client, agent = _client(AgentAnswer(kind="context_result", summary="s", reasoning="r"))
+    client.post("/v1/ask", json={"prompt": "how does X work?", "version": "v14.2.0"})
+    assert agent.last_request.version == "v14.2.0"
 
 
 def test_ask_stream_emits_events() -> None:

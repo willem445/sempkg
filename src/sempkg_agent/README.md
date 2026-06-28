@@ -53,7 +53,7 @@ alongside it ("one capability, three transports").
 |-----------|----------|----------|
 | **A2A** (primary) | `/.well-known/agent.json` + A2A task API | agent-to-agent, multi-turn clarification |
 | **REST / chat** | `POST /v1/ask`, `POST /v1/ask/stream`, `GET /` (chat UI) | manual testing, simple integrations, humans |
-| **MCP mount** | streamable-HTTP `ask` tool | MCP-native hosts mounting this agent as a tool |
+| **MCP mount** | streamable-HTTP: `ask` + the raw sempkg retrieval tools | MCP-native hosts — either ask the agent, or drive `query`/`read_*` yourself |
 
 ---
 
@@ -107,19 +107,48 @@ sempkg-agent serve --transport all       # UI at http://localhost:8901/
 ```
 
 The UI provides:
-- a **question → grounded answer** chat (summary + findings with package, file,
-  line range, snippet, and the per-finding reasoning);
+- a **question → grounded answer** chat: a Markdown **prose answer** a person can
+  read, followed by **source cards** (package@version, file + line range, snippet,
+  per-source reasoning, and a ✓/⚠ citation-check badge);
 - a **"show activity" toggle** that streams the agent's reasoning and every sempkg
   tool call/result live (like Claude Code / Copilot), via SSE;
+- a **release box**: leave blank for the latest version, or scope to a release
+  (e.g. `v14.2.0`) — see *Versioned retrieval* below;
 - a **model dropdown** routed to OpenRouter, populated from a curated catalog
-  (`GET /v1/models`) — a few cheap, a couple medium, one or two strong-reasoning
-  models. Edit the list in `models.py` or override with
-  `SEMPKG_AGENT_MODEL_CATALOG` (a JSON array of `{id,label,tier,note}`);
+  (`GET /v1/models`). Edit the list in `models.py` or override with
+  `SEMPKG_AGENT_MODEL_CATALOG`;
 - multi-turn **clarification**: if the agent asks a question, just reply.
 
-Scope a question to a package by prefixing `@package` (e.g. `@lancedb where is the
-BM25 index opened?`). The streaming endpoint is `POST /v1/ask/stream` (SSE) and the
-model catalog is `GET /v1/models` if you want to drive them directly.
+### Persona, branding & your own prompt
+
+The agent defaults to a **human** persona — an assistant in front of installed code
++ docs that answers in prose and cites its sources. That's just the default:
+
+- name it with `SEMPKG_AGENT_UI_TITLE` / `SEMPKG_AGENT_UI_SUBTITLE`;
+- **replace the behaviour entirely** with your own prompt via
+  `SEMPKG_AGENT_SYSTEM_PROMPT` (inline) or `SEMPKG_AGENT_SYSTEM_PROMPT_FILE` (path);
+- switch to the machine-to-machine persona with `SEMPKG_AGENT_MODE=agent`.
+
+Branding + installed-knowledge info are exposed at `GET /v1/config`.
+
+### Grounding & verification
+
+Every cited snippet is checked **deterministically** against the evidence the agent
+actually retrieved (no extra LLM/tool calls) and flagged `verified` true/false, so a
+hallucinated citation is caught rather than trusted. Toggle with
+`SEMPKG_AGENT_VERIFY_CITATIONS`. The agent is also prompted to say *"that's not in
+the installed bundles"* instead of answering from general knowledge.
+
+### Versioned retrieval
+
+Ask generally (defaults to the **latest** installed version) or scope to a release
+via the UI release box / the `version` field on REST + MCP. Note: cleanly isolating
+a specific release when several versions are installed depends on a `version` filter
+in the sempkg core query layer — see *Versioned retrieval* in
+[`deploy/README.md`](../../deploy/README.md). Today the scope is a soft hint.
+
+Scope a question to a package by prefixing `@package`. The streaming endpoint is
+`POST /v1/ask/stream` (SSE).
 
 ### REST quickstart
 
@@ -171,12 +200,21 @@ Highlights:
 | `SEMPKG_AGENT_MODEL` | `anthropic/claude-3.5-sonnet` | any OpenRouter model slug |
 | `SEMPKG_AGENT_API_BASE` | `https://openrouter.ai/api/v1` | OpenAI-compatible endpoint |
 | `SEMPKG_AGENT_MCP_WORKSPACE` | `.` | workspace with `sempkg.toml` + bundles |
+| `SEMPKG_AGENT_MODE` | `human` | persona: `human` (prose + cited sources) or `agent` |
+| `SEMPKG_AGENT_SYSTEM_PROMPT(_FILE)` | — | replace the built-in prompt with your own |
+| `SEMPKG_AGENT_UI_TITLE` / `_SUBTITLE` | generic | chat-UI branding |
+| `SEMPKG_AGENT_VERIFY_CITATIONS` | `1` | deterministic citation grounding check |
+| `SEMPKG_AGENT_STATE_DB` | — | SQLite path for persistent multi-turn state (`[persist]`) |
 | `SEMPKG_AGENT_MAX_ITERATIONS` | `12` | tool-call round ceiling (cost guard) |
 | `SEMPKG_AGENT_MAX_FINDINGS` | `12` | cap on returned findings |
 | `SEMPKG_AGENT_TRACE` | `0` | log LLM reasoning + every sempkg tool call/result |
 | `SEMPKG_AGENT_PORT` | `8900` | bind port |
 | `SEMPKG_AGENT_PUBLIC_URL` | `http://localhost:8900` | URL advertised in the AgentCard |
 | `SEMPKG_AGENT_AUTH_TOKEN` | — | optional bearer token for REST |
+
+> **Hosted deployment (registry + agent + MCP):** see [`deploy/`](../../deploy/) for
+> a docker-compose stack and a GitHub Actions workflow that publishes a rolling
+> "latest" bundle (tip of main) plus tagged releases to the registry.
 
 ---
 

@@ -25,6 +25,14 @@ class ContextRequest(BaseModel):
             "closely related packages if needed."
         ),
     )
+    version: str | None = Field(
+        default=None,
+        description=(
+            "Optional release/version scope. Omit to answer from the latest installed "
+            "version of each package; set it (e.g. 'v2.3.0') to answer about a specific "
+            "release. Versions are never blended."
+        ),
+    )
     session_id: str | None = Field(
         default=None,
         description="Conversation/thread id for multi-turn clarification continuity.",
@@ -43,6 +51,9 @@ class Finding(BaseModel):
     """A single piece of grounded context selected for the caller."""
 
     package: str = Field(..., description="Package the context was found in.")
+    version: str | None = Field(
+        default=None, description="Release/version of the package this context is from."
+    )
     file: str = Field(..., description="Source/doc file path within the package.")
     start_line: int = Field(
         ..., ge=0, description="1-based start line (0 if not line-addressable)."
@@ -58,13 +69,29 @@ class Finding(BaseModel):
     explanation: str = Field(
         ..., description="Brief reasoning for why this context fulfils the caller's request."
     )
+    verified: bool | None = Field(
+        default=None,
+        description=(
+            "Set by the server's deterministic citation check: True if the snippet was "
+            "found verbatim in the retrieved evidence, False if it could not be confirmed, "
+            "None if checking was disabled."
+        ),
+    )
 
 
 class ContextResult(BaseModel):
     """The grounded answer payload returned to the caller."""
 
     kind: Literal["context_result"] = "context_result"
-    summary: str = Field(..., description="Concise summary of the retrieved context.")
+    summary: str = Field(..., description="Concise one-or-two-sentence summary of the answer.")
+    answer: str | None = Field(
+        default=None,
+        description=(
+            "Human-readable answer in Markdown — the full prose explanation a person reads, "
+            "with inline code snippets and source references. Populated in human mode; "
+            "machine/agent callers can rely on `findings` instead."
+        ),
+    )
     reasoning: str = Field(
         ..., description="Overall reasoning: how the context was located and why it was selected."
     )
@@ -107,6 +134,7 @@ class AgentAnswer(BaseModel):
 
     # context_result fields
     summary: str | None = None
+    answer: str | None = None
     reasoning: str | None = None
     packages_searched: list[str] = Field(default_factory=list)
     findings: list[Finding] = Field(default_factory=list)
@@ -131,6 +159,7 @@ class AgentAnswer(BaseModel):
     def as_result(self) -> ContextResult:
         return ContextResult(
             summary=self.summary or "",
+            answer=self.answer,
             reasoning=self.reasoning or "",
             packages_searched=self.packages_searched,
             findings=self.findings,

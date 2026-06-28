@@ -15,6 +15,8 @@ from __future__ import annotations
 import os
 import shlex
 from functools import lru_cache
+from pathlib import Path
+from typing import Literal
 
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -118,16 +120,53 @@ class AgentSettings(BaseSettings):
         extra="ignore",
     )
 
+    # Persona/output mode — selects the *built-in* default system prompt:
+    #   "human" — a knowledge assistant for people: prose answers (Markdown) that
+    #             cite sources with code snippets; says "I don't know" when the
+    #             answer isn't in the installed bundles. This is the default.
+    #   "agent" — a machine-to-machine retrieval agent: compact, structured findings
+    #             optimised for a *calling agent* rather than a person.
+    mode: Literal["human", "agent"] = Field(default="human")
+    # Bring-your-own system prompt. When set, it REPLACES the built-in persona
+    # prompt entirely, so any deployment can define its own assistant behaviour
+    # (the agent in front of code + docs is just the default use case). Provide the
+    # text directly via SEMPKG_AGENT_SYSTEM_PROMPT, or a path via
+    # SEMPKG_AGENT_SYSTEM_PROMPT_FILE (loaded at startup).
+    system_prompt: str | None = Field(default=None)
+    system_prompt_file: str | None = Field(default=None)
+    # Chat-UI branding — generic by default; name it for your deployment.
+    ui_title: str = Field(default="sempkg knowledge agent")
+    ui_subtitle: str = Field(
+        default="Ask about the installed code and docs — grounded, with cited sources."
+    )
     # Hard ceiling on agent tool-call rounds — a cost-control guardrail.
     max_iterations: int = Field(default=12, gt=0)
     # Default number of hits requested from the `query` tool per search.
     default_query_limit: int = Field(default=10, gt=0)
     # Max findings returned to the caller (keeps the payload focused).
     max_findings: int = Field(default=12, gt=0)
+    # Deterministic citation check: confirm each finding's snippet actually appears
+    # in the retrieved evidence (no extra LLM/tool calls). Flags hallucinated cites.
+    verify_citations: bool = Field(default=True)
     # When true, log every LLM reasoning step + sempkg tool call/result
     # (to the `sempkg_agent.trace` logger). Off by default; enable for inspection.
     trace: bool = Field(default=False)
-    # Conversation memory TTL is process-lifetime by default (in-memory store).
+    # Optional path to a SQLite file for persistent conversation state. When set,
+    # multi-turn sessions survive restarts (vs the default in-process MemorySaver).
+    state_db: str | None = Field(default=None)
+
+    @model_validator(mode="after")
+    def _load_prompt_file(self) -> AgentSettings:
+        """Load a custom system prompt from file when a path was given."""
+        if self.system_prompt is None and self.system_prompt_file:
+            path = Path(self.system_prompt_file).expanduser()
+            try:
+                self.system_prompt = path.read_text(encoding="utf-8")
+            except OSError as exc:  # surface clearly rather than silently ignoring
+                raise ValueError(
+                    f"SEMPKG_AGENT_SYSTEM_PROMPT_FILE could not be read: {path} ({exc})"
+                ) from exc
+        return self
 
 
 class ServerSettings(BaseSettings):
