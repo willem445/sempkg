@@ -59,8 +59,13 @@ artifacts = ["sempkg_agent/static/*.html"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
-addopts = "-q"
+# Default run is the fast, fully-offline suite. Functional (end-to-end) tests are
+# opt-in: `pytest -m functional`.
+addopts = "-q -m 'not functional'"
 asyncio_mode = "auto"
+markers = [
+    "functional: end-to-end tests requiring built sempkg/sembundle binaries, a running registry, and (for the agent backend test) an OpenRouter key + SEMPKG_AGENT_FUNCTIONAL=1. Self-skip when prerequisites are absent.",
+]
 
 [tool.ruff]
 line-length = 100

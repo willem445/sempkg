@@ -237,13 +237,36 @@ transport per service/container** so each scales independently.
 
 ## Tests
 
-Tests are fully offline — the LLM and the sempkg MCP server are mocked, so **no
-OpenRouter calls are made**.
+The default suite is fully offline — the LLM and the sempkg MCP server are mocked,
+so **no OpenRouter calls are made**.
 
 ```bash
 uv pip install -e ".[dev]"
 pytest
 ```
+
+### Functional (end-to-end) tests
+
+Marked `functional` and **deselected by default**. They self-skip when their
+prerequisites are absent, so they're safe to invoke anywhere:
+
+```bash
+# Publish a rolling "latest" bundle into a workspace and verify it installs.
+# Needs the built sempkg + sembundle binaries; spins up a real registry. No LLM.
+pytest -m functional -k publish
+
+# The agent server answering over the real sempkg backend (paid + slow — opt-in).
+SEMPKG_AGENT_FUNCTIONAL=1 OPENROUTER_API_KEY=sk-or-... \
+  SEMPKG_AGENT_MCP_WORKSPACE=/path/to/workspace \
+  pytest -m functional -k backend
+```
+
+- `test_publish_corpus_functional.py` — `sembundle build → POST /publish → sempkg
+  sync`: the exact flow a CI job uses to push tip-of-main as `latest` into the
+  agent's corpus.
+- `test_agent_backend_functional.py` — boots the real `KnowledgeAgent` (launches
+  `sempkg mcp`, loads the indexes) and drives `/v1/ask` through an in-process ASGI
+  client, asserting a grounded, citation-verified answer.
 
 ---
 
