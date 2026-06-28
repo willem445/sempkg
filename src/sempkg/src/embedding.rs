@@ -26,6 +26,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+use crate::providers::{Embed, OpenAiProviderConfig, ProviderKind};
 use crate::reranker::{download_file, expand_tilde};
 
 // ---------------------------------------------------------------------------
@@ -153,21 +154,39 @@ pub struct EmbeddingConfig {
     /// (`embeddinggemma-300m` or `qwen3-embedding-0.6b`). Defaults to
     /// `embeddinggemma-300m`. This selects the identity, dimension, pooling,
     /// prompts, and the default GGUF download.
+    /// Only used when `provider = "local"`.
     #[serde(default = "default_model_id")]
     pub model_id: String,
+
+    /// Which backend to use. `"local"` (default) requires the `embeddings`
+    /// cargo feature; `"openai"` uses any OpenAI-compatible HTTP endpoint.
+    #[serde(default)]
+    pub provider: ProviderKind,
 
     /// Optional explicit path to the GGUF file, overriding the default location
     /// for the selected model. May use `~` for the home directory. When set,
     /// make sure it points at the GGUF for `model_id`.
+    /// Only used when `provider = "local"`.
     pub model: Option<String>,
 
+    /// HuggingFace (or other) URL to download the GGUF from.
+    /// Overrides the built-in default URL when running `sempkg embedding pull`.
+    /// Only used when `provider = "local"`.
+    pub model_url: Option<String>,
+
+    /// OpenAI-compatible provider settings. Required when `provider = "openai"`.
+    /// Must include `dim` (the model's embedding dimension).
+    pub openai: Option<OpenAiProviderConfig>,
+
     /// Context window used when embedding a chunk. Defaults to 2048.
+    /// Only used when `provider = "local"`.
     #[serde(default = "default_n_ctx")]
     pub n_ctx: u32,
 
     /// Number of model layers to offload to the GPU. `0` (default) = CPU-only.
     /// Requires a llama-cpp-2 build with the matching GPU backend; a CPU-only
     /// build silently ignores any non-zero value.
+    /// Only used when `provider = "local"`.
     #[serde(default)]
     pub gpu_layers: u32,
 }
@@ -187,7 +206,10 @@ impl Default for EmbeddingConfig {
         Self {
             enabled: default_true(),
             model_id: default_model_id(),
+            provider: ProviderKind::Local,
             model: None,
+            model_url: None,
+            openai: None,
             n_ctx: default_n_ctx(),
             gpu_layers: 0,
         }
@@ -410,7 +432,7 @@ impl Embedder {
     /// per-row context/KV-cache allocation that dominates `embed_document` while
     /// staying within the single-sequence decode path that pooled embedding
     /// models require.
-    pub fn embed_documents_batch(&self, texts: &[impl AsRef<str>]) -> Result<Vec<Vec<f32>>> {
+    pub fn embed_documents_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
         use llama_cpp_2::{llama_batch::LlamaBatch, model::AddBos};
 
         if texts.is_empty() {
@@ -460,6 +482,29 @@ impl Embedder {
     }
 }
 
+#[cfg(feature = "embeddings")]
+impl Embed for Embedder {
+    fn embed_query(&self, query: &str) -> Result<Vec<f32>> {
+        Embedder::embed_query(self, query)
+    }
+
+    fn embed_document(&self, text: &str) -> Result<Vec<f32>> {
+        Embedder::embed_document(self, text)
+    }
+
+    fn embed_documents_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        Embedder::embed_documents_batch(self, texts)
+    }
+
+    fn dim(&self) -> usize {
+        Embedder::dim(self)
+    }
+
+    fn model_id(&self) -> &str {
+        Embedder::model_id(self)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // No-op stub when the feature is disabled
 // ---------------------------------------------------------------------------
@@ -494,8 +539,27 @@ impl Embedder {
         anyhow::bail!("Embedding support is not compiled into this binary.")
     }
 
-    pub fn embed_documents_batch(&self, _texts: &[impl AsRef<str>]) -> Result<Vec<Vec<f32>>> {
+    pub fn embed_documents_batch(&self, _texts: &[&str]) -> Result<Vec<Vec<f32>>> {
         anyhow::bail!("Embedding support is not compiled into this binary.")
+    }
+}
+
+#[cfg(not(feature = "embeddings"))]
+impl Embed for Embedder {
+    fn embed_query(&self, query: &str) -> Result<Vec<f32>> {
+        Embedder::embed_query(self, query)
+    }
+    fn embed_document(&self, text: &str) -> Result<Vec<f32>> {
+        Embedder::embed_document(self, text)
+    }
+    fn embed_documents_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        Embedder::embed_documents_batch(self, texts)
+    }
+    fn dim(&self) -> usize {
+        Embedder::dim(self)
+    }
+    fn model_id(&self) -> &str {
+        Embedder::model_id(self)
     }
 }
 

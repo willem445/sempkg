@@ -19,6 +19,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+use crate::providers::{Expand, OpenAiProviderConfig, ProviderKind};
 use crate::reranker::{download_file, expand_tilde};
 
 // ---------------------------------------------------------------------------
@@ -53,9 +54,23 @@ pub struct QueryExpansionConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
 
+    /// Which backend to use. `"local"` (default) requires the `embeddings`
+    /// cargo feature; `"openai"` uses any OpenAI-compatible HTTP endpoint.
+    #[serde(default)]
+    pub provider: ProviderKind,
+
     /// Path to the GGUF model file. May use `~`. Defaults to
     /// `~/.sempkg/models/qmd-query-expansion-1.7b-q4_k_m.gguf`.
+    /// Only used when `provider = "local"`.
     pub model: Option<String>,
+
+    /// HuggingFace (or other) URL to download the GGUF from.
+    /// Overrides the built-in default URL when pulling the model.
+    /// Only used when `provider = "local"`.
+    pub model_url: Option<String>,
+
+    /// OpenAI-compatible provider settings. Required when `provider = "openai"`.
+    pub openai: Option<OpenAiProviderConfig>,
 
     /// Maximum number of expanded variants to keep (after parsing/dedup).
     #[serde(default = "default_max_variants")]
@@ -133,7 +148,10 @@ impl Default for QueryExpansionConfig {
     fn default() -> Self {
         Self {
             enabled: default_true(),
+            provider: ProviderKind::Local,
             model: None,
+            model_url: None,
+            openai: None,
             max_variants: default_max_variants(),
             max_tokens: default_max_tokens(),
             n_ctx: default_n_ctx(),
@@ -183,7 +201,10 @@ pub fn pull_model(
     gguf_url: Option<&str>,
 ) -> Result<()> {
     let model_path = config.resolved_model_path();
-    let source_url = gguf_url.unwrap_or(DEFAULT_GGUF_URL);
+    // Priority: CLI --gguf-url flag > toml model_url > built-in default
+    let source_url = gguf_url
+        .or_else(|| config.model_url.as_deref())
+        .unwrap_or(DEFAULT_GGUF_URL);
 
     if model_path.is_file() {
         println!(
@@ -349,7 +370,7 @@ fn strip_think(text: &str) -> &str {
 /// Lines without a recognised prefix are treated leniently as `vec:` variants.
 /// Variants are de-duplicated (case-insensitive) against each other and the
 /// original query, and capped at `max_variants`.
-fn parse_variants(raw: &str, original: &str, max_variants: usize) -> Vec<ExpandedQuery> {
+pub(crate) fn parse_variants(raw: &str, original: &str, max_variants: usize) -> Vec<ExpandedQuery> {
     let body = strip_think(raw);
     let original_norm = original.trim().to_lowercase();
     let original_tokens = content_tokens(original);
@@ -572,6 +593,13 @@ impl QueryExpander {
     }
 }
 
+#[cfg(feature = "embeddings")]
+impl Expand for QueryExpander {
+    fn expand(&self, query: &str) -> Vec<ExpandedQuery> {
+        QueryExpander::expand(self, query)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // No-op stub when the feature is disabled
 // ---------------------------------------------------------------------------
@@ -591,6 +619,13 @@ impl QueryExpander {
     /// Always returns no variants (caller falls back to the original query).
     pub fn expand(&self, _query: &str) -> Vec<ExpandedQuery> {
         Vec::new()
+    }
+}
+
+#[cfg(not(feature = "embeddings"))]
+impl Expand for QueryExpander {
+    fn expand(&self, query: &str) -> Vec<ExpandedQuery> {
+        QueryExpander::expand(self, query)
     }
 }
 
