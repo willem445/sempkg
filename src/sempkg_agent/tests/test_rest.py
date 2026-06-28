@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
 
@@ -20,6 +22,31 @@ class _StubAgent:
     async def ask(self, request: ContextRequest) -> AgentAnswer:
         self.last_request = request
         return self._answer
+
+    async def astream(self, request: ContextRequest):
+        self.last_request = request
+        sid = request.session_id or "rest-x"
+        yield {"type": "status", "state": "working", "model": request.model or "default",
+               "session_id": sid}
+        yield {"type": "tool_call", "name": "query", "input": "{}"}
+        yield {"type": "tool_result", "name": "query", "output": "results"}
+        if self._answer.is_clarification():
+            clar = self._answer.as_clarification()
+            yield {"type": "clarification", "question": clar.question,
+                   "rationale": clar.rationale, "session_id": sid}
+        else:
+            res = self._answer.as_result()
+            yield {"type": "final", "result": res.model_dump(), "markdown": "md", "session_id": sid}
+        yield {"type": "done"}
+
+
+def _parse_sse(text: str) -> list[dict]:
+    events = []
+    for frame in text.split("\n\n"):
+        for line in frame.splitlines():
+            if line.startswith("data:"):
+                events.append(json.loads(line[5:].strip()))
+    return events
 
 
 def _client(answer: AgentAnswer, settings: Settings | None = None) -> tuple[TestClient, _StubAgent]:
@@ -78,6 +105,50 @@ def test_ask_clarification_flow() -> None:
     assert body["kind"] == "clarification"
     assert body["clarification"]["question"] == "Which pandas version?"
     assert body["session_id"] == "abc"  # caller-provided session id preserved
+
+
+def test_models_endpoint_lists_catalog() -> None:
+    client, _ = _client(AgentAnswer(kind="context_result", summary="s", reasoning="r"))
+    resp = client.get("/v1/models")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "default" in body and isinstance(body["models"], list) and body["models"]
+    tiers = {m["tier"] for m in body["models"]}
+    assert {"cheap", "high"} & tiers  # curated tiers present
+    # The configured default model is always selectable.
+    assert any(m["id"] == body["default"] for m in body["models"])
+
+
+def test_chat_ui_is_served() -> None:
+    client, _ = _client(AgentAnswer(kind="context_result", summary="s", reasoning="r"))
+    resp = client.get("/")
+    assert resp.status_code == 200
+    assert "text/html" in resp.headers["content-type"]
+    assert "sempkg-agent" in resp.text
+
+
+def test_ask_stream_emits_events() -> None:
+    answer = AgentAnswer(
+        kind="context_result",
+        summary="streamed answer",
+        reasoning="r",
+        findings=[
+            Finding(package="pandas", file="m.py", start_line=1, end_line=2,
+                    snippet="def merge(): ...", explanation="x")
+        ],
+    )
+    client, agent = _client(answer)
+    resp = client.post("/v1/ask/stream", json={"prompt": "merge?", "model": "openai/gpt-4o-mini"})
+    assert resp.status_code == 200
+    assert "text/event-stream" in resp.headers["content-type"]
+    events = _parse_sse(resp.text)
+    types = [e["type"] for e in events]
+    assert types[0] == "status" and types[-1] == "done"
+    assert "tool_call" in types and "tool_result" in types
+    final = next(e for e in events if e["type"] == "final")
+    assert final["result"]["summary"] == "streamed answer"
+    # Per-request model selection propagates into the request.
+    assert agent.last_request.model == "openai/gpt-4o-mini"
 
 
 def test_auth_token_enforced() -> None:

@@ -36,7 +36,8 @@ def _build_app(transport: str, agent: KnowledgeAgent, settings: Settings):
         from .a2a_server import build_a2a_app
 
         return build_a2a_app(agent, settings)
-    if transport == "rest":
+    if transport in ("rest", "chat"):
+        # 'chat' is an alias for 'rest' — the same app also serves the chat UI at /.
         from .rest import build_rest_app
 
         return build_rest_app(agent, settings)
@@ -81,16 +82,26 @@ async def _run(settings: Settings, transport: str) -> None:
                 _serve_one(build_mcp_app(agent, settings), host, base_port + 2, level),
             ]
             logger.info(
-                "Serving A2A=%d  REST=%d  MCP=%d on %s",
+                "Serving A2A=%d  REST/chat-UI=%d  MCP=%d on %s  (chat UI: http://localhost:%d/)",
                 base_port,
                 base_port + 1,
                 base_port + 2,
                 host,
+                base_port + 1,
             )
             await asyncio.gather(*servers)
         else:
             app = _build_app(transport, agent, settings)
-            logger.info("Serving %s transport on %s:%d", transport.upper(), host, base_port)
+            if transport in ("rest", "chat"):
+                logger.info(
+                    "Serving %s on %s:%d  (chat UI: http://localhost:%d/)",
+                    transport.upper(),
+                    host,
+                    base_port,
+                    base_port,
+                )
+            else:
+                logger.info("Serving %s transport on %s:%d", transport.upper(), host, base_port)
             await _serve_one(app, host, base_port, level)
     finally:
         # Best-effort teardown of the warm sempkg subprocess (same task as setup).
@@ -127,9 +138,10 @@ def main() -> None:
     serve = sub.add_parser("serve", help="Start the agent server")
     serve.add_argument(
         "--transport",
-        choices=["a2a", "rest", "mcp", "all"],
+        choices=["a2a", "rest", "chat", "mcp", "all"],
         default="a2a",
-        help="Inbound protocol to serve (default: a2a). 'all' runs every transport.",
+        help="Inbound protocol to serve (default: a2a). 'chat' = REST + chat UI; "
+        "'all' runs every transport.",
     )
     serve.set_defaults(func=_cmd_serve)
 

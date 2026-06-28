@@ -52,7 +52,7 @@ alongside it ("one capability, three transports").
 | Transport | Endpoint | Best for |
 |-----------|----------|----------|
 | **A2A** (primary) | `/.well-known/agent.json` + A2A task API | agent-to-agent, multi-turn clarification |
-| **REST** | `POST /v1/ask`, `GET /healthz` | quick local/manual testing, simple integrations |
+| **REST / chat** | `POST /v1/ask`, `POST /v1/ask/stream`, `GET /` (chat UI) | manual testing, simple integrations, humans |
 | **MCP mount** | streamable-HTTP `ask` tool | MCP-native hosts mounting this agent as a tool |
 
 ---
@@ -94,6 +94,32 @@ Print the A2A AgentCard (for registration/debugging):
 ```bash
 sempkg-agent card
 ```
+
+### Chat UI
+
+A built-in, copilot-style chat UI is served at **`/`** by the `rest`/`chat`
+transports (and on the REST port under `all`):
+
+```bash
+sempkg-agent serve --transport chat      # UI at http://localhost:8900/
+# or
+sempkg-agent serve --transport all       # UI at http://localhost:8901/
+```
+
+The UI provides:
+- a **question → grounded answer** chat (summary + findings with package, file,
+  line range, snippet, and the per-finding reasoning);
+- a **"show activity" toggle** that streams the agent's reasoning and every sempkg
+  tool call/result live (like Claude Code / Copilot), via SSE;
+- a **model dropdown** routed to OpenRouter, populated from a curated catalog
+  (`GET /v1/models`) — a few cheap, a couple medium, one or two strong-reasoning
+  models. Edit the list in `models.py` or override with
+  `SEMPKG_AGENT_MODEL_CATALOG` (a JSON array of `{id,label,tier,note}`);
+- multi-turn **clarification**: if the agent asks a question, just reply.
+
+Scope a question to a package by prefixing `@package` (e.g. `@lancedb where is the
+BM25 index opened?`). The streaming endpoint is `POST /v1/ask/stream` (SSE) and the
+model catalog is `GET /v1/models` if you want to drive them directly.
 
 ### REST quickstart
 

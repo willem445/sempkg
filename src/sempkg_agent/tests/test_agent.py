@@ -23,13 +23,23 @@ class _FakeGraph:
         return {"structured_response": self._answer}
 
 
-def _agent_with(answer: AgentAnswer, **agent_overrides) -> KnowledgeAgent:
+def _install(agent: KnowledgeAgent, graph, model=None) -> KnowledgeAgent:
+    """Inject a fake graph/model for the default model id, bypassing setup()."""
+    agent._tools = []  # marks setup() as done
+    name = agent._default_model_name
+    agent._graphs[name] = graph
+    agent._models[name] = model if model is not None else object()
+    return agent
+
+
+def _agent_with(answer: AgentAnswer, **agent_overrides) -> tuple[KnowledgeAgent, _FakeGraph]:
     settings = Settings()
     for k, v in agent_overrides.items():
         setattr(settings.agent, k, v)
     agent = KnowledgeAgent(settings, tool_provider=None)  # provider unused in ask()
-    agent._graph = _FakeGraph(answer)
-    return agent
+    graph = _FakeGraph(answer)
+    _install(agent, graph)
+    return agent, graph
 
 
 def _finding(i: int) -> Finding:
@@ -47,7 +57,7 @@ async def test_ask_returns_structured_answer() -> None:
     answer = AgentAnswer(
         kind="context_result", summary="s", reasoning="r", findings=[_finding(1)]
     )
-    agent = _agent_with(answer)
+    agent, _ = _agent_with(answer)
     out = await agent.ask(ContextRequest(prompt="hello"))
     assert out.kind == "context_result"
     assert out.summary == "s"
@@ -55,16 +65,16 @@ async def test_ask_returns_structured_answer() -> None:
 
 async def test_ask_uses_session_id_as_thread() -> None:
     answer = AgentAnswer(kind="context_result", summary="s", reasoning="r")
-    agent = _agent_with(answer)
+    agent, graph = _agent_with(answer)
     await agent.ask(ContextRequest(prompt="hi", session_id="sess-42"))
-    assert agent._graph.last_config["configurable"]["thread_id"] == "sess-42"
+    assert graph.last_config["configurable"]["thread_id"] == "sess-42"
 
 
 async def test_ask_generates_oneshot_thread_when_no_session() -> None:
     answer = AgentAnswer(kind="context_result", summary="s", reasoning="r")
-    agent = _agent_with(answer)
+    agent, graph = _agent_with(answer)
     await agent.ask(ContextRequest(prompt="hi"))
-    assert agent._graph.last_config["configurable"]["thread_id"].startswith("oneshot-")
+    assert graph.last_config["configurable"]["thread_id"].startswith("oneshot-")
 
 
 async def test_findings_are_capped() -> None:
@@ -74,7 +84,7 @@ async def test_findings_are_capped() -> None:
         reasoning="r",
         findings=[_finding(i) for i in range(20)],
     )
-    agent = _agent_with(answer, max_findings=5)
+    agent, _ = _agent_with(answer, max_findings=5)
     out = await agent.ask(ContextRequest(prompt="hi"))
     assert len(out.findings) == 5
 
@@ -85,10 +95,33 @@ async def test_clarification_not_capped_or_altered() -> None:
         clarifying_question="which package?",
         clarification_rationale="ambiguous",
     )
-    agent = _agent_with(answer)
+    agent, _ = _agent_with(answer)
     out = await agent.ask(ContextRequest(prompt="vague"))
     assert out.is_clarification()
     assert out.clarifying_question == "which package?"
+
+
+async def test_streaming_emits_status_final_and_done() -> None:
+    answer = AgentAnswer(
+        kind="context_result", summary="streamed", reasoning="r", findings=[_finding(1)]
+    )
+    agent, _ = _agent_with(answer)
+    events = [ev async for ev in agent.astream(ContextRequest(prompt="hi"))]
+    types = [e["type"] for e in events]
+    assert types[0] == "status"
+    assert types[-1] == "done"
+    final = next(e for e in events if e["type"] == "final")
+    assert final["result"]["summary"] == "streamed"
+
+
+async def test_streaming_clarification_event() -> None:
+    answer = AgentAnswer(
+        kind="clarification", clarifying_question="which pkg?", clarification_rationale="x"
+    )
+    agent, _ = _agent_with(answer)
+    events = [ev async for ev in agent.astream(ContextRequest(prompt="vague"))]
+    clar = next(e for e in events if e["type"] == "clarification")
+    assert clar["question"] == "which pkg?"
 
 
 async def test_ask_before_setup_raises() -> None:
@@ -139,13 +172,13 @@ class _FakeModel:
 async def test_recursion_limit_triggers_synthesis() -> None:
     synth = AgentAnswer(kind="context_result", summary="synthesized", reasoning="from history")
     agent = KnowledgeAgent(Settings(), tool_provider=None)
-    agent._graph = _RecursionGraph([HumanMessage(content="hi")])
-    agent._model = _FakeModel(synth)
+    model = _FakeModel(synth)
+    _install(agent, _RecursionGraph([HumanMessage(content="hi")]), model=model)
     out = await agent.ask(ContextRequest(prompt="x"))
     assert out.kind == "context_result"
     assert out.summary == "synthesized"
     # The synthesis prompt presents the gathered evidence and forbids clarification.
-    assert "GATHERED EVIDENCE" in agent._model.structured.last_messages[-1].content
+    assert "GATHERED EVIDENCE" in model.structured.last_messages[-1].content
 
 
 async def test_synthesis_coerces_stray_clarification() -> None:
@@ -157,8 +190,7 @@ async def test_synthesis_coerces_stray_clarification() -> None:
         findings=[_finding(1)],
     )
     agent = KnowledgeAgent(Settings(), tool_provider=None)
-    agent._graph = _RecursionGraph([HumanMessage(content="hi")])
-    agent._model = _FakeModel(stray)
+    _install(agent, _RecursionGraph([HumanMessage(content="hi")]), model=_FakeModel(stray))
     out = await agent.ask(ContextRequest(prompt="x"))
     assert out.kind == "context_result"  # coerced
     assert len(out.findings) == 1  # findings preserved

@@ -46,6 +46,11 @@ sempkg-agent = "sempkg_agent.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["sempkg_agent"]
+# Ensure the chat UI asset ships in the wheel.
+artifacts = ["sempkg_agent/static/*.html"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"sempkg_agent/static" = "sempkg_agent/static"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

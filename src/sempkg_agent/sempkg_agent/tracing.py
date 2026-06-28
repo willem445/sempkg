@@ -31,6 +31,17 @@ def _trunc(text: str, limit: int) -> str:
     return f"{text[:limit]}… (+{len(text) - limit} more chars)"
 
 
+def is_final_answer_json(text: str) -> bool:
+    """True when ``text`` is the model emitting the final structured AgentAnswer.
+
+    Some models echo the structured ``AgentAnswer`` JSON as message content during
+    the response-format step. That arrives separately as the ``final`` event, so we
+    suppress it from the reasoning/activity stream to avoid showing raw JSON.
+    """
+    stripped = text.lstrip()
+    return stripped.startswith("{") and '"kind"' in stripped[:200]
+
+
 class AgentTracer(AsyncCallbackHandler):
     """Logs LLM reasoning + tool I/O for one agent run."""
 
@@ -46,7 +57,7 @@ class AgentTracer(AsyncCallbackHandler):
         message = getattr(gen, "message", None)
         text = (getattr(message, "content", None) or getattr(gen, "text", "") or "").strip()
         tool_calls = getattr(message, "tool_calls", None) or []
-        if text:
+        if text and not is_final_answer_json(text):
             trace_logger.info("LLM reasoning: %s", _trunc(text, self._max))
         for tc in tool_calls:
             args = json.dumps(tc.get("args", {}), default=str)

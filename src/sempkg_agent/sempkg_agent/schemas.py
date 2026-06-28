@@ -32,6 +32,11 @@ class ContextRequest(BaseModel):
     max_findings: int | None = Field(
         default=None, ge=1, le=50, description="Optional cap on returned findings."
     )
+    model: str | None = Field(
+        default=None,
+        description="Optional OpenRouter model id to use for this request (must be in the "
+        "server's model catalog). Omit to use the server default.",
+    )
 
 
 class Finding(BaseModel):
