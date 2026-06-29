@@ -183,9 +183,23 @@ pub struct EmbeddingConfig {
     #[serde(default = "default_n_ctx")]
     pub n_ctx: u32,
 
-    /// Number of model layers to offload to the GPU. `0` (default) = CPU-only.
-    /// Requires a llama-cpp-2 build with the matching GPU backend; a CPU-only
-    /// build silently ignores any non-zero value.
+    /// GPU offload policy: `"auto"` (default), `"on"`, or `"off"`. `auto`/`on`
+    /// only take effect when this binary was built with a GPU backend
+    /// (`--features embeddings,cuda` or `…,vulkan`); see [`crate::accel::GpuMode`].
+    /// Only used when `provider = "local"`.
+    #[serde(default)]
+    pub gpu: crate::accel::GpuMode,
+
+    /// Number of CPU threads for embedding inference. `0` (default) uses all
+    /// logical cores. Threads only matter for layers run on the CPU.
+    /// Only used when `provider = "local"`.
+    #[serde(default)]
+    pub n_threads: u32,
+
+    /// Advanced override: offload exactly this many model layers to the GPU.
+    /// `0` (default) defers to `gpu` (auto-detect). A non-zero value forces a
+    /// specific partial offload — useful when a small GPU can't hold the whole
+    /// model. Requires a GPU-backend build; a CPU-only build ignores it.
     /// Only used when `provider = "local"`.
     #[serde(default)]
     pub gpu_layers: u32,
@@ -211,6 +225,8 @@ impl Default for EmbeddingConfig {
             model_url: None,
             openai: None,
             n_ctx: default_n_ctx(),
+            gpu: crate::accel::GpuMode::default(),
+            n_threads: 0,
             gpu_layers: 0,
         }
     }
@@ -294,6 +310,8 @@ pub fn normalize(v: &mut [f32]) {
 pub struct Embedder {
     model: llama_cpp_2::model::LlamaModel,
     n_ctx: u32,
+    /// CPU threads used for inference contexts (resolved: 0 → all cores).
+    n_threads: i32,
     /// Embedding dimension reported by the loaded model (`n_embd`).
     dim: usize,
     /// Which model this is — drives pooling, prompts, and the recorded id.
@@ -328,7 +346,9 @@ impl Embedder {
         // double-free panic in `LlamaBackend::drop` at shutdown.
         let backend = crate::llama_runtime::shared()?;
 
-        let model_params = LlamaModelParams::default().with_n_gpu_layers(config.gpu_layers);
+        let n_gpu_layers =
+            crate::accel::resolve_gpu_layers(config.gpu, config.gpu_layers, backend, "embedding");
+        let model_params = LlamaModelParams::default().with_n_gpu_layers(n_gpu_layers);
         let model = LlamaModel::load_from_file(backend, &model_path, &model_params)
             .map_err(|e| anyhow::anyhow!("loading model from {}: {e}", model_path.display()))?;
 
@@ -346,6 +366,7 @@ impl Embedder {
         Ok(Self {
             model,
             n_ctx: config.n_ctx,
+            n_threads: crate::accel::resolve_threads(config.n_threads),
             dim,
             descriptor,
         })
@@ -368,7 +389,9 @@ impl Embedder {
         let ctx_params = LlamaContextParams::default()
             .with_n_ctx(std::num::NonZeroU32::new(self.n_ctx))
             .with_embeddings(true)
-            .with_pooling_type(self.descriptor.pooling_type());
+            .with_pooling_type(self.descriptor.pooling_type())
+            .with_n_threads(self.n_threads)
+            .with_n_threads_batch(self.n_threads);
         self.model
             .new_context(crate::llama_runtime::shared()?, ctx_params)
             .map_err(|e| anyhow::anyhow!("creating embedding context: {e}"))
@@ -582,7 +605,25 @@ pub fn print_status(config: &EmbeddingConfig) {
     }
     println!("  gguf path  : {}", model_path.display());
     println!("  n_ctx      : {}", config.n_ctx);
-    println!("  gpu_layers : {}", config.gpu_layers);
+    println!(
+        "  cpu threads: {} ({})",
+        crate::accel::resolve_threads(config.n_threads),
+        if config.n_threads == 0 {
+            "all cores"
+        } else {
+            "configured"
+        }
+    );
+    println!(
+        "  gpu        : {}{}",
+        config.gpu.as_str(),
+        if config.gpu_layers > 0 {
+            format!(" (manual override: {} layers)", config.gpu_layers)
+        } else {
+            String::new()
+        }
+    );
+    println!("  gpu build  : {}", crate::accel::gpu_build_status());
     println!();
 
     println!("Available models (set `model_id` under [embedding] in sempkg.toml):");

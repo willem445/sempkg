@@ -1,3 +1,4 @@
+mod accel;
 mod cli;
 mod codegraph;
 mod embedding;

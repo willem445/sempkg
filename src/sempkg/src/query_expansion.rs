@@ -84,7 +84,18 @@ pub struct QueryExpansionConfig {
     #[serde(default = "default_n_ctx")]
     pub n_ctx: u32,
 
-    /// GPU layers to offload (`0` = CPU-only).
+    /// GPU offload policy: `"auto"` (default), `"on"`, or `"off"`. Only takes
+    /// effect on a GPU-backend build; see [`crate::accel::GpuMode`].
+    #[serde(default)]
+    pub gpu: crate::accel::GpuMode,
+
+    /// CPU threads for inference. `0` (default) uses all logical cores.
+    #[serde(default)]
+    pub n_threads: u32,
+
+    /// Advanced override: offload exactly this many model layers to the GPU.
+    /// `0` (default) defers to `gpu` (auto-detect). A non-zero value forces a
+    /// specific partial offload. Requires a GPU-backend build.
     #[serde(default)]
     pub gpu_layers: u32,
 
@@ -155,6 +166,8 @@ impl Default for QueryExpansionConfig {
             max_variants: default_max_variants(),
             max_tokens: default_max_tokens(),
             n_ctx: default_n_ctx(),
+            gpu: crate::accel::GpuMode::default(),
+            n_threads: 0,
             gpu_layers: 0,
             temperature: default_temperature(),
             additive_only: default_true(),
@@ -460,6 +473,8 @@ fn build_prompt(query: &str) -> String {
 pub struct QueryExpander {
     model: llama_cpp_2::model::LlamaModel,
     n_ctx: u32,
+    /// CPU threads used for the generation context (resolved: 0 → all cores).
+    n_threads: i32,
     max_tokens: i32,
     temperature: f32,
     max_variants: usize,
@@ -490,13 +505,20 @@ impl QueryExpander {
         // double-free panic in `LlamaBackend::drop` at shutdown.
         let backend = crate::llama_runtime::shared()?;
 
-        let model_params = LlamaModelParams::default().with_n_gpu_layers(config.gpu_layers);
+        let n_gpu_layers = crate::accel::resolve_gpu_layers(
+            config.gpu,
+            config.gpu_layers,
+            backend,
+            "query_expansion",
+        );
+        let model_params = LlamaModelParams::default().with_n_gpu_layers(n_gpu_layers);
         let model = LlamaModel::load_from_file(backend, &model_path, &model_params)
             .map_err(|e| anyhow::anyhow!("loading model from {}: {e}", model_path.display()))?;
 
         Ok(Self {
             model,
             n_ctx: config.n_ctx,
+            n_threads: crate::accel::resolve_threads(config.n_threads),
             max_tokens: config.max_tokens,
             temperature: config.temperature,
             max_variants: config.max_variants,
@@ -522,8 +544,10 @@ impl QueryExpander {
 
         let prompt = build_prompt(query);
 
-        let ctx_params =
-            LlamaContextParams::default().with_n_ctx(std::num::NonZeroU32::new(self.n_ctx));
+        let ctx_params = LlamaContextParams::default()
+            .with_n_ctx(std::num::NonZeroU32::new(self.n_ctx))
+            .with_n_threads(self.n_threads)
+            .with_n_threads_batch(self.n_threads);
 
         let mut ctx = self
             .model
@@ -642,7 +666,25 @@ pub fn print_status(config: &QueryExpansionConfig) {
     println!("  max_variants : {}", config.max_variants);
     println!("  max_tokens   : {}", config.max_tokens);
     println!("  n_ctx        : {}", config.n_ctx);
-    println!("  gpu_layers   : {}", config.gpu_layers);
+    println!(
+        "  cpu threads  : {} ({})",
+        crate::accel::resolve_threads(config.n_threads),
+        if config.n_threads == 0 {
+            "all cores"
+        } else {
+            "configured"
+        }
+    );
+    println!(
+        "  gpu          : {}{}",
+        config.gpu.as_str(),
+        if config.gpu_layers > 0 {
+            format!(" (manual override: {} layers)", config.gpu_layers)
+        } else {
+            String::new()
+        }
+    );
+    println!("  gpu build    : {}", crate::accel::gpu_build_status());
     println!("  temperature  : {}", config.temperature);
     println!("  additive_only: {}", config.additive_only);
     println!(

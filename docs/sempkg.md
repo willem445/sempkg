@@ -119,14 +119,55 @@ enabled    = true
 model_id   = "embeddinggemma-300m"   # or "qwen3-embedding-0.6b"
 # model    = "~/.sempkg/models/custom.gguf"  # optional explicit GGUF path override
 n_ctx      = 2048
-gpu_layers = 0    # >0 offloads layers to GPU (needs a GPU llama.cpp build)
+gpu        = "auto"   # "auto" (default) / "on" / "off" — see "Hardware acceleration"
+n_threads  = 0        # CPU threads; 0 = all logical cores
+gpu_layers = 0        # advanced: force a specific partial offload (0 = let `gpu` decide)
 
 [query_expansion]
 enabled      = true
 # model      = "~/.sempkg/models/qmd-query-expansion-1.7b-q4_k_m.gguf"
 max_variants = 4
+gpu          = "auto"
+n_threads    = 0
 gpu_layers   = 0
 ```
+
+#### Hardware acceleration (CPU threads + GPU)
+
+The local embedding, query-expansion, and reranker models run through llama.cpp.
+Each `[embedding]` / `[query_expansion]` / `[reranker]` section accepts the same
+acceleration knobs:
+
+- **`n_threads`** — CPU threads for inference. `0` (default) uses **all logical
+  cores**, so CPU embedding is multi-threaded out of the box. Set a number to
+  cap it.
+- **`gpu`** — offload policy:
+  - `"auto"` (default) — use the GPU when this binary was **built with a GPU
+    backend** and the device reports offload support; otherwise run on CPU. The
+    same config is portable across machines.
+  - `"on"` — force GPU offload (warns and falls back to CPU on a CPU-only build).
+  - `"off"` — CPU only.
+- **`gpu_layers`** — advanced manual override. `0` defers to `gpu`; a non-zero
+  value offloads exactly that many layers (useful to fit a small/old GPU).
+
+GPU offload is a **build-time** capability — a plain `cargo build --features
+embeddings` is CPU-only. To enable the GPU, compile with a backend feature
+matching your hardware (the toolchain/driver must be installed at build time):
+
+```bash
+# NVIDIA (CUDA toolkit). Works on Maxwell+ GPUs, including the GTX 9xx series.
+cargo build --release --features embeddings,reranker,cuda
+
+# Vendor-neutral (Vulkan SDK) — a good fallback for older NVIDIA/AMD cards.
+cargo build --release --features embeddings,reranker,vulkan
+
+# Other backends: rocm (AMD), metal (Apple Silicon).
+```
+
+With a GPU backend compiled in, `gpu = "auto"` offloads automatically — no config
+change needed. `sempkg embedding status` (and the reranker / query-expansion
+`status` commands) report the resolved thread count and which GPU backend, if
+any, was compiled in.
 
 Download the models, then build the vector indexes for installed bundles and
 local packages:
