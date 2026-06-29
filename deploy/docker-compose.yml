@@ -1,0 +1,68 @@
+# ---------------------------------------------------------------------------
+# Hosted "knowledge agent" stack: registry + agent in one deployment.
+#
+#   registry  — receives version-pinned .sembundle uploads (e.g. from a GitHub
+#               Actions job that bundles tip-of-main on a schedule) and serves
+#               them for install.
+#   agent     — syncs the curated bundles into its workspace, then serves:
+#                 • the human chat UI + REST   (port 8901)
+#                 • the standard sempkg MCP    (port 8902)  for calling agents
+#                 • the A2A agent surface      (port 8900)
+#
+# Bring up:  OPENROUTER_API_KEY=sk-or-... REGISTRY_ADMIN_PASSWORD=... docker compose up
+# Then mint a publish token (see deploy/README.md) and point CI at /publish.
+# ---------------------------------------------------------------------------
+services:
+  registry:
+    build:
+      context: ../src/sempkg_registry
+    image: sempkg-registry:latest
+    environment:
+      sempkg_registry_ADMIN_PASSWORD: ${REGISTRY_ADMIN_PASSWORD:?set REGISTRY_ADMIN_PASSWORD}
+    command: ["serve", "--host", "0.0.0.0", "--port", "8765",
+              "--storage-dir", "/data/bundles", "--config-dir", "/data/config"]
+    ports:
+      - "8765:8765"
+    volumes:
+      - registry-data:/data
+    restart: unless-stopped
+
+  agent:
+    build:
+      context: ../src/sempkg_agent
+    image: sempkg-agent:latest
+    depends_on:
+      - registry
+    environment:
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:?set OPENROUTER_API_KEY}
+      # Default model — UI dropdown can pick others from the catalog.
+      SEMPKG_AGENT_MODEL: ${SEMPKG_AGENT_MODEL:-anthropic/claude-3.5-sonnet}
+      # Persona + branding (override for your deployment, or supply your own prompt).
+      SEMPKG_AGENT_MODE: ${SEMPKG_AGENT_MODE:-human}
+      SEMPKG_AGENT_UI_TITLE: ${SEMPKG_AGENT_UI_TITLE:-sempkg knowledge agent}
+      SEMPKG_AGENT_UI_SUBTITLE: ${SEMPKG_AGENT_UI_SUBTITLE:-Ask about the installed code and docs — grounded, with cited sources.}
+      # Bring-your-own system prompt (optional): mount a file and point here.
+      # SEMPKG_AGENT_SYSTEM_PROMPT_FILE: /workspace/system_prompt.txt
+      # Persistent multi-turn state across restarts (needs the [persist] extra).
+      SEMPKG_AGENT_STATE_DB: /workspace/.state/conversations.sqlite
+      SEMPKG_AGENT_MCP_WORKSPACE: /workspace
+      # Sync the workspace from the registry on startup.
+      SEMPKG_SYNC_ON_START: "1"
+    # Serve every surface (A2A=8900, REST/UI=8901, MCP=8902) off one agent.
+    command: ["serve", "--transport", "all"]
+    entrypoint: ["/usr/local/bin/agent-entrypoint.sh"]
+    ports:
+      - "8900:8900"   # A2A
+      - "8901:8901"   # REST + human chat UI  ->  http://localhost:8901/
+      - "8902:8902"   # standard sempkg MCP (for calling agents)
+    volumes:
+      # Workspace declares which bundles this agent "knows" (sempkg.toml) and
+      # holds the installed bundles after sync.
+      - ./workspace:/workspace
+      - ./agent-entrypoint.sh:/usr/local/bin/agent-entrypoint.sh:ro
+      # Provide the sempkg binary (or bake it into the image instead).
+      - ${SEMPKG_BIN:-/usr/local/bin/sempkg}:/usr/local/bin/sempkg:ro
+    restart: unless-stopped
+
+volumes:
+  registry-data:
