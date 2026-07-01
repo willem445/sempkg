@@ -85,7 +85,12 @@ name = "default"
 url  = "https://registry.example.com"
 
 [dependencies]
+# aws-sdk = { version = "1.11.210", description = "AWS SDK — S3, DynamoDB, Lambda clients" }
 ```
+
+The optional `description` on a dependency is a one-line summary shown by
+`sempkg list` and the MCP `list_packages` tool. Set it with
+`sempkg add --description "..."` (see [Describing a bundle](#describing-a-bundle)).
 
 ### Optional reranker configuration
 
@@ -212,6 +217,23 @@ sempkg add requests@2.32.3 --registry my-registry
 sempkg sync
 ```
 
+### Describing a bundle
+
+Any `sempkg add` command accepts an optional `--description` to record a
+one-line summary of what the bundle is for. It is stored in `sempkg.toml` and
+surfaced by `sempkg list` and the MCP `list_packages` tool, giving agents a hint
+about which package to search instead of guessing from the name alone.
+
+```powershell
+sempkg add aws-sdk@1.11.210 --description "AWS SDK — S3, DynamoDB, Lambda clients"
+sempkg add . --name mylib --description "Our CAN bus decoding utilities"
+```
+
+The description works with every add source (registry, `--url`, GitHub, and
+local `.`). It is preserved across `sempkg sync` and `sempkg refresh`, and a
+bare `sempkg add <same>` without `--description` keeps the existing text. Pass
+`--description` again to overwrite it.
+
 ### From a GitHub release asset (direct URL)
 
 Use `--url` to point directly at a `.sembundle` asset attached to a GitHub
@@ -295,12 +317,14 @@ sempkg list
 
 ```
 Installed bundles:
-  aws-sdk   @ 1.11.210  [indexed]  [workspace]  +lance
+  aws-sdk   @ 1.11.210  [indexed]  [workspace]  +lance  # AWS SDK — S3, DynamoDB, Lambda clients
   requests  @ 2.32.3    [indexed]  [workspace]
   mylib                 [indexed]  [global]     (local pkg)
 ```
 
 The `+lance` flag indicates the bundle includes a LanceDB documentation index.
+The trailing `# ...` is the optional bundle description recorded with
+`sempkg add --description` (the MCP `list_packages` tool renders it as `— ...`).
 
 ### Bundle and package status
 
@@ -529,7 +553,7 @@ falling back to global bundles. Omit `-C` to use only the global bundle store.
 
 | Tool | Required params | Optional params | Description |
 |------|-----------------|-----------------|-------------|
-| `list_packages` | — | — | List all local packages and installed bundles with index and docs status |
+| `list_packages` | — | — | List all local packages and installed bundles with index and docs status, plus any per-bundle `--description` to hint which package to search |
 | `query` | `query` | `package`, `limit` | Unified hybrid search (BM25 + vector + CodeGraph, RRF-fused, reranked). Searches every installed package by default; pass `package` (name or `name@version`) to focus the whole pipeline on one package for a deeper, less-diluted search |
 | `search_symbols` | `package`, `query` | `kind`, `limit` | FTS symbol search via CodeGraph |
 | `get_context` | `package`, `task` | — | AI-optimised code context for a natural-language task |

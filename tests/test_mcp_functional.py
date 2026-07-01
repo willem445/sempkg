@@ -1691,3 +1691,240 @@ class TestReadDocs:
         assert len(_fenced_body(ranged)) <= len(_fenced_body(full)), (
             "Line-bounded read returned more content than the whole file"
         )
+
+
+# ---------------------------------------------------------------------------
+# CLI + MCP — bundle descriptions (`sempkg add --description`)
+# ---------------------------------------------------------------------------
+#
+# A user may attach an optional one-line description to a workspace dependency
+# with ``sempkg add --description``.  It is stored in ``sempkg.toml``, preserved
+# across re-records (sync / refresh / a bare re-add), overwritten when supplied
+# again, and surfaced by both ``sempkg list`` and the MCP ``list_packages`` tool
+# so an agent can tell which package to search.
+#
+# These tests drive the real binary against isolated temp workspaces and need no
+# network or bundle build: the registry/URL add path only edits the manifest,
+# and an "installed" bundle is faked on disk (just its ``manifest.json``) so it
+# appears in the listings.
+
+import contextlib
+
+ADD_DESC_NAME = "demo-lib"
+ADD_DESC_VERSION = "1.2.3"
+ADD_DESC_TEXT = "Demo library for functional-test coverage"
+ADD_DESC_URL = "http://example.invalid/demo-lib.sembundle"
+
+
+def _run_cli(sempkg_bin: str, workspace: Path, *args: str, timeout: float = 30.0):
+    """Run ``sempkg <args> --workspace <ws>`` and return the CompletedProcess."""
+    return subprocess.run(
+        [sempkg_bin, *args, "--workspace", str(workspace)],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+
+
+def _init_workspace(sempkg_bin: str, workspace: Path) -> None:
+    result = _run_cli(sempkg_bin, workspace, "init")
+    assert result.returncode == 0, f"sempkg init failed:\n{result.stderr}"
+
+
+def _add_url_dep(
+    sempkg_bin: str,
+    workspace: Path,
+    name: str,
+    version: str,
+    description: str | None = None,
+    url: str = ADD_DESC_URL,
+):
+    """Add a direct-URL dependency (manifest-only; no download happens)."""
+    args = ["add", f"{name}@{version}", "--url", url]
+    if description is not None:
+        args += ["--description", description]
+    result = _run_cli(sempkg_bin, workspace, *args)
+    assert result.returncode == 0, (
+        f"sempkg add failed for {name}@{version}:\n{result.stderr}"
+    )
+    return result
+
+
+def _manifest_text(workspace: Path) -> str:
+    return (workspace / "sempkg.toml").read_text(encoding="utf-8")
+
+
+def _write_fake_bundle(
+    workspace: Path, name: str, version: str, *, extensions: list[str] | None = None
+) -> Path:
+    """Fabricate a minimal installed-bundle layout in the workspace store so the
+    bundle appears in ``sempkg list`` / ``list_packages`` without a real build.
+
+    Only ``manifest.json`` is required for the bundle to be listed (it shows as
+    ``[no graph]`` since no codegraph index is present)."""
+    bundle_dir = workspace / ".sempkg" / "bundles" / name / version
+    bundle_dir.mkdir(parents=True, exist_ok=True)
+    manifest = {
+        "spec_version": "1.0",
+        "name": name,
+        "version": version,
+        "source_repo": "local:functional-test",
+        "commit_hash": "0" * 40,
+        "tag": None,
+        "created_at": "2026-01-01T00:00:00Z",
+        "codegraph_version": "0.9.7",
+        "extensions": list(extensions or []),
+        "checksums": {},
+    }
+    (bundle_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    return bundle_dir
+
+
+@contextlib.contextmanager
+def _mcp_server(sempkg_bin: str, workspace: Path, log_dir: Path):
+    """Start ``sempkg mcp`` against *workspace* and yield a handshaken client."""
+    stderr_path = Path(log_dir) / "mcp-stderr.log"
+    with open(stderr_path, "w") as stderr_file:
+        proc = subprocess.Popen(
+            [sempkg_bin, "mcp", "--workspace", str(workspace)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=stderr_file,
+            text=True,
+            # Force UTF-8 so non-ASCII output (e.g. the em-dash description
+            # separator) decodes correctly regardless of the OS default codec.
+            encoding="utf-8",
+            bufsize=1,
+        )
+        client = McpClient(proc, stderr_path=stderr_path)
+        try:
+            resp = client.send(
+                "initialize",
+                {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {},
+                    "clientInfo": {"name": "pytest-add-desc", "version": "0"},
+                },
+            )
+            assert "result" in resp, f"MCP initialize failed: {resp}"
+            yield client
+        finally:
+            client.close()
+
+
+def _bundle_line(text: str, name: str) -> str:
+    """Return the first output line that names *name*, or '' if none."""
+    return next((l for l in text.splitlines() if name in l), "")
+
+
+@pytest.mark.functional
+class TestAddDescriptionManifest:
+    """``sempkg add --description`` records/preserves/overwrites the description
+    in sempkg.toml (validated by reading the manifest the binary writes)."""
+
+    def test_description_written_to_manifest(
+        self, sempkg_bin: str, tmp_path: Path
+    ) -> None:
+        _init_workspace(sempkg_bin, tmp_path)
+        _add_url_dep(
+            sempkg_bin, tmp_path, ADD_DESC_NAME, ADD_DESC_VERSION,
+            description=ADD_DESC_TEXT,
+        )
+        toml = _manifest_text(tmp_path)
+        assert f'description = "{ADD_DESC_TEXT}"' in toml, (
+            f"description not recorded in sempkg.toml:\n{toml}"
+        )
+
+    def test_description_omitted_when_not_provided(
+        self, sempkg_bin: str, tmp_path: Path
+    ) -> None:
+        _init_workspace(sempkg_bin, tmp_path)
+        _add_url_dep(sempkg_bin, tmp_path, ADD_DESC_NAME, ADD_DESC_VERSION)
+        toml = _manifest_text(tmp_path)
+        assert "description" not in toml, (
+            f"description key emitted for a dep added without --description:\n{toml}"
+        )
+
+    def test_description_preserved_on_bare_readd(
+        self, sempkg_bin: str, tmp_path: Path
+    ) -> None:
+        """A later re-record without --description must keep the existing text,
+        mirroring what happens on `sempkg sync` / `refresh`."""
+        _init_workspace(sempkg_bin, tmp_path)
+        _add_url_dep(
+            sempkg_bin, tmp_path, ADD_DESC_NAME, ADD_DESC_VERSION,
+            description=ADD_DESC_TEXT,
+        )
+        _add_url_dep(sempkg_bin, tmp_path, ADD_DESC_NAME, "1.2.4")  # no description
+        toml = _manifest_text(tmp_path)
+        assert f'description = "{ADD_DESC_TEXT}"' in toml, (
+            f"existing description was lost on a bare re-add:\n{toml}"
+        )
+        assert 'version = "1.2.4"' in toml, (
+            f"re-add did not update the version:\n{toml}"
+        )
+
+    def test_description_overwritten_when_provided_again(
+        self, sempkg_bin: str, tmp_path: Path
+    ) -> None:
+        new_desc = "Updated description text"
+        _init_workspace(sempkg_bin, tmp_path)
+        _add_url_dep(
+            sempkg_bin, tmp_path, ADD_DESC_NAME, ADD_DESC_VERSION,
+            description=ADD_DESC_TEXT,
+        )
+        _add_url_dep(
+            sempkg_bin, tmp_path, ADD_DESC_NAME, ADD_DESC_VERSION,
+            description=new_desc,
+        )
+        toml = _manifest_text(tmp_path)
+        assert f'description = "{new_desc}"' in toml, (
+            f"description was not overwritten with the new text:\n{toml}"
+        )
+        assert ADD_DESC_TEXT not in toml, (
+            f"stale description text still present after overwrite:\n{toml}"
+        )
+
+
+@pytest.mark.functional
+class TestListDescriptionSurfacing:
+    """A recorded description is surfaced by ``sempkg list`` and the MCP
+    ``list_packages`` tool alongside the matching installed bundle."""
+
+    def _prepare(self, sempkg_bin: str, ws: Path) -> None:
+        _init_workspace(sempkg_bin, ws)
+        _write_fake_bundle(ws, ADD_DESC_NAME, ADD_DESC_VERSION)
+        _add_url_dep(
+            sempkg_bin, ws, ADD_DESC_NAME, ADD_DESC_VERSION,
+            description=ADD_DESC_TEXT,
+        )
+
+    def test_cli_list_shows_description(
+        self, sempkg_bin: str, tmp_path: Path
+    ) -> None:
+        self._prepare(sempkg_bin, tmp_path)
+        result = _run_cli(sempkg_bin, tmp_path, "list")
+        assert result.returncode == 0, f"sempkg list failed:\n{result.stderr}"
+        line = _bundle_line(result.stdout, ADD_DESC_NAME)
+        assert line, f"{ADD_DESC_NAME} not listed:\n{result.stdout}"
+        assert ADD_DESC_TEXT in line, (
+            f"description missing from `sempkg list` bundle line:\n{line!r}"
+        )
+
+    def test_mcp_list_packages_shows_description(
+        self, sempkg_bin: str, tmp_path: Path
+    ) -> None:
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        self._prepare(sempkg_bin, ws)
+        with _mcp_server(sempkg_bin, ws, tmp_path) as client:
+            text = client.tool_text("list_packages", {})
+        line = _bundle_line(text, ADD_DESC_NAME)
+        assert line, f"{ADD_DESC_NAME} not in list_packages output:\n{text}"
+        assert ADD_DESC_TEXT in line, (
+            f"description missing from list_packages bundle line:\n{line!r}"
+        )
+        # list_packages renders the description after an em-dash separator.
+        assert "—" in line, (
+            f"expected the em-dash description separator in:\n{line!r}"
+        )

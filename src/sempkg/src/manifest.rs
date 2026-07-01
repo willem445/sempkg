@@ -93,6 +93,11 @@ pub struct DependencyEntry {
     /// Directories excluded from all indexing (source, docs, and source-code index).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub exclude_dirs: Vec<String>,
+    /// Optional one-line, user-supplied description of what this bundle provides.
+    /// Set with `sempkg add --description`; surfaced in `sempkg list` and the MCP
+    /// `list_packages` tool so agents can tell at a glance which package to search.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -133,6 +138,16 @@ impl WorkspaceManifest {
 
     pub fn get_registry(&self, name: &str) -> Option<&RegistryEntry> {
         self.registries.iter().find(|r| r.name == name)
+    }
+
+    /// Find a dependency by name across `[dependencies]` and every
+    /// `[dependency-groups]` group. Returns the first match.
+    pub fn find_dependency(&self, name: &str) -> Option<&DependencyEntry> {
+        self.dependencies.get(name).or_else(|| {
+            self.dependency_groups
+                .values()
+                .find_map(|group| group.get(name))
+        })
     }
 
     /// Resolve the registry for a dependency (fallback to first registry).
@@ -465,6 +480,9 @@ fn dep_inline(dep: &DependencyEntry) -> InlineTable {
         }
         it.insert("exclude_dirs", Value::Array(arr));
     }
+    if let Some(desc) = &dep.description {
+        it.insert("description", Value::from(desc.as_str()));
+    }
     it
 }
 
@@ -515,6 +533,79 @@ mod tests {
 
     use super::{load_manifest, save_manifest, DependencyEntry, WorkspaceManifest};
 
+    fn dep(version: &str) -> DependencyEntry {
+        DependencyEntry {
+            version: version.to_string(),
+            registry: None,
+            url: None,
+            git: None,
+            git_ref: None,
+            subdir: None,
+            full: false,
+            local: None,
+            include_source: false,
+            source_glob: None,
+            source_dirs: vec![],
+            docs_dirs: vec![],
+            exclude_dirs: vec![],
+            description: None,
+        }
+    }
+
+    #[test]
+    fn dependency_description_round_trips() {
+        let dir = tempdir().expect("create temp dir");
+
+        let mut manifest = WorkspaceManifest::default();
+        let mut described = dep("1.0.0");
+        described.description = Some("HTTP client with retry support".to_string());
+        manifest
+            .dependencies
+            .insert("reqwest".to_string(), described);
+        // A dependency without a description must not emit the key.
+        manifest.dependencies.insert("plain".to_string(), dep("2.0.0"));
+
+        save_manifest(&manifest, dir.path()).expect("save manifest");
+
+        let saved =
+            fs::read_to_string(dir.path().join(super::MANIFEST_FILE)).expect("read manifest");
+        assert!(saved.contains("description = \"HTTP client with retry support\""));
+        // Only one description line should be present (the plain dep omits it).
+        assert_eq!(saved.matches("description =").count(), 1);
+
+        let loaded = load_manifest(dir.path()).expect("load manifest");
+        assert_eq!(
+            loaded
+                .find_dependency("reqwest")
+                .and_then(|d| d.description.as_deref()),
+            Some("HTTP client with retry support")
+        );
+        assert_eq!(
+            loaded.find_dependency("plain").and_then(|d| d.description.clone()),
+            None
+        );
+    }
+
+    #[test]
+    fn find_dependency_searches_groups() {
+        let mut manifest = WorkspaceManifest::default();
+        let mut grouped = dep("3.0.0");
+        grouped.description = Some("test-only helper".to_string());
+        manifest
+            .dependency_groups
+            .entry("dev".to_string())
+            .or_default()
+            .insert("pytest".to_string(), grouped);
+
+        assert_eq!(
+            manifest
+                .find_dependency("pytest")
+                .and_then(|d| d.description.as_deref()),
+            Some("test-only helper")
+        );
+        assert!(manifest.find_dependency("missing").is_none());
+    }
+
     #[test]
     fn save_manifest_preserves_reranker_table() {
         let dir = tempdir().expect("create temp dir");
@@ -536,6 +627,7 @@ mod tests {
                 source_dirs: vec![],
                 docs_dirs: vec![],
                 exclude_dirs: vec![],
+                description: None,
             },
         );
         manifest.reranker = Some(crate::reranker::RerankerConfig {
@@ -586,6 +678,7 @@ mod tests {
                 source_dirs: vec![],
                 docs_dirs: vec![],
                 exclude_dirs: vec![],
+                description: None,
             },
         );
         manifest.embedding = Some(crate::embedding::EmbeddingConfig {
@@ -637,6 +730,7 @@ mod tests {
                 source_dirs: vec![],
                 docs_dirs: vec![],
                 exclude_dirs: vec![],
+                description: None,
             },
         );
         manifest.query_expansion = Some(crate::query_expansion::QueryExpansionConfig {
@@ -697,6 +791,7 @@ mod tests {
                 source_dirs: vec![],
                 docs_dirs: vec![],
                 exclude_dirs: vec![],
+                description: None,
             },
         );
         manifest.embedding = Some(crate::embedding::EmbeddingConfig {

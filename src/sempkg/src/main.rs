@@ -78,6 +78,8 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
             let registry = PackageRegistry::load()?;
             let local_pkgs = registry.list();
             let bundles = list_all_bundles(workspace);
+            // Workspace manifest carries any user-set bundle descriptions.
+            let manifest = workspace.and_then(|ws| manifest::load_manifest(ws).ok());
 
             if local_pkgs.is_empty() && bundles.is_empty() {
                 println!("No packages or bundles registered.");
@@ -120,8 +122,15 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
                         BundleScope::Workspace => "workspace",
                         BundleScope::Global => "global",
                     };
+                    let desc = manifest
+                        .as_ref()
+                        .and_then(|mf| mf.find_dependency(&b.name))
+                        .and_then(|d| d.description.as_deref())
+                        .filter(|d| !d.is_empty())
+                        .map(|d| format!("  # {d}"))
+                        .unwrap_or_default();
                     println!(
-                        "  {:<20} @ {:<12} [{idx}]  [{scope}]{lance_flag}{code_flag}",
+                        "  {:<20} @ {:<12} [{idx}]  [{scope}]{lance_flag}{code_flag}{desc}",
                         b.name, b.version
                     );
                 }
@@ -149,6 +158,7 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
             source_dirs,
             docs_dirs,
             exclude_dirs,
+            description,
         } => {
             let dir = require_workspace(workspace)?;
 
@@ -172,6 +182,7 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
                         source_dirs,
                         docs_dirs,
                         exclude_dirs,
+                        description,
                         workspace,
                         None,
                     );
@@ -193,6 +204,7 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
                         source_dirs,
                         docs_dirs,
                         exclude_dirs,
+                        description,
                         workspace,
                         None,
                     );
@@ -227,6 +239,7 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
                     source_dirs: vec![],
                     docs_dirs: vec![],
                     exclude_dirs: vec![],
+                    description: description.clone(),
                 };
                 insert_dep(&mut mf, name, dep, group.as_deref());
             } else if let Some(url) = &registry_url {
@@ -253,6 +266,7 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
                     source_dirs: vec![],
                     docs_dirs: vec![],
                     exclude_dirs: vec![],
+                    description: description.clone(),
                 };
                 insert_dep(&mut mf, name, dep, group.as_deref());
             } else {
@@ -280,6 +294,7 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
                     source_dirs: vec![],
                     docs_dirs: vec![],
                     exclude_dirs: vec![],
+                    description: description.clone(),
                 };
                 insert_dep(&mut mf, name, dep, group.as_deref());
             }
@@ -441,6 +456,7 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
                         dep.source_dirs.iter().map(PathBuf::from).collect(),
                         dep.docs_dirs.iter().map(PathBuf::from).collect(),
                         dep.exclude_dirs.iter().map(PathBuf::from).collect(),
+                        dep.description.clone(),
                         workspace,
                         Some(&mut lock),
                     )?;
@@ -473,6 +489,7 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
                         dep.source_dirs.iter().map(PathBuf::from).collect(),
                         dep.docs_dirs.iter().map(PathBuf::from).collect(),
                         dep.exclude_dirs.iter().map(PathBuf::from).collect(),
+                        dep.description.clone(),
                         workspace,
                         Some(&mut lock),
                     )?;
@@ -1544,6 +1561,7 @@ fn add_from_github(
     source_dirs_override: Vec<PathBuf>,
     docs_dirs_override: Vec<PathBuf>,
     exclude_dirs: Vec<PathBuf>,
+    description: Option<String>,
     _workspace: Option<&Path>,
     lock: Option<&mut manifest::LockFile>,
 ) -> Result<()> {
@@ -1582,6 +1600,7 @@ fn add_from_github(
             &source_dirs_override,
             &docs_dirs_override,
             &exclude_dirs,
+            description,
             lock,
         )?;
         return Ok(());
@@ -1617,6 +1636,7 @@ fn add_from_github(
                 vec![],
                 vec![],
                 vec![],
+                description,
                 lock,
             );
         }
@@ -1745,6 +1765,7 @@ fn add_from_github(
         source_dirs_override,
         docs_dirs_override,
         exclude_dirs,
+        description,
         lock,
     )
 }
@@ -1764,6 +1785,7 @@ fn install_github_bundle(
     source_dirs_override: Vec<PathBuf>,
     docs_dirs_override: Vec<PathBuf>,
     exclude_dirs: Vec<PathBuf>,
+    description: Option<String>,
     lock: Option<&mut manifest::LockFile>,
 ) -> Result<()> {
     // Remove existing bundle dir so install_bytes can extract the freshly-built one.
@@ -1799,6 +1821,7 @@ fn install_github_bundle(
         &source_dirs_override,
         &docs_dirs_override,
         &exclude_dirs,
+        description,
         lock,
     )
 }
@@ -1814,6 +1837,7 @@ fn record_github_dep(
     source_dirs_override: &[PathBuf],
     docs_dirs_override: &[PathBuf],
     exclude_dirs: &[PathBuf],
+    description: Option<String>,
     lock: Option<&mut manifest::LockFile>,
 ) -> Result<()> {
     let mut mf = manifest::load_manifest(workspace_dir)?;
@@ -1845,6 +1869,7 @@ fn record_github_dep(
             .iter()
             .map(|p| p.to_string_lossy().into_owned())
             .collect(),
+        description,
     };
     insert_dep(&mut mf, &resolved.package_name, dep, group);
     manifest::save_manifest(&mf, workspace_dir)?;
@@ -1912,12 +1937,20 @@ fn record_installed_bundle_lock(
 }
 
 /// Insert a dependency into the manifest, either into [dependencies] or a named group.
+///
+/// When the incoming entry carries no description, any description already
+/// recorded for this dependency is preserved. This keeps a user-set description
+/// intact across `sempkg sync` / `refresh` (which rebuild the entry from source
+/// metadata) and across a bare `sempkg add <same>` without `--description`.
 fn insert_dep(
     mf: &mut manifest::WorkspaceManifest,
     name: &str,
-    dep: manifest::DependencyEntry,
+    mut dep: manifest::DependencyEntry,
     group: Option<&str>,
 ) {
+    if dep.description.is_none() {
+        dep.description = mf.find_dependency(name).and_then(|d| d.description.clone());
+    }
     if let Some(g) = group {
         mf.dependency_groups
             .entry(g.to_string())
@@ -2107,6 +2140,7 @@ fn run_refresh(workspace: Option<&Path>) -> Result<()> {
         dep.source_dirs.iter().map(PathBuf::from).collect(),
         dep.docs_dirs.iter().map(PathBuf::from).collect(),
         dep.exclude_dirs.iter().map(PathBuf::from).collect(),
+        dep.description.clone(),
         workspace,
         None,
     )
@@ -2207,6 +2241,7 @@ fn add_from_local(
     source_dirs_override: Vec<PathBuf>,
     docs_dirs_override: Vec<PathBuf>,
     exclude_dirs: Vec<PathBuf>,
+    description: Option<String>,
     _workspace: Option<&Path>,
     lock: Option<&mut manifest::LockFile>,
 ) -> Result<()> {
@@ -2276,6 +2311,7 @@ fn add_from_local(
             &source_dirs_override,
             &docs_dirs_override,
             &exclude_dirs,
+            description,
             lock,
         )?;
         return Ok(());
@@ -2395,6 +2431,7 @@ fn add_from_local(
         &source_dirs_override,
         &docs_dirs_override,
         &exclude_dirs,
+        description,
         lock,
     )
 }
@@ -2461,6 +2498,7 @@ fn record_local_dep(
     source_dirs_override: &[PathBuf],
     docs_dirs_override: &[PathBuf],
     exclude_dirs: &[PathBuf],
+    description: Option<String>,
     lock: Option<&mut manifest::LockFile>,
 ) -> Result<()> {
     let mut mf = manifest::load_manifest(workspace_dir)?;
@@ -2508,6 +2546,7 @@ fn record_local_dep(
             .iter()
             .map(|p| p.to_string_lossy().into_owned())
             .collect(),
+        description,
     };
     insert_dep(&mut mf, package_name, dep, group);
     manifest::save_manifest(&mf, workspace_dir)?;
