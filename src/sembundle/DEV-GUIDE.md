@@ -98,7 +98,7 @@ src/sembundle/
 All commands must be run from the `src/sembundle/` directory.
 
 ```powershell
-cd c:\Projects\codegraph-hub\src\sembundle
+cd c:\Projects\sempkg\src\sembundle
 ```
 
 ### Debug build (fast compile, includes debug symbols)

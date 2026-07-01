@@ -10,7 +10,7 @@ It scans the repository by default, but you can also pass explicit file paths.
 Examples:
     python scripts/bump_versions.py 0.2.0
     python scripts/bump_versions.py 0.2.0 --dry-run
-    python scripts/bump_versions.py 0.2.0 --root C:\\Projects\\codegraph-hub
+    python scripts/bump_versions.py 0.2.0 --root C:\\Projects\\sempkg
     python scripts/bump_versions.py 0.2.0 --files pyproject.toml src/sempkg/Cargo.toml
 """
 

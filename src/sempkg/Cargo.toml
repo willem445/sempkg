@@ -25,6 +25,22 @@ reranker = ["dep:llama-cpp-2"]
 # Build with:  cargo build --features embeddings
 embeddings = ["dep:llama-cpp-2"]
 
+# --- GPU acceleration backends ------------------------------------------------
+# Compile llama.cpp with a GPU backend so local inference (embeddings, query
+# expansion, reranker) can offload to the GPU. These are additive: combine one
+# with `embeddings` and/or `reranker`, e.g.
+#     cargo build --release --features embeddings,reranker,cuda
+# With a GPU backend present, `gpu = "auto"` (the default) offloads automatically.
+# Each backend needs its toolchain/drivers installed at build time:
+#   cuda   — NVIDIA CUDA toolkit (Maxwell+ GPUs, incl. GTX 9xx series)
+#   vulkan — Vulkan SDK; vendor-neutral, a good fallback for older NVIDIA/AMD
+#   rocm   — AMD ROCm/HIP
+#   metal  — Apple Silicon
+cuda   = ["dep:llama-cpp-2", "llama-cpp-2/cuda"]
+vulkan = ["dep:llama-cpp-2", "llama-cpp-2/vulkan"]
+rocm   = ["dep:llama-cpp-2", "llama-cpp-2/rocm"]
+metal  = ["dep:llama-cpp-2", "llama-cpp-2/metal"]
+
 [dependencies]
 sembundle    = { path = "../sembundle" }
 clap         = { version = "4", features = ["derive", "env"] }

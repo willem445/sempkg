@@ -10,12 +10,22 @@ sempkg = { version = "0.3.0-beta-30-gcfcfdefb0b81", local = ".", include_source 
 
 [embedding]
 enabled = true
+model_id = "embeddinggemma-300m"   # or "qwen3-embedding-0.6b"
 n_ctx = 2048
+# Hardware acceleration (local provider). `gpu` = "auto" (default) uses the GPU
+# when this binary was built with a GPU backend (e.g. `--features embeddings,cuda`
+# or `…,vulkan`) and falls back to CPU otherwise; "on" forces GPU, "off" forces CPU.
+# `n_threads` = 0 uses all logical CPU cores for CPU-side work.
+# `gpu_layers` is an advanced manual override (0 = let `gpu` decide).
+gpu = "auto"
+n_threads = 0
 gpu_layers = 0
 
 [query_expansion]
 enabled = true
 max_variants = 4
+gpu = "auto"
+n_threads = 0
 gpu_layers = 0
 max_tokens = 256
 n_ctx = 2048
@@ -25,3 +35,6 @@ temperature = 0.699999988079071
 enabled = true
 top_k = 20
 output_n = 5
+gpu = "auto"
+n_threads = 0
+gpu_layers = 0

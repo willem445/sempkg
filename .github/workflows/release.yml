@@ -4,6 +4,10 @@ on:
   push:
     tags:
       - 'v*'
+  # Manual runs build (and cache) every artifact — including the CUDA job — so
+  # the pipeline can be smoke-tested without cutting a tag. The "Publish GitHub
+  # Release" job is skipped on manual runs (see its `if:` guard).
+  workflow_dispatch:
 
 permissions:
   contents: write   # required to create GitHub Releases
@@ -165,6 +169,159 @@ jobs:
           path: ${{ env.ARTIFACT }}
           retention-days: 1
 
+  # ── sempkg (CUDA / NVIDIA GPU) ──────────────────────────────────────────────
+  # Separate job from `build` because it needs the CUDA toolkit installed and,
+  # on Windows, bundles the CUDA runtime DLLs alongside the binary. See
+  # docs/gpu-cuda.md for the runtime/driver requirements this produces.
+  build-cuda:
+    name: Build sempkg (CUDA) — ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    env:
+      CARGO_INCREMENTAL: 0
+      RUSTFLAGS: -C debuginfo=0
+      # The llama-cpp-sys build script forwards any CMAKE_* env var to CMake as
+      # a -D define, so this pins the GPU architectures llama.cpp is compiled
+      # for instead of the sys-crate default. Targets CUDA 13, which supports
+      # Turing (sm_75) and newer — Maxwell/Pascal/Volta are dropped. `75-virtual`
+      # emits Turing PTX the driver JIT-compiles for any newer card; 86-real and
+      # 89-real ship ready-to-run SASS for the common RTX 30xx/40xx cards, and
+      # 90-virtual covers Hopper/Blackwell via PTX.
+      CMAKE_CUDA_ARCHITECTURES: "75-virtual;80-virtual;86-real;89-real;90-virtual"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            ext: .exe
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            ext: ""
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Free disk space (Ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          df -h
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo apt-get clean
+          df -h
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src/sempkg -> target
+          key: ${{ matrix.target }}-cuda
+
+      # Provides nvcc + the cudart/cublas headers and import libraries, and on
+      # Windows the redistributable runtime DLLs bundled in the package step.
+      # Targets CUDA 13 (Turing sm_75 and newer; see CMAKE_CUDA_ARCHITECTURES).
+      # GitHub caching is disabled so the ~3 GB installer doesn't evict the Rust
+      # build cache from the repo's 10 GB Actions cache budget.
+      - name: Install CUDA Toolkit
+        uses: Jimver/cuda-toolkit@v0.2.35
+        id: cuda-toolkit
+        with:
+          cuda: '13.2.0'
+          method: 'local'
+          linux-local-args: '["--toolkit"]'
+          use-github-cache: false
+
+      - name: Install build dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y cmake clang libclang-dev llvm-dev
+
+      - name: Install LLVM (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install llvm --no-progress -y
+
+      - name: Resolve LIBCLANG_PATH (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          echo "LIBCLANG_PATH=$(llvm-config --libdir)" >> "$GITHUB_ENV"
+
+      - name: Resolve LIBCLANG_PATH (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          "LIBCLANG_PATH=C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Install NASM (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/setup-nasm@v1
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # GPU offload is most valuable for the embedding + query-expansion + rerank
+      # models, so the CUDA artifact enables all local-inference features.
+      - name: Build (CUDA)
+        shell: bash
+        run: |
+          cargo build --release \
+            --manifest-path src/sempkg/Cargo.toml \
+            --target ${{ matrix.target }} \
+            --features reranker,embeddings,cuda
+
+      # Windows links the CUDA runtime dynamically, so ship the redistributable
+      # DLLs next to the binary. This frees users from installing the CUDA
+      # Toolkit — but NOT from having an NVIDIA driver: nvcuda.dll ships with the
+      # driver and cannot legally be redistributed.
+      - name: Package (Windows — bundle CUDA runtime DLLs)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $stage = "sempkg-${{ matrix.target }}-cuda"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item "src/sempkg/target/${{ matrix.target }}/release/sempkg.exe" $stage
+          # CUDA 13 reorganised the Windows toolkit layout, so search the whole
+          # toolkit tree rather than assuming the DLLs live in \bin.
+          foreach ($pat in @('cudart64_*.dll','cublas64_*.dll','cublasLt64_*.dll')) {
+            $dll = Get-ChildItem -Path $env:CUDA_PATH -Filter $pat -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($null -eq $dll) { throw "Missing CUDA runtime DLL '$pat' under $env:CUDA_PATH" }
+            Copy-Item $dll.FullName $stage
+            Write-Host "bundled $($dll.Name)"
+          }
+          if (Test-Path docs/gpu-cuda.md) { Copy-Item docs/gpu-cuda.md "$stage/README-GPU.md" }
+          Compress-Archive -Path "$stage/*" -DestinationPath "$stage.zip" -Force
+          "ARTIFACT=$stage.zip"     | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "ARTIFACT_NAME=$stage"    | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      # Linux links the CUDA runtime statically, so the binary is self-contained
+      # apart from the driver's libcuda.so — ship it as a single file.
+      - name: Package (Linux — static CUDA runtime, single binary)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          artifact="sempkg-${{ matrix.target }}-cuda"
+          cp "src/sempkg/target/${{ matrix.target }}/release/sempkg" "$artifact"
+          echo "ARTIFACT=$artifact"      >> "$GITHUB_ENV"
+          echo "ARTIFACT_NAME=$artifact" >> "$GITHUB_ENV"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ${{ env.ARTIFACT }}
+          retention-days: 1
+
   bundle-sempkg:
     name: Build and sign sempkg SemBundle
     needs: build
@@ -212,7 +369,13 @@ jobs:
 
       - name: Resolve version and CodeGraph version
         run: |
-          echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+          else
+            # Manual (workflow_dispatch) runs have no release tag; stamp a dev
+            # version so the bundle still builds for smoke-testing.
+            echo "VERSION=0.0.0-dev.${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+          fi
           CG_VER=$(codegraph --version 2>&1 | grep -oP '\d+\.\d+\.\d+' | head -1)
           echo "CODEGRAPH_VERSION=${CG_VER:-unknown}" >> "$GITHUB_ENV"
 
@@ -260,7 +423,10 @@ jobs:
 
   release:
     name: Publish GitHub Release
-    needs: [build, bundle-sempkg]
+    needs: [build, build-cuda, bundle-sempkg]
+    # Only publish a GitHub Release for real tag pushes; manual
+    # (workflow_dispatch) runs stop after building artifacts.
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
       - name: Download all build artifacts

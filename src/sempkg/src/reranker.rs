@@ -63,6 +63,23 @@ pub struct RerankerConfig {
     /// Defaults to 5.
     #[serde(default = "default_output_n")]
     pub output_n: usize,
+
+    /// GPU offload policy: `"auto"` (default), `"on"`, or `"off"`. Only takes
+    /// effect on a GPU-backend build (`--features reranker,cuda` or `…,vulkan`);
+    /// see [`crate::accel::GpuMode`]. Only used when `provider = "local"`.
+    #[serde(default)]
+    pub gpu: crate::accel::GpuMode,
+
+    /// CPU threads for reranker inference. `0` (default) uses all logical cores.
+    /// Only used when `provider = "local"`.
+    #[serde(default)]
+    pub n_threads: u32,
+
+    /// Advanced override: offload exactly this many model layers to the GPU.
+    /// `0` (default) defers to `gpu` (auto-detect). Requires a GPU-backend build.
+    /// Only used when `provider = "local"`.
+    #[serde(default)]
+    pub gpu_layers: u32,
 }
 
 fn default_true() -> bool {
@@ -89,6 +106,9 @@ impl Default for RerankerConfig {
             openai: None,
             top_k: default_top_k(),
             output_n: default_output_n(),
+            gpu: crate::accel::GpuMode::default(),
+            n_threads: 0,
+            gpu_layers: 0,
         }
     }
 }
@@ -361,6 +381,8 @@ fn build_rerank_prompt(query: &str, document: &str) -> String {
 #[cfg(feature = "reranker")]
 pub struct Reranker {
     model: llama_cpp_2::model::LlamaModel,
+    /// CPU threads used for scoring contexts (resolved: 0 → all cores).
+    n_threads: i32,
     top_k: usize,
     output_n: usize,
 }
@@ -392,12 +414,15 @@ impl Reranker {
         // multiple llama models can coexist without a double-free at shutdown.
         let backend = crate::llama_runtime::shared()?;
 
-        let model_params = LlamaModelParams::default();
+        let n_gpu_layers =
+            crate::accel::resolve_gpu_layers(config.gpu, config.gpu_layers, backend, "reranker");
+        let model_params = LlamaModelParams::default().with_n_gpu_layers(n_gpu_layers);
         let model = LlamaModel::load_from_file(backend, &model_path, &model_params)
             .map_err(|e| anyhow::anyhow!("loading model from {}: {e}", model_path.display()))?;
 
         Ok(Self {
             model,
+            n_threads: crate::accel::resolve_threads(config.n_threads),
             top_k: config.top_k,
             output_n: config.output_n,
         })
@@ -422,7 +447,11 @@ impl Reranker {
         // Pooling type comes from the GGUF metadata (RANK for Qwen3-Reranker).
         let ctx_params = LlamaContextParams::default()
             .with_n_ctx(std::num::NonZeroU32::new(4096))
-            .with_embeddings(true);
+            .with_embeddings(true)
+            .with_n_batch(4096)
+            .with_n_ubatch(4096)
+            .with_n_threads(self.n_threads)
+            .with_n_threads_batch(self.n_threads);
 
         let mut ctx = self
             .model
@@ -630,6 +659,25 @@ pub fn print_status(config: &RerankerConfig) {
     println!("  model      : {}", model_path.display());
     println!("  top_k      : {}", config.top_k);
     println!("  output_n   : {}", config.output_n);
+    println!(
+        "  cpu threads: {} ({})",
+        crate::accel::resolve_threads(config.n_threads),
+        if config.n_threads == 0 {
+            "all cores"
+        } else {
+            "configured"
+        }
+    );
+    println!(
+        "  gpu        : {}{}",
+        config.gpu.as_str(),
+        if config.gpu_layers > 0 {
+            format!(" (manual override: {} layers)", config.gpu_layers)
+        } else {
+            String::new()
+        }
+    );
+    println!("  gpu build  : {}", crate::accel::gpu_build_status());
     println!();
 
     let model_ok = model_path.is_file();
