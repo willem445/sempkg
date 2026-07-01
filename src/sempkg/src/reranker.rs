@@ -448,6 +448,8 @@ impl Reranker {
         let ctx_params = LlamaContextParams::default()
             .with_n_ctx(std::num::NonZeroU32::new(4096))
             .with_embeddings(true)
+            .with_n_batch(4096)
+            .with_n_ubatch(4096)
             .with_n_threads(self.n_threads)
             .with_n_threads_batch(self.n_threads);
 

@@ -390,6 +390,8 @@ impl Embedder {
             .with_n_ctx(std::num::NonZeroU32::new(self.n_ctx))
             .with_embeddings(true)
             .with_pooling_type(self.descriptor.pooling_type())
+            .with_n_batch(4096)
+            .with_n_ubatch(4096)
             .with_n_threads(self.n_threads)
             .with_n_threads_batch(self.n_threads);
         self.model
