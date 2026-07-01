@@ -72,7 +72,7 @@ impl GhClient {
     pub fn new(token: Option<&str>) -> Result<Self> {
         let inner = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(300))
-            .user_agent("sempkg/0.1 (https://github.com/willem445/codegraph-hub)")
+            .user_agent("sempkg/0.1 (https://github.com/willem445/sempkg)")
             .build()
             .context("Failed to build HTTP client")?;
         Ok(Self {

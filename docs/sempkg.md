@@ -42,12 +42,12 @@ optional local LLM reranker for high-quality hybrid queries.
 
 **Linux / macOS:**
 ```sh
-curl -fsSL https://raw.githubusercontent.com/willem445/codegraph-hub/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/willem445/sempkg/main/install.sh | sh
 ```
 
 **Windows (PowerShell):**
 ```powershell
-irm https://raw.githubusercontent.com/willem445/codegraph-hub/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/willem445/sempkg/main/install.ps1 | iex
 ```
 
 ### Build from source

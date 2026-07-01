@@ -12,6 +12,15 @@ The release workflow publishes CUDA artifacts alongside the CPU binaries:
 | `sempkg-x86_64-pc-windows-msvc-cuda.zip` | `sempkg.exe` + bundled CUDA runtime DLLs |
 | `sempkg-x86_64-unknown-linux-gnu-cuda` | self-contained binary (CUDA runtime linked statically) |
 
+## Installing
+
+The `install.sh` / `install.ps1` scripts pick the build automatically: if a
+supported NVIDIA GPU (compute capability ≥ 7.5) with a driver ≥ 580 is detected
+via `nvidia-smi`, they install the GPU build; otherwise they fall back to the
+CPU build. Override the choice with `--gpu on|off` (`-Gpu on|off` on Windows) —
+for example `--gpu off` to force the CPU build. GPU selection applies to
+`sempkg` only; `sembundle` has no GPU variant.
+
 ## What you need to run it
 
 You do **not** need to install the CUDA Toolkit or recompile — the CUDA runtime
