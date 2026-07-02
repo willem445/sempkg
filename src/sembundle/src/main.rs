@@ -180,6 +180,20 @@ enum Commands {
         /// each entry's path relative to its base directory.
         #[arg(long = "exclude-dir", short = 'x')]
         exclude_dirs: Vec<PathBuf>,
+
+        // --- Embeddings (optional) ---
+        /// Bake vector embeddings into the docs and source-code indexes before
+        /// packing, so the bundle ships pre-embedded. The embedding model is
+        /// recorded in manifest.json and appended to the default output filename
+        /// (`<name>-<version>+emb.<model>.sembundle`). Requires the `sempkg`
+        /// binary (built with --features embeddings) on PATH.
+        #[arg(long, default_value_t = false)]
+        embed: bool,
+
+        /// Embedding model id when --embed is set: `embeddinggemma-300m`
+        /// (default) or `qwen3-embedding-0.6b`.
+        #[arg(long)]
+        embedding_model: Option<String>,
     },
 
     /// Generate an Ed25519 keypair for bundle signing
@@ -263,6 +277,8 @@ fn main() {
             include_source,
             source_glob,
             exclude_dirs,
+            embed,
+            embedding_model,
         } => build::build(BuildOptions {
             name,
             version,
@@ -278,6 +294,8 @@ fn main() {
             include_source,
             source_glob,
             exclude_dirs,
+            embed,
+            embedding_model,
         })
         .map(|path| {
             println!("Bundle created: {}", path.display());

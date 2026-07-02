@@ -113,16 +113,31 @@ pub fn pack(opts: PackOptions) -> Result<PathBuf, PackError> {
 
     // --- Optional Lance extension ---
     let mut extensions: Vec<String> = Vec::new();
+    let mut lance_embedding: Option<(String, u32)> = None;
     if let Some(ref lance_dir) = opts.lance_dir {
-        collect_lance_entries(lance_dir, &created_at, &mut entries)?;
+        lance_embedding = collect_lance_entries(lance_dir, &created_at, &mut entries)?;
         extensions.push("lance".to_string());
     }
 
     // --- Optional source-code index extension ---
+    let mut code_embedding: Option<(String, u32)> = None;
     if let Some(ref code_dir) = opts.code_dir {
-        collect_code_entries(code_dir, &created_at, &mut entries)?;
+        code_embedding = collect_code_entries(code_dir, &created_at, &mut entries)?;
         extensions.push("code".to_string());
     }
+
+    // Embedding model baked into the shipped tables, if any. `build --embed`
+    // embeds every table with the same model, so lance/code agree; if they
+    // somehow disagree, prefer the docs (`lance/`) index and warn.
+    if let (Some((lm, _)), Some((cm, _))) = (&lance_embedding, &code_embedding) {
+        if lm != cm {
+            eprintln!(
+                "[sembundle] Warning: lance ({lm}) and code ({cm}) indexes were embedded \
+                 with different models; recording the lance model in the manifest."
+            );
+        }
+    }
+    let embedding = lance_embedding.or(code_embedding);
 
     // --- Compute checksums for all non-manifest files ---
     let mut checksums: HashMap<String, String> = HashMap::new();
@@ -131,7 +146,12 @@ pub fn pack(opts: PackOptions) -> Result<PathBuf, PackError> {
     }
 
     // --- Generate manifest.json (checksums are now final) ---
-    let spec_version = if opts.code_dir.is_some() {
+    // Bundles that ship pre-computed embeddings advertise spec 1.4.0 (adds the
+    // manifest `embedding_model`/`embedding_dim` fields); the `code/` extension
+    // alone is 1.3.0; a plain docs/graph bundle is 1.2.0.
+    let spec_version = if embedding.is_some() {
+        "1.4.0"
+    } else if opts.code_dir.is_some() {
         "1.3.0"
     } else {
         "1.2.0"
@@ -146,6 +166,8 @@ pub fn pack(opts: PackOptions) -> Result<PathBuf, PackError> {
         created_at,
         codegraph_version: opts.codegraph_version.clone(),
         extensions,
+        embedding_model: embedding.as_ref().map(|(m, _)| m.clone()),
+        embedding_dim: embedding.as_ref().map(|(_, d)| *d),
         checksums,
     };
     // Insert manifest first so it appears first in the archive listing.
@@ -160,7 +182,7 @@ pub fn pack(opts: PackOptions) -> Result<PathBuf, PackError> {
     // --- Write archive ---
     let output_path = opts
         .output_path
-        .unwrap_or_else(|| PathBuf::from(format!("{}.sembundle", prefix)));
+        .unwrap_or_else(|| PathBuf::from(default_output_name(&prefix, embedding.as_ref())));
 
     {
         let file = std::fs::File::create(&output_path)?;
@@ -183,6 +205,20 @@ pub fn pack(opts: PackOptions) -> Result<PathBuf, PackError> {
     }
 
     Ok(output_path)
+}
+
+/// Default `.sembundle` filename for a given `<name>-<version>` prefix.
+///
+/// When the bundle ships pre-computed embeddings, a `+emb.<model_id>` suffix is
+/// appended (semver-build-metadata style) so the model is visible in the
+/// filename, e.g. `mypkg-1.0.0+emb.embeddinggemma-300m.sembundle`. The suffix is
+/// cosmetic: package identity (`name`/`version`) and the archive's top-level
+/// directory stay `<name>-<version>`, so it does not affect install/resolve.
+fn default_output_name(prefix: &str, embedding: Option<&(String, u32)>) -> String {
+    match embedding {
+        Some((model, _)) => format!("{prefix}+emb.{model}.sembundle"),
+        None => format!("{prefix}.sembundle"),
+    }
 }
 
 /// Recursively collect all files under `dir`, adding them to `entries` with
@@ -212,17 +248,22 @@ fn collect_dir(dir: &Path, dir_prefix: &str, entries: &mut Vec<Entry>) -> Result
 ///
 /// - `lance/metadata.json`   — parsed, `created_at` stamped, re-serialised
 /// - `lance/<table>.lance/**` — all Arrow/Lance data files copied verbatim
+///
+/// Returns the `(embedding_model, embedding_dim)` recorded in the table's
+/// `metadata.json`, if the index ships pre-computed vectors.
 fn collect_lance_entries(
     lance_dir: &Path,
     created_at: &str,
     entries: &mut Vec<Entry>,
-) -> Result<(), PackError> {
+) -> Result<Option<(String, u32)>, PackError> {
     // Stamp metadata.json with the bundle's created_at (spec §11.5)
+    let mut embedding: Option<(String, u32)> = None;
     let meta_path = lance_dir.join("metadata.json");
     if meta_path.is_file() {
         let raw = std::fs::read(&meta_path)?;
         let mut meta: LanceMetadata = serde_json::from_slice(&raw)?;
         meta.created_at = created_at.to_string();
+        embedding = meta.embedding_model.clone().zip(meta.embedding_dim);
         entries.push(Entry {
             key: "lance/metadata.json".to_string(),
             content: serde_json::to_vec_pretty(&meta)?,
@@ -253,23 +294,28 @@ fn collect_lance_entries(
         });
     }
 
-    Ok(())
+    Ok(embedding)
 }
 
 /// Collect all source-code index files into `code/`-prefixed bundle entries.
 ///
 /// - `code/metadata.json`   — parsed, `created_at` stamped, re-serialised
 /// - `code/<table>.lance/**` — all Arrow/Lance data files copied verbatim
+///
+/// Returns the `(embedding_model, embedding_dim)` recorded in the table's
+/// `metadata.json`, if the index ships pre-computed vectors.
 fn collect_code_entries(
     code_dir: &Path,
     created_at: &str,
     entries: &mut Vec<Entry>,
-) -> Result<(), PackError> {
+) -> Result<Option<(String, u32)>, PackError> {
+    let mut embedding: Option<(String, u32)> = None;
     let meta_path = code_dir.join("metadata.json");
     if meta_path.is_file() {
         let raw = std::fs::read(&meta_path)?;
         let mut meta: CodeMetadata = serde_json::from_slice(&raw)?;
         meta.created_at = created_at.to_string();
+        embedding = meta.embedding_model.clone().zip(meta.embedding_dim);
         entries.push(Entry {
             key: "code/metadata.json".to_string(),
             content: serde_json::to_vec_pretty(&meta)?,
@@ -298,7 +344,7 @@ fn collect_code_entries(
         });
     }
 
-    Ok(())
+    Ok(embedding)
 }
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -358,6 +404,28 @@ mod tests {
             "indexed_paths": ["docs/**/*.md"],
             "fts_enabled": true,
             "created_at": "1970-01-01T00:00:00Z"
+        });
+        fs::write(
+            dir.join("metadata.json"),
+            serde_json::to_vec_pretty(&meta).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// Build a LanceDB index directory whose metadata declares baked embeddings.
+    fn make_lance_dir_embedded(dir: &Path, model: &str, dim: u32) {
+        let table_dir = dir.join("docs.lance");
+        fs::create_dir_all(&table_dir).unwrap();
+        fs::write(table_dir.join("0.lance"), b"arrow-data").unwrap();
+        let meta = serde_json::json!({
+            "table_name": "docs",
+            "document_count": 10,
+            "chunk_count": 42,
+            "indexed_paths": ["docs/**/*.md"],
+            "fts_enabled": true,
+            "created_at": "1970-01-01T00:00:00Z",
+            "embedding_model": model,
+            "embedding_dim": dim,
         });
         fs::write(
             dir.join("metadata.json"),
@@ -740,5 +808,62 @@ mod tests {
                 "lance file '{key}' missing from checksums"
             );
         }
+    }
+
+    // ── Embedding metadata & naming ───────────────────────────────────────────
+
+    #[test]
+    fn default_output_name_plain_and_embedded() {
+        assert_eq!(
+            super::default_output_name("my-sdk-1.0.0", None),
+            "my-sdk-1.0.0.sembundle"
+        );
+        let emb = ("embeddinggemma-300m".to_string(), 768u32);
+        assert_eq!(
+            super::default_output_name("my-sdk-1.0.0", Some(&emb)),
+            "my-sdk-1.0.0+emb.embeddinggemma-300m.sembundle"
+        );
+    }
+
+    #[test]
+    fn manifest_records_embedding_from_lance_metadata() {
+        let tmp = TempDir::new().unwrap();
+        let input = tmp.path().join("input");
+        let lance = tmp.path().join("lance");
+        make_input(&input);
+        make_lance_dir_embedded(&lance, "embeddinggemma-300m", 768);
+        let output = tmp.path().join("out.sembundle");
+        let mut opts = default_opts(input, output.clone());
+        opts.lance_dir = Some(lance);
+        pack(opts).unwrap();
+
+        let (manifest_bytes, _) = extract_bundle(&output);
+        let m: Manifest = serde_json::from_slice(&manifest_bytes).unwrap();
+        assert_eq!(m.embedding_model.as_deref(), Some("embeddinggemma-300m"));
+        assert_eq!(m.embedding_dim, Some(768));
+        // Shipping embeddings advertises spec 1.4.0.
+        assert_eq!(m.spec_version, "1.4.0");
+    }
+
+    #[test]
+    fn manifest_omits_embedding_when_absent() {
+        let tmp = TempDir::new().unwrap();
+        let input = tmp.path().join("input");
+        let lance = tmp.path().join("lance");
+        make_input(&input);
+        make_lance_dir(&lance); // no embedding fields
+        let output = tmp.path().join("out.sembundle");
+        let mut opts = default_opts(input, output.clone());
+        opts.lance_dir = Some(lance);
+        pack(opts).unwrap();
+
+        let (manifest_bytes, _) = extract_bundle(&output);
+        let m: Manifest = serde_json::from_slice(&manifest_bytes).unwrap();
+        assert_eq!(m.embedding_model, None);
+        assert_eq!(m.embedding_dim, None);
+        // Fields are skipped entirely when absent (not serialized as null).
+        let raw: serde_json::Value = serde_json::from_slice(&manifest_bytes).unwrap();
+        assert!(raw.get("embedding_model").is_none());
+        assert!(raw.get("embedding_dim").is_none());
     }
 }

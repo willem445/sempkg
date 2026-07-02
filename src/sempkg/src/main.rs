@@ -118,6 +118,10 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
                     };
                     let lance_flag = if b.has_lance() { "  +lance" } else { "" };
                     let code_flag = if b.has_code() { "  +code" } else { "" };
+                    let emb_flag = match b.manifest.embedding_model() {
+                        Some(model) => format!("  +emb:{model}"),
+                        None => String::new(),
+                    };
                     let scope = match b.scope {
                         BundleScope::Workspace => "workspace",
                         BundleScope::Global => "global",
@@ -130,7 +134,7 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
                         .map(|d| format!("  # {d}"))
                         .unwrap_or_default();
                     println!(
-                        "  {:<20} @ {:<12} [{idx}]  [{scope}]{lance_flag}{code_flag}{desc}",
+                        "  {:<20} @ {:<12} [{idx}]  [{scope}]{lance_flag}{code_flag}{emb_flag}{desc}",
                         b.name, b.version
                     );
                 }
@@ -888,6 +892,7 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
         // Embedding / query-expansion management
         // -----------------------------------------------------------------------
         Commands::Embed { package, force } => run_embed(package.as_deref(), force, workspace),
+        Commands::EmbedDir { path, table, model } => run_embed_dir(&path, &table, &model),
         Commands::Embedding(sub) => run_embedding(sub, workspace),
         Commands::QueryExpansion(sub) => run_query_expansion(sub, workspace),
     }
@@ -1409,6 +1414,49 @@ fn run_embed(package: Option<&str>, force: bool, workspace: Option<&Path>) -> Re
     Ok(())
 }
 
+/// Run `sempkg embed-dir`: embed a single LanceDB index directory in place.
+///
+/// Used by `sembundle build --embed` to bake vectors into a bundle's `lance/`
+/// or `code/` index before packing. Adds a `vector` column to `<table>` and
+/// stamps `embedding_model`/`embedding_dim` into `<path>/metadata.json`.
+fn run_embed_dir(path: &Path, table: &str, model_id: &str) -> Result<()> {
+    if table != "docs" && table != "code" {
+        anyhow::bail!("--table must be 'docs' or 'code' (got '{table}')");
+    }
+    if !path.is_dir() {
+        anyhow::bail!("index directory not found: {}", path.display());
+    }
+
+    // Force a local embedder pinned to the requested model, resolving to the
+    // default GGUF path under ~/.sempkg/models/ (no workspace config involved).
+    let cfg = embedding::EmbeddingConfig {
+        model_id: model_id.to_string(),
+        provider: providers::ProviderKind::Local,
+        model: None,
+        ..embedding::EmbeddingConfig::default()
+    };
+    // Validate the model id up front for a clear error before loading anything.
+    let model = cfg.model()?;
+
+    let embedder = providers::build_embedder(&cfg).ok_or_else(|| {
+        anyhow::anyhow!(
+            "Embedding model '{model_id}' not available. Run \
+             `sempkg embedding pull --model {model_id}` and ensure this binary was \
+             built with `--features embeddings`."
+        )
+    })?;
+
+    println!(
+        "Embedding {}::{table} with {} ({}-dim)...",
+        path.display(),
+        model.display_name(),
+        model.dim()
+    );
+    let n = lance::embed_table(path, table, embedder.as_ref())?;
+    println!("Embedded {n} rows into {}::{table}.", path.display());
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // index — one-shot workspace indexing
 // ---------------------------------------------------------------------------
@@ -1733,6 +1781,8 @@ fn add_from_github(
                 }
             })
             .collect(),
+        embed: false,
+        embedding_model: None,
     };
 
     sembundle::build(build_opts).with_context(|| {
@@ -2381,6 +2431,8 @@ fn add_from_local(
                 }
             })
             .collect(),
+        embed: false,
+        embedding_model: None,
     };
 
     sembundle::build(build_opts).with_context(|| {

@@ -59,7 +59,21 @@ pub struct BuildOptions {
     /// Absolute paths are matched against entry paths directly; relative paths are
     /// matched against the entry's path relative to its base directory.
     pub exclude_dirs: Vec<PathBuf>,
+
+    // --- Embeddings (optional) ---
+    /// When `true`, embed the docs and source-code LanceDB indexes (adding a
+    /// `vector` column) before packing, so the bundle ships pre-computed
+    /// embeddings. Requires the `sempkg` binary (built with `--features
+    /// embeddings`) on `PATH`.
+    pub embed: bool,
+    /// Embedding model id to use when `embed` is `true`.
+    /// Defaults to `embeddinggemma-300m`.
+    pub embedding_model: Option<String>,
 }
+
+/// Default embedding model used by `build --embed` when none is specified.
+/// Mirrors sempkg's `EmbeddingModel::DEFAULT`.
+const DEFAULT_EMBEDDING_MODEL: &str = "embeddinggemma-300m";
 
 /// Run the full build pipeline and return the path of the produced bundle.
 pub fn build(opts: BuildOptions) -> Result<PathBuf, PackError> {
@@ -141,6 +155,27 @@ pub fn build(opts: BuildOptions) -> Result<PathBuf, PackError> {
     } else {
         None
     };
+
+    // Step 2c: embed the LanceDB indexes in place (optional, --embed).
+    // sembundle cannot link the embedding engine (it lives in the sempkg crate,
+    // which depends on *this* crate), so shell out to the `sempkg` binary. The
+    // embed step stamps embedding_model/embedding_dim into each table's
+    // metadata.json, which pack() reads back into the manifest + filename.
+    if opts.embed {
+        let model_id = opts
+            .embedding_model
+            .as_deref()
+            .unwrap_or(DEFAULT_EMBEDDING_MODEL);
+        let sempkg = find_tool("sempkg")?;
+        if let Some(ref lance_dir) = lance_out {
+            eprintln!("[sembundle] Embedding documentation index ({model_id}) ...");
+            embed_index(&sempkg, lance_dir, "docs", model_id)?;
+        }
+        if let Some(ref code_dir) = code_out {
+            eprintln!("[sembundle] Embedding source-code index ({model_id}) ...");
+            embed_index(&sempkg, code_dir, "code", model_id)?;
+        }
+    }
 
     // Step 3: pack.
     eprintln!("[sembundle] Packing bundle ...");
@@ -1356,6 +1391,31 @@ fn chunk_text(text: &str, max_chars: usize) -> Vec<DocChunk> {
 
 fn find_tool(name: &str) -> Result<PathBuf, PackError> {
     which::which(name).map_err(|_| PackError::ToolNotFound(name.to_string()))
+}
+
+/// Embed a LanceDB index directory in place by shelling out to `sempkg
+/// embed-dir`. `table` is `"docs"` or `"code"`. A missing model / non-embeddings
+/// `sempkg` build surfaces as [`PackError::ToolFailed`] with sempkg's message.
+fn embed_index(sempkg: &Path, dir: &Path, table: &str, model_id: &str) -> Result<(), PackError> {
+    let dir_str = dir.to_str().ok_or_else(|| PackError::InvalidField {
+        field: "index_dir".to_string(),
+        reason: format!("index path is not valid UTF-8: {}", dir.display()),
+    })?;
+    invoke(
+        sempkg,
+        &[
+            "embed-dir",
+            "--path",
+            dir_str,
+            "--table",
+            table,
+            "--model",
+            model_id,
+        ],
+        None,
+        None,
+        true,
+    )
 }
 
 fn build_command(exe: &Path, args: &[&str]) -> Command {

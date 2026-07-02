@@ -20,6 +20,15 @@ pub struct Manifest {
     /// Optional bundle extensions present (e.g. `["lance"]`).
     /// Spec: sembundle-spec.md §4.2.
     pub extensions: Vec<String>,
+    /// Identifier of the embedding model baked into the `lance/`/`code/` tables,
+    /// if the bundle ships pre-computed vectors (e.g. `"embeddinggemma-300m"`).
+    /// `None` means the bundle has no embeddings. Authoritative record used to
+    /// resolve which local embedding model to run at query time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_model: Option<String>,
+    /// Dimension of the baked embedding vectors, if present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_dim: Option<u32>,
     /// Map of bundle-relative file path → SHA-256 hex digest.
     /// Covers every file in the bundle **except** `manifest.json` itself.
     pub checksums: HashMap<String, String>,

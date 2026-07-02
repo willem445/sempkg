@@ -199,6 +199,38 @@ Optional:
 - `--docs-glob`
 - `--include-source` (embed `code/` source-code index extension)
 - `--source-glob` (restrict files included by source-code index)
+- `--embed` (bake vector embeddings into the docs/code indexes before packing)
+- `--embedding-model` (model id when `--embed` is set; default: `embeddinggemma-300m`)
+
+### Pre-embedded bundles (`--embed`)
+
+`--embed` runs the embedding model over every docs/code chunk at build time and
+ships the resulting vectors inside the bundle, so consumers get semantic
+(vector) search immediately after `sempkg sync` — no local corpus-embedding
+pass. The model is recorded in `manifest.json` and appended to the default
+filename (`<name>-<version>+emb.<model>.sembundle`); at query time sempkg
+auto-resolves that model per bundle.
+
+Requirements: the `sempkg` binary (built with `--features embeddings`) on
+`PATH`, with the model downloaded (`sempkg embedding pull`).
+
+**Guidance:**
+
+- **Prefer the default model, `embeddinggemma-300m`, for published bundles.**
+  Consumers need the same model locally to embed queries, so publishing against
+  the shared default means one small model serves every pre-embedded bundle a
+  user installs. Treat `qwen3-embedding-0.6b` as a local re-embed choice
+  (`sempkg embed --force`) for users who want it, not as a second published
+  variant — shipping multiple model variants doubles artifacts and fragments
+  the ecosystem.
+- **Reserve `--embed` for large corpuses**, where the consumer-side embedding
+  pass is genuinely expensive (minutes or more on CPU). Vectors add roughly
+  `chunks × dim × 4` bytes of incompressible data — ~3 KB per chunk at 768
+  dims, so ~30 MB per 10k chunks — which can inflate a bundle several-fold.
+  For small repos, skip `--embed` and let consumers run `sempkg embed` after
+  `sync`; it is fast and keeps the bundle lean.
+- Bundles without embeddings are never broken for consumers: search falls back
+  to BM25, and `sempkg embed` can add vectors post-install at any time.
 
 ## `sembundle key-gen`
 
@@ -303,6 +335,27 @@ sembundle build `
   --source-dir .\src `
   --include-source `
   --source-glob "**/*.{rs,py,js,ts,tsx}"
+```
+
+### Build a large corpus with embeddings baked in
+
+For big libraries where the consumer-side embedding pass would be expensive.
+Uses the default `embeddinggemma-300m` model (recommended for published
+bundles); produces `my-sdk-1.2.0+emb.embeddinggemma-300m.sembundle`.
+
+```powershell
+sempkg embedding pull   # one-time: download the embedding model
+
+sembundle build `
+  --name my-sdk `
+  --version 1.2.0 `
+  --source-repo https://github.com/my-org/my-sdk `
+  --commit-hash a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0 `
+  --codegraph-version 0.3.1 `
+  --source-dir .\src `
+  --docs-dir .\docs `
+  --include-source `
+  --embed
 ```
 
 ### Publish in CI with env vars

@@ -189,6 +189,23 @@ sempkg embed <package>                         # embed a single package/bundle
 > the previous model no longer match. Re-run `sempkg embed` to re-embed them
 > (mismatched tables are re-embedded automatically; identical ones are skipped).
 
+### Pre-embedded bundles
+
+Bundles built with `sembundle build --embed` ship their vectors already
+computed — no `sempkg embed` pass is needed after `sync`. `sempkg list` marks
+them with `+emb:<model>`, and the filename carries a `+emb.<model>` suffix
+(e.g. `my-sdk-1.2.0+emb.embeddinggemma-300m.sembundle`).
+
+At query time the MCP server **auto-resolves the model per bundle**: each
+table is searched with the model it was embedded with, so bundles embedded
+with different models work side by side. You only need the matching model
+pulled locally (for query embedding); published bundles should use the default
+`embeddinggemma-300m`, so in practice `sempkg embedding pull` covers them all.
+If a bundle needs a model you haven't pulled, its tables fall back to BM25 and
+a one-time hint prints the exact `sempkg embedding pull --model <id>` command.
+Prefer a different model? `sempkg embed --force` re-embeds any installed
+bundle locally with your configured `model_id`.
+
 Status / test helpers:
 
 ```bash
