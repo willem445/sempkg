@@ -27,12 +27,15 @@ src/sempkg/
 
 ## Building
 
+The repo is a single Cargo workspace, so build from the repo root — both member
+crates share one `target/` directory there:
+
 ```sh
-cd src/sempkg
-cargo build --release
+cargo build --release --manifest-path src/sempkg/Cargo.toml
 ```
 
-The binary is output to `target/release/sempkg`.
+The binary is output to `target/release/sempkg` at the **repo root** (not
+`src/sempkg/target/`).
 
 Install globally with cargo:
 ```sh

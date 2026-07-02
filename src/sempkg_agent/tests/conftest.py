@@ -27,11 +27,15 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 def _find_binary(crate: str, name: str) -> str:
     """Return the path to a built Rust binary (release preferred), or ''."""
     exe = f"{name}.exe" if os.name == "nt" else name
-    for profile in ("release", "debug"):
-        for candidate in (exe, name):
-            p = REPO_ROOT / "src" / crate / "target" / profile / candidate
-            if p.is_file():
-                return str(p)
+    # Cargo workspace: both crates build into the repo-root target/. Keep the
+    # legacy per-crate target/ as a fallback for pre-workspace checkouts.
+    search_roots = (REPO_ROOT / "target", REPO_ROOT / "src" / crate / "target")
+    for base in search_roots:
+        for profile in ("release", "debug"):
+            for candidate in (exe, name):
+                p = base / profile / candidate
+                if p.is_file():
+                    return str(p)
     return shutil.which(name) or ""
 
 

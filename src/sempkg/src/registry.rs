@@ -3,7 +3,6 @@ use std::collections::HashMap;
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
 
 use crate::{error::SempkgError, github};
 
@@ -105,7 +104,7 @@ impl RegistryClient {
         let bytes = bytes.to_vec();
 
         if let Some(expected) = expected_sha256 {
-            let actual = hex::encode(Sha256::digest(&bytes));
+            let actual = sembundle::checksum::sha256_bytes(&bytes);
             if actual != expected {
                 return Err(SempkgError::ChecksumMismatch {
                     path: format!("{package}-{version}.sembundle"),
@@ -225,7 +224,7 @@ pub fn download_from_url(url: &str, expected_sha256: Option<&str>) -> Result<Vec
     };
 
     if let Some(expected) = expected_sha256 {
-        let actual = hex::encode(Sha256::digest(&bytes));
+        let actual = sembundle::checksum::sha256_bytes(&bytes);
         if actual != expected {
             return Err(SempkgError::ChecksumMismatch {
                 path: url.to_string(),

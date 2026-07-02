@@ -201,6 +201,12 @@ def _find_binary() -> str:
     """Return the path to the sempkg release (or debug) binary, or ''."""
     root = Path(__file__).parent.parent
     candidates = [
+        # Cargo workspace: binaries land in the repo-root target/.
+        root / "target" / "release" / "sempkg",
+        root / "target" / "release" / "sempkg.exe",
+        root / "target" / "debug" / "sempkg",
+        root / "target" / "debug" / "sempkg.exe",
+        # Legacy per-crate location (pre-workspace checkouts).
         root / "src" / "sempkg" / "target" / "release" / "sempkg",
         root / "src" / "sempkg" / "target" / "release" / "sempkg.exe",
         root / "src" / "sempkg" / "target" / "debug" / "sempkg",
