@@ -563,7 +563,9 @@ mod tests {
             .dependencies
             .insert("reqwest".to_string(), described);
         // A dependency without a description must not emit the key.
-        manifest.dependencies.insert("plain".to_string(), dep("2.0.0"));
+        manifest
+            .dependencies
+            .insert("plain".to_string(), dep("2.0.0"));
 
         save_manifest(&manifest, dir.path()).expect("save manifest");
 
@@ -581,7 +583,9 @@ mod tests {
             Some("HTTP client with retry support")
         );
         assert_eq!(
-            loaded.find_dependency("plain").and_then(|d| d.description.clone()),
+            loaded
+                .find_dependency("plain")
+                .and_then(|d| d.description.clone()),
             None
         );
     }

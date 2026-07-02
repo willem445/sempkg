@@ -44,31 +44,28 @@ metal  = ["dep:llama-cpp-2", "llama-cpp-2/metal"]
 
 [dependencies]
 sembundle    = { path = "../sembundle" }
-clap         = { version = "4", features = ["derive", "env"] }
-tokio        = { version = "1", features = ["full"] }
-serde        = { version = "1", features = ["derive"] }
-serde_json   = "1"
+clap         = { workspace = true }
+tokio        = { workspace = true, features = ["full"] }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
 toml         = "1"
 toml_edit    = "0.25"
-reqwest      = { version = "0.13", features = ["blocking", "json"] }
-sha2         = "0.11"
-hex          = "0.4"
-tar          = "0.4"
-flate2       = "1"
-ed25519-dalek = { version = "2", features = ["pkcs8", "pem"] }
-lancedb      = "0.30"
-arrow-array  = "58"
-arrow-schema = "58"
+reqwest      = { workspace = true, features = ["blocking", "json"] }
+tar          = { workspace = true }
+flate2       = { workspace = true }
+lancedb      = { workspace = true }
+arrow-array  = { workspace = true }
+arrow-schema = { workspace = true }
 futures      = "0.3"
-glob         = "0.3"
+glob         = { workspace = true }
 anyhow       = "1"
-thiserror    = "2"
-chrono       = { version = "0.4", features = ["serde"] }
+thiserror    = { workspace = true }
+chrono       = { workspace = true }
 dirs         = "6"
-tempfile     = "3"
-walkdir      = "2"
-which        = "8"
-rusqlite     = { version = "0.31", features = ["bundled"] }
+tempfile     = { workspace = true }
+walkdir      = { workspace = true }
+which        = { workspace = true }
+rusqlite     = { workspace = true }
 
 # Optional reranker dependency (enabled via --features reranker)
 # llama-cpp-2 wraps llama.cpp with native Qwen3 + RANK-pooling reranker support.

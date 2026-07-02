@@ -75,13 +75,13 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      # Cache is scoped to the crate being built (src/sembundle or src/sempkg).
-      # Binary name matches its source directory name, so this resolves correctly.
+      # Single cargo workspace at the repo root — one shared target/ and lockfile
+      # for both member crates.
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: src/${{ matrix.binary }} -> target
-          key: ${{ matrix.target }}
+          workspaces: . -> target
+          key: ${{ matrix.target }}-${{ matrix.binary }}
 
       # aws-lc-rs requires cmake + clang on Linux.
       - name: Install build dependencies (Linux)
@@ -155,9 +155,8 @@ jobs:
       - name: Stage artifact
         shell: bash
         run: |
-          crate_dir="${{ matrix.manifest }}"
-          crate_dir="${crate_dir%/Cargo.toml}"
-          src="${crate_dir}/target/${{ matrix.target }}/release/${{ matrix.binary }}${{ matrix.ext }}"
+          # Workspace builds land in the repo-root target/, not per-crate.
+          src="target/${{ matrix.target }}/release/${{ matrix.binary }}${{ matrix.ext }}"
           artifact="${{ matrix.binary }}-${{ matrix.target }}${{ matrix.ext }}"
           cp "${src}" "${artifact}"
           echo "ARTIFACT=${artifact}" >> "${GITHUB_ENV}"
@@ -220,7 +219,7 @@ jobs:
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: src/sempkg -> target
+          workspaces: . -> target
           key: ${{ matrix.target }}-cuda
 
       # Provides nvcc + the cudart/cublas headers and import libraries, and on
@@ -290,7 +289,7 @@ jobs:
         run: |
           $stage = "sempkg-${{ matrix.target }}-cuda"
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
-          Copy-Item "src/sempkg/target/${{ matrix.target }}/release/sempkg.exe" $stage
+          Copy-Item "target/${{ matrix.target }}/release/sempkg.exe" $stage
           # CUDA 13 reorganised the Windows toolkit layout, so search the whole
           # toolkit tree rather than assuming the DLLs live in \bin.
           foreach ($pat in @('cudart64_*.dll','cublas64_*.dll','cublasLt64_*.dll')) {
@@ -311,7 +310,7 @@ jobs:
         shell: bash
         run: |
           artifact="sempkg-${{ matrix.target }}-cuda"
-          cp "src/sempkg/target/${{ matrix.target }}/release/sempkg" "$artifact"
+          cp "target/${{ matrix.target }}/release/sempkg" "$artifact"
           echo "ARTIFACT=$artifact"      >> "$GITHUB_ENV"
           echo "ARTIFACT_NAME=$artifact" >> "$GITHUB_ENV"
 

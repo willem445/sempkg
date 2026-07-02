@@ -1,10 +1,10 @@
 /// Bundle store: manages installed .sembundle archives at workspace or global scope.
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+
+use sembundle::consts::{CODE_EXT, LANCE_EXT};
 
 use crate::error::SempkgError;
 
@@ -29,28 +29,28 @@ pub fn global_store_dir() -> PathBuf {
 // Bundle manifest JSON (inside the .sembundle archive)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct BundleManifest {
-    pub spec_version: String,
-    pub name: String,
-    pub version: String,
-    pub source_repo: String,
-    pub commit_hash: String,
-    pub tag: Option<String>,
-    pub created_at: String,
-    pub codegraph_version: String,
-    #[serde(default)]
-    pub extensions: Vec<String>,
-    pub checksums: BTreeMap<String, String>,
+/// The manifest schema is owned by `sembundle`; re-export it under the historical
+/// `BundleManifest` name rather than keeping a second, drift-prone copy. It is
+/// field-identical (both use a `BTreeMap` for `checksums`).
+pub use sembundle::manifest::Manifest as BundleManifest;
+
+/// Extension methods for querying which optional extensions a manifest declares.
+///
+/// These stay on the `sempkg` side (as an extension trait) rather than on the
+/// shared type because "which extensions are present" is an install-store concern,
+/// not part of the on-disk archive schema.
+pub trait ManifestExt {
+    fn has_lance(&self) -> bool;
+    fn has_code(&self) -> bool;
 }
 
-impl BundleManifest {
-    pub fn has_lance(&self) -> bool {
-        self.extensions.iter().any(|e| e == "lance")
+impl ManifestExt for BundleManifest {
+    fn has_lance(&self) -> bool {
+        self.extensions.iter().any(|e| e == LANCE_EXT)
     }
 
-    pub fn has_code(&self) -> bool {
-        self.extensions.iter().any(|e| e == "code")
+    fn has_code(&self) -> bool {
+        self.extensions.iter().any(|e| e == CODE_EXT)
     }
 }
 
@@ -152,7 +152,7 @@ impl BundleStore {
             .into());
         }
 
-        let archive_sha256 = hex::encode(Sha256::digest(bytes));
+        let archive_sha256 = sembundle::checksum::sha256_bytes(bytes);
 
         // Validate checksums before extracting
         validate_checksums(bytes, &manifest)?;
@@ -175,23 +175,21 @@ impl BundleStore {
             .context("Failed to read archive entries")?
         {
             let mut entry = entry.context("Bad archive entry")?;
-            let entry_path = entry.path().context("Bad entry path")?;
-            let entry_path = entry_path.to_path_buf();
+            let entry_path = entry.path().context("Bad entry path")?.to_path_buf();
 
-            // Strip leading `<name>-<version>/`
-            let stripped = entry_path.components().skip(1).collect::<PathBuf>();
-            if stripped == PathBuf::from("") {
+            // Strip the leading `<name>-<version>/` using the shared convention.
+            let Some(rel_key) = sembundle::reader::bundle_relative_key(&entry_path) else {
                 continue; // top-level dir entry itself
-            }
+            };
 
-            let out_path = tmp_dir.path().join(&stripped);
+            let out_path = tmp_dir.path().join(&rel_key);
             if let Some(parent) = out_path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
             if entry.header().entry_type().is_file() {
                 entry
                     .unpack(&out_path)
-                    .with_context(|| format!("Failed to extract {}", stripped.display()))?;
+                    .with_context(|| format!("Failed to extract {rel_key}"))?;
             }
         }
 
@@ -410,77 +408,19 @@ fn read_install_metadata(bundle_dir: &Path) -> Option<InstallMetadata> {
 }
 
 /// Read `manifest.json` from a .sembundle archive (without extracting).
+///
+/// Delegates to the shared reader so the archive-layout convention lives in one
+/// place ([`sembundle::reader`]).
 pub fn read_manifest_from_tar(bytes: &[u8]) -> Result<BundleManifest> {
-    use std::io::{Cursor, Read};
-
-    let cursor = Cursor::new(bytes);
-    let gz = flate2::read::GzDecoder::new(cursor);
-    let mut archive = tar::Archive::new(gz);
-
-    for entry in archive.entries().context("Failed to read archive")? {
-        let mut entry = entry.context("Bad archive entry")?;
-        let path = entry.path().context("Bad entry path")?.to_path_buf();
-        let parts: Vec<_> = path.components().collect();
-
-        // Looking for `<name>-<version>/manifest.json`
-        if parts.len() == 2 && parts[1].as_os_str() == "manifest.json" {
-            let mut buf = String::new();
-            entry
-                .read_to_string(&mut buf)
-                .context("Failed to read manifest.json")?;
-            return serde_json::from_str(&buf).context("Failed to parse manifest.json");
-        }
-    }
-    anyhow::bail!("manifest.json not found in archive")
+    Ok(sembundle::reader::read_manifest(bytes)?)
 }
 
 /// Validate all checksums listed in bundle manifest.json.
+///
+/// Delegates to [`sembundle::reader::verify_checksums`] — the same routine used
+/// by the sembundle CLI — so writer and reader can't disagree on what's covered.
 fn validate_checksums(bytes: &[u8], manifest: &BundleManifest) -> Result<()> {
-    use std::io::{Cursor, Read};
-
-    let cursor = Cursor::new(bytes);
-    let gz = flate2::read::GzDecoder::new(cursor);
-    let mut archive = tar::Archive::new(gz);
-
-    for entry in archive
-        .entries()
-        .context("Failed to read archive for checksum validation")?
-    {
-        let mut entry = entry.context("Bad archive entry")?;
-        let path = entry.path().context("Bad entry path")?.to_path_buf();
-        let parts: Vec<_> = path.components().collect();
-        if parts.len() < 2 {
-            continue;
-        }
-
-        // Relative path within bundle (strip top-level dir)
-        let rel: PathBuf = parts[1..].iter().collect();
-        let rel_str = rel.to_string_lossy().replace('\\', "/");
-
-        if rel_str == "manifest.json" {
-            continue; // manifest itself is not checksummed
-        }
-
-        if let Some(expected) = manifest.checksums.get(&rel_str) {
-            if !entry.header().entry_type().is_file() {
-                continue;
-            }
-            let mut data = Vec::new();
-            entry
-                .read_to_end(&mut data)
-                .context("Failed to read file for checksum")?;
-            let actual = hex::encode(Sha256::digest(&data));
-            if &actual != expected {
-                return Err(SempkgError::ChecksumMismatch {
-                    path: rel_str,
-                    expected: expected.clone(),
-                    actual,
-                }
-                .into());
-            }
-        }
-    }
-    Ok(())
+    Ok(sembundle::reader::verify_checksums(bytes, manifest)?)
 }
 
 // ---------------------------------------------------------------------------

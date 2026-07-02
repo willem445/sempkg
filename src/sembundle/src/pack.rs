@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use chrono::Utc;
@@ -7,6 +7,9 @@ use flate2::Compression;
 use walkdir::WalkDir;
 
 use crate::checksum::sha256_bytes;
+use crate::consts::{
+    CODE_EXT, LANCE_EXT, MANIFEST_FILE, METADATA_FILE, SPEC_VERSION_CODE, SPEC_VERSION_LANCE,
+};
 use crate::error::PackError;
 use crate::manifest::{CodeMetadata, LanceMetadata, Manifest, Metadata};
 use crate::validate::{
@@ -107,7 +110,7 @@ pub fn pack(opts: PackOptions) -> Result<PathBuf, PackError> {
         created_at: created_at.clone(),
     };
     entries.push(Entry {
-        key: "metadata.json".to_string(),
+        key: METADATA_FILE.to_string(),
         content: serde_json::to_vec_pretty(&metadata)?,
     });
 
@@ -115,26 +118,27 @@ pub fn pack(opts: PackOptions) -> Result<PathBuf, PackError> {
     let mut extensions: Vec<String> = Vec::new();
     if let Some(ref lance_dir) = opts.lance_dir {
         collect_lance_entries(lance_dir, &created_at, &mut entries)?;
-        extensions.push("lance".to_string());
+        extensions.push(LANCE_EXT.to_string());
     }
 
     // --- Optional source-code index extension ---
     if let Some(ref code_dir) = opts.code_dir {
         collect_code_entries(code_dir, &created_at, &mut entries)?;
-        extensions.push("code".to_string());
+        extensions.push(CODE_EXT.to_string());
     }
 
     // --- Compute checksums for all non-manifest files ---
-    let mut checksums: HashMap<String, String> = HashMap::new();
+    // BTreeMap keeps the serialized (and therefore signed) manifest deterministic.
+    let mut checksums: BTreeMap<String, String> = BTreeMap::new();
     for e in &entries {
         checksums.insert(e.key.clone(), sha256_bytes(&e.content));
     }
 
     // --- Generate manifest.json (checksums are now final) ---
     let spec_version = if opts.code_dir.is_some() {
-        "1.3.0"
+        SPEC_VERSION_CODE
     } else {
-        "1.2.0"
+        SPEC_VERSION_LANCE
     };
     let manifest = Manifest {
         spec_version: spec_version.to_string(),
@@ -152,7 +156,7 @@ pub fn pack(opts: PackOptions) -> Result<PathBuf, PackError> {
     entries.insert(
         0,
         Entry {
-            key: "manifest.json".to_string(),
+            key: MANIFEST_FILE.to_string(),
             content: serde_json::to_vec_pretty(&manifest)?,
         },
     );

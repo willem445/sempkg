@@ -206,7 +206,11 @@ fn codegraph_initialized(dot_cg: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn run_codegraph(source_dirs: &[PathBuf], out_dir: &Path, exclude_dirs: &[PathBuf]) -> Result<(), PackError> {
+fn run_codegraph(
+    source_dirs: &[PathBuf],
+    out_dir: &Path,
+    exclude_dirs: &[PathBuf],
+) -> Result<(), PackError> {
     let exe = find_tool("codegraph")?;
     let graph_dir = out_dir.join("graph");
     std::fs::create_dir_all(&graph_dir)?;

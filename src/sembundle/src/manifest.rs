@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
@@ -7,7 +7,11 @@ use serde::{Deserialize, Serialize};
 /// Authoritative descriptor generated at pack time. Contains SHA-256
 /// checksums for every other file in the bundle.
 /// Spec: sembundle-spec.md §4.
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
+///
+/// This is the single shared definition of the manifest schema: `sempkg`
+/// re-exports it (as `BundleManifest`) instead of maintaining its own copy, so
+/// writer and reader can never disagree on the field set.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Manifest {
     pub spec_version: String,
     pub name: String,
@@ -19,10 +23,15 @@ pub struct Manifest {
     pub codegraph_version: String,
     /// Optional bundle extensions present (e.g. `["lance"]`).
     /// Spec: sembundle-spec.md §4.2.
+    #[serde(default)]
     pub extensions: Vec<String>,
     /// Map of bundle-relative file path → SHA-256 hex digest.
     /// Covers every file in the bundle **except** `manifest.json` itself.
-    pub checksums: HashMap<String, String>,
+    ///
+    /// A `BTreeMap` (not `HashMap`) so iteration order is deterministic: the
+    /// serialized manifest bytes are what gets signed, and a nondeterministic
+    /// key order would make identical inputs produce different signatures.
+    pub checksums: BTreeMap<String, String>,
 }
 
 /// Source metadata embedded in the bundle (`metadata.json`).

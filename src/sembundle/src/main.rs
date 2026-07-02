@@ -1,17 +1,10 @@
-mod build;
-mod checksum;
-mod error;
-mod keygen;
-mod manifest;
-mod pack;
-mod publish;
-mod sign;
-mod validate;
-mod verify;
-
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
+
+// The binary is a thin CLI over the `sembundle` library crate — the same surface
+// `sempkg` links against — so there is exactly one implementation of each command.
+use sembundle::{build, keygen, pack, publish, sign, verify};
 
 use build::BuildOptions;
 use keygen::KeygenOptions;
