@@ -148,7 +148,9 @@ fn all_tools() -> Value {
     json!([
         tool_schema(
             "list_packages",
-            "List all registered local packages and installed bundles with their index and LanceDB doc status.",
+            "List all registered local packages and installed bundles with their index and LanceDB doc status. \
+             Entries may include a short description of what the package/bundle covers — use these to decide \
+             which package to focus on for a context search.",
             json!({}),
             &[]
         ),
@@ -1367,6 +1369,13 @@ impl McpContext {
         }
 
         if !bundles.is_empty() {
+            // Load the workspace manifest so a user-set description on a bundle
+            // dependency (`sempkg add --description`) can be surfaced alongside
+            // the bundle, giving the agent a hint about which package to search.
+            let manifest = self
+                .workspace()
+                .and_then(|ws| crate::manifest::load_manifest(ws).ok());
+
             if !local_pkgs.is_empty() {
                 lines.push(String::new());
             }
@@ -1383,9 +1392,16 @@ impl McpContext {
                     crate::store::BundleScope::Workspace => "workspace",
                     crate::store::BundleScope::Global => "global",
                 };
+                let desc = manifest
+                    .as_ref()
+                    .and_then(|mf| mf.find_dependency(&b.name))
+                    .and_then(|d| d.description.as_deref())
+                    .filter(|d| !d.is_empty())
+                    .map(|d| format!("  — {d}"))
+                    .unwrap_or_default();
                 lines.push(format!(
-                    "  \u{2022} **{}** @ {}  [{}]  [{}]{}{}",
-                    b.name, b.version, idx, scope, lance, code
+                    "  \u{2022} **{}** @ {}  [{}]  [{}]{}{}{}",
+                    b.name, b.version, idx, scope, lance, code, desc
                 ));
             }
         }

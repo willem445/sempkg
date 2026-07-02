@@ -140,6 +140,12 @@ pub enum Commands {
         /// index). Repeat the flag to exclude multiple directories.
         #[arg(long = "exclude-dir", short = 'e')]
         exclude_dirs: Vec<PathBuf>,
+
+        /// Optional one-line description of what this bundle provides. Shown in
+        /// `sempkg list` and the MCP `list_packages` tool so agents know which
+        /// package to search. Preserved across `sempkg sync` / `refresh`.
+        #[arg(long)]
+        description: Option<String>,
     },
 
     /// Remove a workspace dependency or global package state.
@@ -587,6 +593,28 @@ mod tests {
                 assert_eq!(spec.as_deref(), Some("."));
                 assert!(include_source);
                 assert_eq!(docs_dirs, vec![PathBuf::from("docs")]);
+            }
+            _ => panic!("expected add command"),
+        }
+    }
+
+    #[test]
+    fn add_accepts_description_flag() {
+        let cli = Cli::try_parse_from([
+            "sempkg",
+            "add",
+            "owner/repo@v1.0",
+            "--description",
+            "CAN bus utilities",
+        ])
+        .expect("add command should parse");
+
+        match cli.command {
+            Commands::Add {
+                spec, description, ..
+            } => {
+                assert_eq!(spec.as_deref(), Some("owner/repo@v1.0"));
+                assert_eq!(description.as_deref(), Some("CAN bus utilities"));
             }
             _ => panic!("expected add command"),
         }

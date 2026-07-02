@@ -52,7 +52,7 @@ name = "default"
 url  = "https://registry.example.com"
 
 [dependencies]
-aws-sdk = { version = "1.11.210" }
+aws-sdk = { version = "1.11.210", description = "AWS SDK — S3, DynamoDB, Lambda clients" }
 qt      = { version = "6.7.0", registry = "other-registry" }
 
 [packages]
@@ -72,7 +72,7 @@ The lock file `sempkg.lock` is auto-generated. Commit it for reproducible instal
 |---------|-------------|
 | `sempkg init [--registry <url>]` | Create `sempkg.toml` in current directory |
 | `sempkg list` | List all registered packages and installed bundles |
-| `sempkg add <name>@<version> [--registry-url <url>]` | Add a dependency to `sempkg.toml` |
+| `sempkg add <name>@<version> [--registry-url <url>] [--description <text>]` | Add a dependency to `sempkg.toml` (optional one-line description shown in `sempkg list` / `list_packages`) |
 | `sempkg remove <name>` | Remove a dependency from `sempkg.toml` |
 | `sempkg sync [--reinstall]` | Install all workspace dependencies |
 | `sempkg install <name>@<version> --registry <url> [--global] [--verify-key <pem>]` | Install a bundle directly |
@@ -137,7 +137,7 @@ The MCP server exposes these tools to AI agents:
 
 | Tool | Description |
 |------|-------------|
-| `list_packages` | List all packages and bundles |
+| `list_packages` | List all packages and bundles (with any per-bundle description) |
 | `search_symbols` | Search CodeGraph symbols in a package |
 | `get_context` | Get AI context for a task (CodeGraph) |
 | `get_callers` | Find callers of a symbol |
