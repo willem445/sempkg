@@ -41,6 +41,13 @@ pub struct BundleManifest {
     pub codegraph_version: String,
     #[serde(default)]
     pub extensions: Vec<String>,
+    /// Embedding model baked into the shipped `lance`/`code` tables, if the
+    /// bundle carries pre-computed vectors. Drives query-time model resolution.
+    #[serde(default)]
+    pub embedding_model: Option<String>,
+    /// Dimension of the baked embedding vectors, if present.
+    #[serde(default)]
+    pub embedding_dim: Option<u32>,
     pub checksums: BTreeMap<String, String>,
 }
 
@@ -51,6 +58,11 @@ impl BundleManifest {
 
     pub fn has_code(&self) -> bool {
         self.extensions.iter().any(|e| e == "code")
+    }
+
+    /// The embedding model the bundle shipped with, if any.
+    pub fn embedding_model(&self) -> Option<&str> {
+        self.embedding_model.as_deref()
     }
 }
 
@@ -530,4 +542,49 @@ pub fn resolve_bundle_spec(spec: &str, workspace_dir: Option<&Path>) -> Option<B
         }
     }
     resolve_bundle(spec, workspace_dir)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base_manifest_json(extra: &str) -> String {
+        format!(
+            r#"{{
+                "spec_version": "1.4.0",
+                "name": "demo",
+                "version": "1.0.0",
+                "source_repo": "https://example.com/demo",
+                "commit_hash": "{hash}",
+                "tag": null,
+                "created_at": "1970-01-01T00:00:00Z",
+                "codegraph_version": "0.3.1",
+                "extensions": ["lance", "code"],
+                {extra}
+                "checksums": {{}}
+            }}"#,
+            hash = "a".repeat(40),
+            extra = extra
+        )
+    }
+
+    #[test]
+    fn manifest_reads_embedding_fields() {
+        let json = base_manifest_json(
+            r#""embedding_model": "embeddinggemma-300m", "embedding_dim": 768,"#,
+        );
+        let m: BundleManifest = serde_json::from_str(&json).unwrap();
+        assert_eq!(m.embedding_model(), Some("embeddinggemma-300m"));
+        assert_eq!(m.embedding_dim, Some(768));
+    }
+
+    #[test]
+    fn manifest_without_embedding_fields_is_backward_compatible() {
+        // Older bundles (pre-1.4.0) omit the fields entirely.
+        let json = base_manifest_json("");
+        let m: BundleManifest = serde_json::from_str(&json).unwrap();
+        assert_eq!(m.embedding_model(), None);
+        assert_eq!(m.embedding_dim, None);
+        assert!(m.has_lance() && m.has_code());
+    }
 }

@@ -1736,4 +1736,60 @@ mod tests {
         assert_eq!(slice.content, "gamma three\ndelta four");
         assert!(!slice.line_meta_missing);
     }
+
+    // ── Embedding metadata ────────────────────────────────────────────────────
+
+    #[test]
+    fn stamp_and_read_embedding_metadata_roundtrip() {
+        let dir = tempdir().unwrap();
+        // No metadata yet → no embedding info.
+        assert!(read_embedding_info(dir.path()).is_none());
+
+        stamp_embedding_metadata(dir.path(), "embeddinggemma-300m", 768).unwrap();
+        assert_eq!(
+            read_embedding_info(dir.path()),
+            Some(("embeddinggemma-300m".to_string(), 768))
+        );
+    }
+
+    #[test]
+    fn stamp_embedding_metadata_preserves_existing_fields() {
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("metadata.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "table_name": "docs",
+                "document_count": 3,
+                "fts_enabled": true,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        stamp_embedding_metadata(dir.path(), "qwen3-embedding-0.6b", 1024).unwrap();
+
+        let meta = load_metadata(dir.path()).unwrap();
+        assert_eq!(meta.table_name.as_deref(), Some("docs"));
+        assert_eq!(meta.document_count, Some(3));
+        assert_eq!(
+            meta.embedding_model.as_deref(),
+            Some("qwen3-embedding-0.6b")
+        );
+        assert_eq!(meta.embedding_dim, Some(1024));
+    }
+
+    #[test]
+    fn read_embedding_info_requires_both_fields() {
+        let dir = tempdir().unwrap();
+        // Only the model, no dim → treated as "no embeddings".
+        std::fs::write(
+            dir.path().join("metadata.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "embedding_model": "embeddinggemma-300m",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(read_embedding_info(dir.path()).is_none());
+    }
 }

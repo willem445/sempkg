@@ -3,10 +3,11 @@
 /// Protocol: https://spec.modelcontextprotocol.io
 /// Transport: stdin/stdout (newline-delimited JSON)
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -1183,8 +1184,16 @@ struct McpContext {
     registry: PackageRegistry,
     /// Optionally-loaded reranker (local GGUF or remote OpenAI-compatible).
     reranker: Option<Box<dyn Rerank>>,
-    /// Optionally-loaded vector embedder for semantic search.
-    embedder: Option<Box<dyn Embed>>,
+    /// Base embedding config (provider, gpu, n_ctx, model-path override) used to
+    /// build per-model embedders on demand for query-time auto-resolution.
+    embed_cfg: embedding::EmbeddingConfig,
+    /// Lazily-built embedders keyed by model id. A cached `None` marks a model
+    /// as known-unavailable (GGUF missing / feature off) so we don't retry it
+    /// on every query. Vectors are resolved per bundle from the model each table
+    /// was embedded with, so bundles built with different models all work.
+    embedders: Mutex<HashMap<String, Option<Arc<dyn Embed>>>>,
+    /// Model ids we've already emitted a one-time "pull this model" hint for.
+    warned_models: Mutex<HashSet<String>>,
     /// Optionally-loaded generative query expander.
     expander: Option<Box<dyn Expand>>,
     /// Query-expansion / fusion configuration (used even when the expander
@@ -1226,15 +1235,8 @@ impl McpContext {
             );
         }
 
-        // Build embedder through the provider factory.
-        let embedder: Option<Box<dyn Embed>> = providers::build_embedder(&embed_cfg);
-        if let Some(ref e) = embedder {
-            eprintln!(
-                "sempkg: embedder loaded ({}, dim {})",
-                e.model_id(),
-                e.dim()
-            );
-        }
+        // Embedders are built lazily, per bundle, from the model each table was
+        // embedded with (query-time auto-resolution) — not eagerly here.
 
         // Build query expander through the provider factory.
         let expander: Option<Box<dyn Expand>> = providers::build_expander(&qe_cfg);
@@ -1246,10 +1248,78 @@ impl McpContext {
             workspace_dir,
             registry,
             reranker,
-            embedder,
+            embed_cfg,
+            embedders: Mutex::new(HashMap::new()),
+            warned_models: Mutex::new(HashSet::new()),
             expander,
             qe_cfg,
         }
+    }
+
+    /// Return an embedder for `model_id`, building and caching it on first use.
+    ///
+    /// Returns `None` when the model's GGUF isn't present locally or the binary
+    /// lacks the `embeddings` feature; in that case a one-time, actionable hint
+    /// is printed and the tables that need this model degrade to BM25-only.
+    fn embedder_for(&self, model_id: &str) -> Option<Arc<dyn Embed>> {
+        if let Some(slot) = self.embedders.lock().unwrap().get(model_id) {
+            return slot.clone();
+        }
+
+        // Pin a config to this model. For local models, resolve the default GGUF
+        // path unless the base config's explicit `model` override IS this model.
+        let mut cfg = self.embed_cfg.clone();
+        if self.embed_cfg.provider == providers::ProviderKind::Local {
+            cfg.model_id = model_id.to_string();
+            let base_is_same = self
+                .embed_cfg
+                .model()
+                .map(|m| m.id() == model_id)
+                .unwrap_or(false);
+            if !base_is_same {
+                cfg.model = None;
+            }
+        }
+
+        let built: Option<Arc<dyn Embed>> = providers::build_embedder(&cfg).map(|b| Arc::from(b));
+        if built.is_none()
+            && self
+                .warned_models
+                .lock()
+                .unwrap()
+                .insert(model_id.to_string())
+        {
+            eprintln!(
+                "sempkg: a bundle was embedded with '{model_id}', but that model isn't available \
+                 locally — vector search for those tables is disabled (BM25 still runs). Run \
+                 `sempkg embedding pull --model {model_id}` to enable it."
+            );
+        }
+        self.embedders
+            .lock()
+            .unwrap()
+            .insert(model_id.to_string(), built.clone());
+        built
+    }
+
+    /// Resolve the query vector to search `dir`'s table with, honoring the model
+    /// that table was embedded with. Embeds the query at most once per model via
+    /// `memo`. Returns `None` when the table has no stored vectors, its model
+    /// can't be loaded, or the stored/embedder dimensions disagree.
+    fn query_vec_for(
+        &self,
+        dir: &Path,
+        query: &str,
+        memo: &mut HashMap<String, Option<Vec<f32>>>,
+    ) -> Option<Vec<f32>> {
+        let (model, dim) = lance::read_embedding_info(dir)?;
+        let embedder = self.embedder_for(&model)?;
+        if embedder.dim() != dim as usize {
+            return None;
+        }
+        memo.entry(model)
+            .or_insert_with(|| embedder.embed_query(query).ok())
+            .clone()
     }
 
     fn workspace(&self) -> Option<&PathBuf> {
@@ -1747,30 +1817,11 @@ impl McpContext {
         hits: &mut Vec<UnifiedHit>,
     ) -> QueryRunStats {
         let mut stats = QueryRunStats::default();
-        // Embed the query once (reused across every table) when vector search
-        // is requested and an embedder is loaded. `None` => vector search is
-        // silently skipped and the run degrades to BM25 only.
-        let query_vec: Option<Vec<f32>> = if do_vec {
-            self.embedder
-                .as_ref()
-                .and_then(|e| e.embed_query(query).ok())
-        } else {
-            None
-        };
-
-        // Whether `dir`'s table was embedded with the model we'd query with.
-        let vectors_compatible = |dir: &Path, qlen: usize| -> bool {
-            match lance::read_embedding_info(dir) {
-                Some((model, dim)) => {
-                    self.embedder
-                        .as_ref()
-                        .map(|e| e.model_id() == model.as_str())
-                        .unwrap_or(false)
-                        && dim as usize == qlen
-                }
-                None => false,
-            }
-        };
+        // Per-model query-vector cache for this run: each table is searched with
+        // the model IT was embedded with (auto-resolved via `query_vec_for`), so
+        // the query is embedded at most once per distinct model. Tables whose
+        // model isn't available locally degrade to BM25 only.
+        let mut query_vecs: HashMap<String, Option<Vec<f32>>> = HashMap::new();
 
         // ── Helper: push lance SearchResults with weighted RRF ───────────
         let push_results = |hits: &mut Vec<UnifiedHit>,
@@ -1874,11 +1925,12 @@ impl McpContext {
                         push_results(hits, &pkg_name, "code", results);
                     }
                 }
-                if let Some(qv) = &query_vec {
+                if do_vec {
                     stats.vec_tables_checked += 1;
-                    if vectors_compatible(&code_dir, qv.len()) {
+                    if let Some(qv) = self.query_vec_for(&code_dir, query, &mut query_vecs) {
                         stats.vec_tables_compatible += 1;
-                        if let Ok(results) = lance::search_code_vector(&code_dir, qv, fetch_limit) {
+                        if let Ok(results) = lance::search_code_vector(&code_dir, &qv, fetch_limit)
+                        {
                             stats.vec_code_hits += results.len();
                             push_results(hits, &pkg_name, "code", results);
                         }
@@ -1895,11 +1947,11 @@ impl McpContext {
                         push_results(hits, &pkg_name, "docs", results);
                     }
                 }
-                if let Some(qv) = &query_vec {
+                if do_vec {
                     stats.vec_tables_checked += 1;
-                    if vectors_compatible(&lance_dir, qv.len()) {
+                    if let Some(qv) = self.query_vec_for(&lance_dir, query, &mut query_vecs) {
                         stats.vec_tables_compatible += 1;
-                        if let Ok(results) = lance::search_vector(&lance_dir, qv, fetch_limit) {
+                        if let Ok(results) = lance::search_vector(&lance_dir, &qv, fetch_limit) {
                             stats.vec_docs_hits += results.len();
                             push_results(hits, &pkg_name, "docs", results);
                         }
@@ -1931,11 +1983,11 @@ impl McpContext {
                         push_results(hits, &pkg_name, "docs", results);
                     }
                 }
-                if let Some(qv) = &query_vec {
+                if do_vec {
                     stats.vec_tables_checked += 1;
-                    if vectors_compatible(&lance_dir, qv.len()) {
+                    if let Some(qv) = self.query_vec_for(&lance_dir, query, &mut query_vecs) {
                         stats.vec_tables_compatible += 1;
-                        if let Ok(results) = lance::search_vector(&lance_dir, qv, fetch_limit) {
+                        if let Ok(results) = lance::search_vector(&lance_dir, &qv, fetch_limit) {
                             stats.vec_docs_hits += results.len();
                             push_results(hits, &pkg_name, "docs", results);
                         }
@@ -2005,13 +2057,13 @@ impl McpContext {
 
         if debug {
             eprintln!(
-                "sempkg: query debug — runs={} (original=1 expanded={}) fetch_limit={} limit={} expander_loaded={} embedder_loaded={}",
+                "sempkg: query debug — runs={} (original=1 expanded={}) fetch_limit={} limit={} expander_loaded={} embedders_cached={}",
                 runs.len(),
                 expanded_variants,
                 fetch_limit,
                 limit,
                 self.expander.is_some(),
-                self.embedder.is_some()
+                self.embedders.lock().unwrap().len()
             );
             for (i, (q, weight, do_lex, do_vec)) in runs.iter().enumerate() {
                 eprintln!(

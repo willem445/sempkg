@@ -399,6 +399,25 @@ pub enum Commands {
         force: bool,
     },
 
+    /// Embed a single pre-built LanceDB index directory in place.
+    ///
+    /// Adds a `vector` column to `<table>` and stamps `embedding_model` /
+    /// `embedding_dim` into `<path>/metadata.json`. This is the low-level hook
+    /// used by `sembundle build --embed` to bake vectors into a bundle before
+    /// packing; it does not touch the workspace registry or config.
+    EmbedDir {
+        /// Directory containing `metadata.json` + `<table>.lance/`
+        /// (a sembundle `lance/` or `code/` index directory).
+        #[arg(long)]
+        path: PathBuf,
+        /// Table to embed: `docs` or `code`.
+        #[arg(long)]
+        table: String,
+        /// Embedding model id: `embeddinggemma-300m` or `qwen3-embedding-0.6b`.
+        #[arg(long)]
+        model: String,
+    },
+
     /// Manage the optional Qwen3-Embedding-0.6B GGUF model (vector search).
     #[command(subcommand)]
     Embedding(EmbeddingCommands),

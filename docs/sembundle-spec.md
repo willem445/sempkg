@@ -1,6 +1,6 @@
 # SemBundle Format Specification
 
-**Version:** 1.2.0
+**Version:** 1.4.0
 **Status:** Draft
 
 ---
@@ -16,13 +16,14 @@ SemBundles allow codebases to publish semantic intelligence artifacts alongside 
 ## 2. File Naming Convention
 
 ```
-<name>-<version>.SemBundle
+<name>-<version>[+emb.<embedding-model>].SemBundle
 ```
 
 | Component | Description |
 |-----------|-------------|
 | `name`    | Package/library name (lowercase, hyphens allowed, no spaces) |
 | `version` | Semantic version (`MAJOR.MINOR.PATCH`) or tag identifier |
+| `+emb.<embedding-model>` | **Optional.** Present only when the bundle ships pre-computed vector embeddings. Names the embedding model baked into the `lance/`/`code/` indexes (e.g. `embeddinggemma-300m`). Semver-build-metadata style. |
 
 **Examples:**
 
@@ -30,7 +31,16 @@ SemBundles allow codebases to publish semantic intelligence artifacts alongside 
 aws-sdk-1.11.210.SemBundle
 qt-6.7.0.SemBundle
 ros2-humble.SemBundle
+my-sdk-1.0.0+emb.embeddinggemma-300m.SemBundle
 ```
+
+The `+emb.<embedding-model>` suffix is **cosmetic**: it makes the embedding model
+visible in the filename so a pre-embedded bundle can be selected at a glance. It
+does **not** change package identity — `name`, `version`, and the archive's
+top-level directory (below) remain `<name>-<version>`. The authoritative record
+of the embedding model is the manifest's `embedding_model` field (§4), not the
+filename. Consumers resolve which local embedding model to run at query time from
+that field.
 
 A `.SemBundle` file is a **gzip-compressed tar archive** (`.tar.gz` renamed to `.SemBundle`). All paths inside the archive are relative and rooted at a single top-level directory matching the bundle name:
 
@@ -51,13 +61,19 @@ A `.SemBundle` file is a **gzip-compressed tar archive** (`.tar.gz` renamed to `
 │   └── ...             # Internal graph files (implementation-defined)
 ├── embeddings/         # CodeGraph semantic embedding vectors (required)
 │   └── ...             # Internal embedding files (implementation-defined)
-└── lance/              # LanceDB documentation index (optional)
-    ├── metadata.json   # Lance index metadata
-    └── docs.lance/     # LanceDB table directory (Arrow/Lance files)
+├── lance/              # LanceDB documentation index (optional, extension "lance")
+│   ├── metadata.json   # Lance index metadata (see §9.3)
+│   └── docs.lance/     # LanceDB table directory (Arrow/Lance files)
+│       └── ...         # Arrow Lance data and index files
+└── code/               # LanceDB source-code index (optional, extension "code")
+    ├── metadata.json   # Code index metadata (see §9.4)
+    └── code.lance/     # LanceDB table directory (Arrow/Lance files)
         └── ...         # Arrow Lance data and index files
 ```
 
-The top-level entries `manifest.json`, `metadata.json`, `config.json`, `graph/`, and `embeddings/` are **required**. The `lance/` entry is **optional**. A bundle missing any required entry is invalid.
+The top-level entries `manifest.json`, `metadata.json`, `config.json`, `graph/`, and `embeddings/` are **required**. The `lance/` and `code/` entries are **optional** extensions. A bundle missing any required entry is invalid.
+
+> **Note — `embeddings/` vs. vector search.** The required `embeddings/` directory holds CodeGraph's own opaque graph-engine vectors. The optional *vector search* embeddings used by sempkg's hybrid retrieval live as a `vector` column **inside** the `lance/` and `code/` LanceDB tables, and are present only when the bundle was built with embeddings (§9). The two are unrelated.
 
 ---
 
@@ -78,6 +94,8 @@ The manifest is the authoritative descriptor for a bundle. It is generated at pa
   "created_at":        "<ISO 8601 UTC datetime>",
   "codegraph_version": "<string>",
   "extensions":        ["<string>", ...],
+  "embedding_model":   "<string>",   // optional
+  "embedding_dim":     <integer>,    // optional
   "checksums": {
     "<relative-file-path>": "<sha256-hex>",
     ...
@@ -97,8 +115,12 @@ The manifest is the authoritative descriptor for a bundle. It is generated at pa
 | `tag`               | string or null  | Yes      | Git tag associated with this version, or `null` if none |
 | `created_at`        | string          | Yes      | ISO 8601 UTC timestamp of when the bundle was created (e.g. `"2025-08-01T14:30:00Z"`) |
 | `codegraph_version` | string          | Yes      | Version of CodeGraph used to produce the index |
-| `extensions`        | array of string | No       | Optional bundle extensions present. Must include `"lance"` when `lance/` is present. Omit or use `[]` when no extensions are bundled. |
+| `extensions`        | array of string | No       | Optional bundle extensions present. Must include `"lance"` when `lance/` is present and `"code"` when `code/` is present. Omit or use `[]` when no extensions are bundled. |
+| `embedding_model`   | string          | No       | Identifier of the embedding model baked into the `lance/`/`code/` tables (e.g. `"embeddinggemma-300m"`). Present only when the bundle ships pre-computed vectors. Authoritative source for query-time model resolution. Omit when the bundle has no embeddings. |
+| `embedding_dim`     | integer         | No       | Dimension of the baked embedding vectors. Present iff `embedding_model` is present. |
 | `checksums`         | object          | Yes      | Map of relative file paths (within the bundle) to their SHA-256 hex digests. Must cover every file except `manifest.json` itself. |
+
+When present, `embedding_model`/`embedding_dim` mirror the values stamped into the per-table metadata (§9.3, §9.4). A bundle that ships embeddings advertises `spec_version` `1.4.0` or higher.
 
 ### 4.3 Checksums Coverage
 
@@ -248,7 +270,9 @@ results = table.search("authentication flow", query_type="fts").limit(10).to_lis
   "chunk_count":     "<number>",
   "indexed_paths":   ["<string>", ...],
   "fts_enabled":     "<boolean>",
-  "created_at":      "<ISO 8601 UTC datetime>"
+  "created_at":      "<ISO 8601 UTC datetime>",
+  "embedding_model": "<string>",   // optional
+  "embedding_dim":   <integer>     // optional
 }
 ```
 
@@ -262,6 +286,13 @@ results = table.search("authentication flow", query_type="fts").limit(10).to_lis
 | `indexed_paths`  | array of string | Yes      | Glob patterns or directories indexed |
 | `fts_enabled`    | boolean         | Yes      | Whether a tantivy BM25 FTS index was built |
 | `created_at`     | string          | Yes      | ISO 8601 UTC timestamp (must match `manifest.json` `created_at`) |
+| `embedding_model`| string          | No       | Model id used to populate the table's `vector` column (e.g. `"embeddinggemma-300m"`). Present only when the table ships pre-computed vectors. |
+| `embedding_dim`  | integer         | No       | Dimension of the stored vectors. Present iff `embedding_model` is present. |
+
+When `embedding_model`/`embedding_dim` are present the `docs` table carries an
+extra `vector` column of type `FixedSizeList<Float32, embedding_dim>`, enabling
+hybrid vector + BM25 retrieval. Consumers run vector search only with the model
+named here (query and document vectors must come from the same model).
 
 #### Example
 
@@ -272,9 +303,15 @@ results = table.search("authentication flow", query_type="fts").limit(10).to_lis
   "chunk_count": 9231,
   "indexed_paths": ["docs/**/*.md", "**/*.rst", "README.md"],
   "fts_enabled": true,
-  "created_at": "2025-08-01T14:30:00Z"
+  "created_at": "2025-08-01T14:30:00Z",
+  "embedding_model": "embeddinggemma-300m",
+  "embedding_dim": 768
 }
 ```
+
+The `code/` extension's `code/metadata.json` follows the same shape, with
+`table_name` `"code"` and `symbol_count` in place of `document_count`. It carries
+the same optional `embedding_model`/`embedding_dim` fields with identical meaning.
 
 ### 9.4 Producing a LanceDB Index
 
@@ -411,6 +448,8 @@ With `manifest.json` listing checksums for `metadata.json`, `config.json`, `grap
 
 | Version | Date       | Notes |
 |---------|------------|-------|
+| 1.4.0   | 2026-06-30 | Added optional pre-computed embeddings: `embedding_model`/`embedding_dim` in `manifest.json` (§4) and in `lance/`/`code/` metadata (§9.3), a `vector` column in the LanceDB tables, and the optional `+emb.<model>` filename suffix (§2). Bundles with embeddings advertise `spec_version` `1.4.0`. |
+| 1.3.0   | 2026-06-20 | Added optional `code/` extension: a LanceDB source-code index chunked by symbol (§3 layout, `code/metadata.json`). Added `"code"` to `extensions`. |
 | 1.2.0   | 2026-06-15 | Replaced `qmd/` extension with `lance/` (LanceDB Arrow files). Updated §3 layout, rewrote §9, updated §11.2 and §11.5 validation rules. Bumped `spec_version`. |
 | 1.1.0   | 2026-06-12 | Added optional `qmd/` extension (§9) for per-repository QMD documentation index. Added optional `extensions` field to `manifest.json`. Added QMD validation rules to §11.2 and §11.5. |
 | 1.0.0   | 2026-06-10 | Initial specification |
