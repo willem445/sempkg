@@ -42,6 +42,14 @@ of the embedding model is the manifest's `embedding_model` field (§4), not the
 filename. Consumers resolve which local embedding model to run at query time from
 that field.
 
+> **Publishing guidance (non-normative).** Publishers SHOULD embed with the
+> default model (`embeddinggemma-300m`) so one locally-pulled model serves every
+> pre-embedded bundle a consumer installs, and SHOULD reserve embedding for
+> large corpuses where the consumer-side embedding pass is expensive — vectors
+> add roughly `chunks × dim × 4` bytes of incompressible data to the archive.
+> Consumers can always add or replace vectors post-install (`sempkg embed
+> [--force]`), so smaller bundles are best shipped without embeddings.
+
 A `.SemBundle` file is a **gzip-compressed tar archive** (`.tar.gz` renamed to `.SemBundle`). All paths inside the archive are relative and rooted at a single top-level directory matching the bundle name:
 
 ```
