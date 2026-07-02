@@ -2,13 +2,14 @@ use std::path::Path;
 
 use walkdir::WalkDir;
 
+use crate::consts::{CONFIG_FILE, EMBEDDINGS_DIR, GRAPH_DIR, METADATA_FILE};
 use crate::error::PackError;
 
 /// Subdirectories that must exist and be non-empty in the CodeGraph output dir.
-const REQUIRED_DIRS: &[&str] = &["graph", "embeddings"];
+const REQUIRED_DIRS: &[&str] = &[GRAPH_DIR, EMBEDDINGS_DIR];
 
 /// Files that must exist in the CodeGraph output dir.
-const REQUIRED_FILES: &[&str] = &["config.json"];
+const REQUIRED_FILES: &[&str] = &[CONFIG_FILE];
 
 /// Validate that the CodeGraph output directory has the required structure.
 ///
@@ -49,13 +50,13 @@ pub fn validate_input_dir(dir: &Path) -> Result<(), PackError> {
 /// - at least one `*.lance/` subdirectory  — the LanceDB table directory
 pub fn validate_lance_dir(dir: &Path) -> Result<(), PackError> {
     // metadata.json is required
-    if !dir.join("metadata.json").is_file() {
+    if !dir.join(METADATA_FILE).is_file() {
         return Err(PackError::MissingFile("lance/metadata.json".to_string()));
     }
 
     // At least one *.lance table directory must exist
     let has_table = std::fs::read_dir(dir)
-        .map_err(|e| PackError::Io(e))?
+        .map_err(PackError::Io)?
         .filter_map(|e| e.ok())
         .any(|e| e.file_name().to_string_lossy().ends_with(".lance") && e.path().is_dir());
 
@@ -109,7 +110,7 @@ pub fn validate_name(name: &str) -> Result<(), PackError> {
 /// - `metadata.json`     — index metadata
 /// - at least one `*.lance/` subdirectory  — the LanceDB table directory
 pub fn validate_code_dir(dir: &Path) -> Result<(), PackError> {
-    if !dir.join("metadata.json").is_file() {
+    if !dir.join(METADATA_FILE).is_file() {
         return Err(PackError::MissingFile("code/metadata.json".to_string()));
     }
 

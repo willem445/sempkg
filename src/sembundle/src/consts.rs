@@ -33,8 +33,14 @@ pub const LANCE_EXT: &str = "lance";
 pub const CODE_EXT: &str = "code";
 
 /// Spec version stamped when the bundle has no `code/` extension (may still have
-/// `lance/`). Spec: sembundle-spec.md §4.
+/// `lance/`). This is the version the published spec documents
+/// (`docs/sembundle-spec.md`, "Version: 1.2.0").
 pub const SPEC_VERSION_LANCE: &str = "1.2.0";
 
 /// Spec version stamped when the bundle includes the `code/` extension.
+///
+/// NOTE: the `code/` extension is not yet described in `docs/sembundle-spec.md`
+/// (which documents up to 1.2.0 / the `lance/` extension). This constant is the
+/// de-facto version for `code/`-bearing bundles; update the spec doc to define
+/// 1.3.0 + `code/` before treating it as normative.
 pub const SPEC_VERSION_CODE: &str = "1.3.0";

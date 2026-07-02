@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 
 use sembundle::keygen::{keygen, KeygenOptions};
 use sembundle::pack::{pack, PackOptions};
+use sembundle::reader::read_entries;
 use sembundle::sign::{sign, SignOptions};
 use sembundle::verify::{verify, VerifyOptions};
 use sembundle::{read_manifest, verify_checksums};
@@ -180,36 +181,111 @@ fn verify_checksums_detects_mismatch() {
     );
 }
 
-// ── determinism (the reproducibility fix) ────────────────────────────────────
-
 #[test]
-fn manifest_checksum_order_is_deterministic() {
-    // Two packs of the same input must produce byte-identical checksum maps in
-    // the serialized manifest (BTreeMap ⇒ sorted, stable key order), which is
-    // what makes the signed manifest reproducible.
+fn verify_checksums_detects_missing_file() {
+    // A file listed in manifest.checksums but absent from the archive must be
+    // rejected — otherwise a truncated/stripped bundle installs cleanly and only
+    // fails later at query time.
     let tmp = TempDir::new().unwrap();
     let input = tmp.path().join("input");
     make_input(&input);
+    let output = tmp.path().join("out.sembundle");
+    pack(pack_opts(input, output.clone())).unwrap();
+
+    let bytes = fs::read(&output).unwrap();
+    let mut manifest = read_manifest(&bytes).unwrap();
+
+    // Record a checksum for a file that was never packed into the archive.
+    manifest
+        .checksums
+        .insert("graph/does-not-exist.bin".to_string(), "0".repeat(64));
+
+    let err = verify_checksums(&bytes, &manifest).unwrap_err();
+    assert!(
+        matches!(err, sembundle::reader::ReadError::MissingFile(ref f) if f == "graph/does-not-exist.bin"),
+        "expected MissingFile, got: {err}"
+    );
+}
+
+// ── determinism (the reproducibility fix) ────────────────────────────────────
+
+/// Extract the checksum-map keys in the order they physically appear in the
+/// pretty-printed `manifest.json` text — i.e. the on-disk / signed order —
+/// *without* deserializing (which would re-sort through the `BTreeMap` and hide
+/// the very ordering we want to assert about).
+///
+/// `checksums` is the last field in the manifest and its values are plain hex
+/// strings, so the first `}` after `"checksums": {` closes the object and no
+/// nested braces appear inside it.
+fn checksum_keys_in_document_order(manifest_json: &str) -> Vec<String> {
+    let open = manifest_json
+        .find("\"checksums\"")
+        .expect("manifest has a checksums block");
+    let brace = open + manifest_json[open..].find('{').expect("checksums opens");
+    let close = brace + manifest_json[brace..].find('}').expect("checksums closes");
+    manifest_json[brace + 1..close]
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            let rest = line.strip_prefix('"')?;
+            let end = rest.find('"')?;
+            Some(rest[..end].to_string())
+        })
+        .collect()
+}
+
+#[test]
+fn manifest_checksum_order_is_deterministic() {
+    // The reproducibility fix stores `checksums` in a BTreeMap so the *serialized*
+    // manifest — the bytes that get signed — always lists checksum keys in sorted
+    // order. Under the previous HashMap the on-disk key order was randomized per
+    // process, so a signed manifest wasn't reproducible.
+    //
+    // We assert on the RAW manifest bytes from the archive: reading back through
+    // `read_manifest` deserializes into a BTreeMap and would re-sort, masking a
+    // regression to an unordered map. (We deliberately do NOT compare full bundle
+    // bytes across packs: `metadata.json` embeds a live `created_at`, so bundles
+    // are not byte-reproducible across wall-clock — only the key *ordering* is
+    // what BTreeMap makes deterministic.)
+    let tmp = TempDir::new().unwrap();
+    let input = tmp.path().join("input");
+    make_input(&input);
+
+    let raw_keys = |out: &Path| -> Vec<String> {
+        let entries = read_entries(&fs::read(out).unwrap()).unwrap();
+        let (_, manifest_bytes) = entries
+            .iter()
+            .find(|(k, _)| k == "manifest.json")
+            .expect("manifest.json present in archive");
+        checksum_keys_in_document_order(std::str::from_utf8(manifest_bytes).unwrap())
+    };
 
     let out_a = tmp.path().join("a.sembundle");
     let out_b = tmp.path().join("b.sembundle");
     pack(pack_opts(input.clone(), out_a.clone())).unwrap();
     pack(pack_opts(input, out_b.clone())).unwrap();
 
-    let m_a = read_manifest(&fs::read(&out_a).unwrap()).unwrap();
-    let m_b = read_manifest(&fs::read(&out_b).unwrap()).unwrap();
+    let keys_a = raw_keys(&out_a);
+    let keys_b = raw_keys(&out_b);
 
-    // Serialized checksum maps are identical and sorted.
-    let keys_a: Vec<&String> = m_a.checksums.keys().collect();
+    // Several files, so an unordered map would almost never land sorted by chance.
+    assert!(
+        keys_a.len() >= 3,
+        "expected several checksummed files, got {keys_a:?}"
+    );
+
+    // 1. On-disk keys are in sorted order (the BTreeMap invariant on the signed bytes).
     let mut sorted = keys_a.clone();
     sorted.sort();
     assert_eq!(
         keys_a, sorted,
-        "checksum keys must serialize in sorted order"
+        "on-disk checksum keys must be serialized in sorted order"
     );
+
+    // 2. Two packs of identical input produce the identical on-disk key ordering
+    //    (compares keys, not timestamp-bearing values — so this is not flaky).
     assert_eq!(
-        serde_json::to_string(&m_a.checksums).unwrap(),
-        serde_json::to_string(&m_b.checksums).unwrap(),
-        "identical inputs must produce identical checksum serialization"
+        keys_a, keys_b,
+        "identical inputs must produce identical on-disk checksum key ordering"
     );
 }

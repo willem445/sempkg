@@ -8,7 +8,8 @@ use walkdir::WalkDir;
 
 use crate::checksum::sha256_bytes;
 use crate::consts::{
-    CODE_EXT, LANCE_EXT, MANIFEST_FILE, METADATA_FILE, SPEC_VERSION_CODE, SPEC_VERSION_LANCE,
+    CODE_DIR, CODE_EXT, CONFIG_FILE, EMBEDDINGS_DIR, GRAPH_DIR, LANCE_DIR, LANCE_EXT,
+    MANIFEST_FILE, METADATA_FILE, SPEC_VERSION_CODE, SPEC_VERSION_LANCE,
 };
 use crate::error::PackError;
 use crate::manifest::{CodeMetadata, LanceMetadata, Manifest, Metadata};
@@ -81,15 +82,15 @@ pub fn pack(opts: PackOptions) -> Result<PathBuf, PackError> {
 
     // config.json (verbatim copy from input dir)
     entries.push(Entry {
-        key: "config.json".to_string(),
-        content: std::fs::read(opts.input_dir.join("config.json"))?,
+        key: CONFIG_FILE.to_string(),
+        content: std::fs::read(opts.input_dir.join(CONFIG_FILE))?,
     });
 
     // graph/** and embeddings/** (sorted for determinism)
-    collect_dir(&opts.input_dir.join("graph"), "graph", &mut entries)?;
+    collect_dir(&opts.input_dir.join(GRAPH_DIR), GRAPH_DIR, &mut entries)?;
     collect_dir(
-        &opts.input_dir.join("embeddings"),
-        "embeddings",
+        &opts.input_dir.join(EMBEDDINGS_DIR),
+        EMBEDDINGS_DIR,
         &mut entries,
     )?;
 
@@ -222,13 +223,13 @@ fn collect_lance_entries(
     entries: &mut Vec<Entry>,
 ) -> Result<(), PackError> {
     // Stamp metadata.json with the bundle's created_at (spec §11.5)
-    let meta_path = lance_dir.join("metadata.json");
+    let meta_path = lance_dir.join(METADATA_FILE);
     if meta_path.is_file() {
         let raw = std::fs::read(&meta_path)?;
         let mut meta: LanceMetadata = serde_json::from_slice(&raw)?;
         meta.created_at = created_at.to_string();
         entries.push(Entry {
-            key: "lance/metadata.json".to_string(),
+            key: format!("{LANCE_DIR}/{METADATA_FILE}"),
             content: serde_json::to_vec_pretty(&meta)?,
         });
     }
@@ -247,12 +248,12 @@ fn collect_lance_entries(
             .join("/");
 
         // metadata.json already handled above
-        if rel_key == "metadata.json" {
+        if rel_key == METADATA_FILE {
             continue;
         }
 
         entries.push(Entry {
-            key: format!("lance/{rel_key}"),
+            key: format!("{LANCE_DIR}/{rel_key}"),
             content: std::fs::read(entry.path())?,
         });
     }
@@ -269,13 +270,13 @@ fn collect_code_entries(
     created_at: &str,
     entries: &mut Vec<Entry>,
 ) -> Result<(), PackError> {
-    let meta_path = code_dir.join("metadata.json");
+    let meta_path = code_dir.join(METADATA_FILE);
     if meta_path.is_file() {
         let raw = std::fs::read(&meta_path)?;
         let mut meta: CodeMetadata = serde_json::from_slice(&raw)?;
         meta.created_at = created_at.to_string();
         entries.push(Entry {
-            key: "code/metadata.json".to_string(),
+            key: format!("{CODE_DIR}/{METADATA_FILE}"),
             content: serde_json::to_vec_pretty(&meta)?,
         });
     }
@@ -292,12 +293,12 @@ fn collect_code_entries(
             .collect::<Vec<_>>()
             .join("/");
 
-        if rel_key == "metadata.json" {
+        if rel_key == METADATA_FILE {
             continue;
         }
 
         entries.push(Entry {
-            key: format!("code/{rel_key}"),
+            key: format!("{CODE_DIR}/{rel_key}"),
             content: std::fs::read(entry.path())?,
         });
     }
@@ -386,8 +387,8 @@ mod tests {
             let raw_path = entry.path().unwrap().to_string_lossy().to_string();
             // Strip the `<name>-<version>/` top-level prefix.
             let key = raw_path
-                .splitn(2, '/')
-                .nth(1)
+                .split_once('/')
+                .map(|x| x.1)
                 .unwrap_or(&raw_path)
                 .to_string();
             let mut buf = Vec::new();

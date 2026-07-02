@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use sembundle::consts::{CODE_EXT, LANCE_EXT};
+use sembundle::consts::{CODE_DIR, CODE_EXT, GRAPH_DIR, LANCE_DIR, LANCE_EXT, MANIFEST_FILE};
 
 use crate::error::SempkgError;
 
@@ -77,21 +77,21 @@ pub enum BundleScope {
 
 impl BundleInfo {
     pub fn has_lance(&self) -> bool {
-        self.manifest.has_lance() && self.bundle_dir.join("lance").is_dir()
+        self.manifest.has_lance() && self.bundle_dir.join(LANCE_DIR).is_dir()
     }
 
     pub fn has_code(&self) -> bool {
-        self.manifest.has_code() && self.bundle_dir.join("code").is_dir()
+        self.manifest.has_code() && self.bundle_dir.join(CODE_DIR).is_dir()
     }
 
     pub fn is_indexed(&self) -> bool {
         // .codegraph/ must exist (created by create_codegraph_view after install),
         // and graph/ must be non-empty (the actual data from the bundle).
         self.bundle_dir.join(".codegraph").exists()
-            && self.bundle_dir.join("graph").exists()
+            && self.bundle_dir.join(GRAPH_DIR).exists()
             && self
                 .bundle_dir
-                .join("graph")
+                .join(GRAPH_DIR)
                 .read_dir()
                 .map(|mut d| d.next().is_some())
                 .unwrap_or(false)
@@ -182,6 +182,22 @@ impl BundleStore {
                 continue; // top-level dir entry itself
             };
 
+            // Guard against path traversal: `bundle_relative_key` preserves `..`
+            // and (on Windows) drive prefixes, and `entry.unpack` performs no
+            // containment check, so a crafted entry could escape the store even
+            // with a matching checksum. Reject anything that isn't a plain,
+            // store-relative path.
+            if Path::new(&rel_key).components().any(|c| {
+                matches!(
+                    c,
+                    std::path::Component::ParentDir
+                        | std::path::Component::RootDir
+                        | std::path::Component::Prefix(_)
+                )
+            }) {
+                anyhow::bail!("Refusing to extract unsafe bundle entry path: {rel_key}");
+            }
+
             let out_path = tmp_dir.path().join(&rel_key);
             if let Some(parent) = out_path.parent() {
                 std::fs::create_dir_all(parent)?;
@@ -239,7 +255,7 @@ impl BundleStore {
                     for ver_entry in versions.flatten() {
                         let version = ver_entry.file_name().to_string_lossy().to_string();
                         let bundle_dir = ver_entry.path();
-                        let manifest_path = bundle_dir.join("manifest.json");
+                        let manifest_path = bundle_dir.join(MANIFEST_FILE);
                         if let Ok(text) = std::fs::read_to_string(&manifest_path) {
                             if let Ok(manifest) = serde_json::from_str::<BundleManifest>(&text) {
                                 let archive_sha256 = read_install_metadata(&bundle_dir)
@@ -270,7 +286,7 @@ impl BundleStore {
     /// Get a specific version of a bundle.
     pub fn get_version(&self, name: &str, version: &str) -> Option<BundleInfo> {
         let bundle_dir = self.bundle_dir(name, version);
-        let manifest_path = bundle_dir.join("manifest.json");
+        let manifest_path = bundle_dir.join(MANIFEST_FILE);
         if !manifest_path.exists() {
             return None;
         }
@@ -339,7 +355,7 @@ impl BundleStore {
 ///
 /// Idempotent — silently skips if `.codegraph` already exists or `graph/` is absent.
 pub fn create_codegraph_view(bundle_dir: &Path) -> Result<()> {
-    let graph_dir = bundle_dir.join("graph");
+    let graph_dir = bundle_dir.join(GRAPH_DIR);
     let link = bundle_dir.join(".codegraph");
 
     if !graph_dir.exists() || link.exists() {
