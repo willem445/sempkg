@@ -310,3 +310,109 @@ jobs:
             --tb=short
         env:
           SEMPKG_WORKSPACE: /tmp/sempkg-test-workspace
+
+  lint:
+    name: Lint (fmt + clippy + ruff)
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TARGET_DIR: target
+      CARGO_INCREMENTAL: 0
+      RUSTFLAGS: -C debuginfo=0
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+          key: lint-rust-ubuntu
+
+      # sempkg's reranker/embeddings features build llama-cpp-sys, which needs
+      # cmake + clang + libclang; lance-encoding needs protoc.
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y cmake clang libclang-dev llvm-dev
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve LIBCLANG_PATH
+        shell: bash
+        run: |
+          if command -v llvm-config >/dev/null 2>&1; then
+            echo "LIBCLANG_PATH=$(llvm-config --libdir)" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          for p in /usr/lib/llvm-*/lib; do
+            if [ -e "$p/libclang.so" ] || ls "$p"/libclang-*.so 2>/dev/null | grep -q .; then
+              echo "LIBCLANG_PATH=$p" >> "$GITHUB_ENV"
+              exit 0
+            fi
+          done
+          echo "libclang not found" >&2
+          exit 1
+
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
+
+      # sembundle has no optional GPU features, so --all-features is safe there.
+      - name: clippy (sembundle)
+        run: cargo clippy --all-targets --all-features --manifest-path src/sembundle/Cargo.toml -- -D warnings
+
+      # sempkg's --all-features enables every GPU backend at once
+      # (cuda/vulkan/rocm/metal), which is mutually incompatible and needs each
+      # vendor's SDK. Lint the buildable inference feature set instead.
+      - name: clippy (sempkg)
+        run: cargo clippy --all-targets --features reranker,embeddings --manifest-path src/sempkg/Cargo.toml -- -D warnings
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      # sempkg_agent carries its own ruff config; sempkg_registry uses ruff
+      # defaults. Pin the ruff version so CI matches local runs.
+      - name: ruff check (agent + registry)
+        run: uvx ruff@0.15.20 check src/sempkg_agent src/sempkg_registry
+
+  agent-test:
+    name: sempkg_agent tests — Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install sempkg_agent with dev extras
+        run: uv pip install --system -e "src/sempkg_agent[dev]"
+
+      # Run from the package dir so pytest picks up src/sempkg_agent's own
+      # pyproject config (asyncio_mode, markers). The fast, fully-offline suite
+      # only — functional tests need built binaries + a running registry.
+      - name: Run sempkg_agent offline tests
+        working-directory: src/sempkg_agent
+        run: python -m pytest -m "not functional"
