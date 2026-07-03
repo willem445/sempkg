@@ -206,7 +206,11 @@ fn codegraph_initialized(dot_cg: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn run_codegraph(source_dirs: &[PathBuf], out_dir: &Path, exclude_dirs: &[PathBuf]) -> Result<(), PackError> {
+fn run_codegraph(
+    source_dirs: &[PathBuf],
+    out_dir: &Path,
+    exclude_dirs: &[PathBuf],
+) -> Result<(), PackError> {
     let exe = find_tool("codegraph")?;
     let graph_dir = out_dir.join("graph");
     std::fs::create_dir_all(&graph_dir)?;
@@ -565,7 +569,6 @@ struct NodeRow {
     file_path: String,
     start_line: u32,
     end_line: u32,
-    signature: String,
 }
 
 /// Read every non-import, non-file node from `codegraph.db`, slice the
@@ -597,7 +600,7 @@ fn extract_chunks_from_codegraph_db(
     let mut stmt = conn
         .prepare(
             "SELECT name, COALESCE(qualified_name,''), kind, file_path, \
-             COALESCE(start_line,0), COALESCE(end_line,0), COALESCE(signature,'') \
+             COALESCE(start_line,0), COALESCE(end_line,0) \
              FROM nodes \
              WHERE file_path IS NOT NULL AND file_path != '' \
                AND COALESCE(start_line,0) > 0 \
@@ -619,7 +622,6 @@ fn extract_chunks_from_codegraph_db(
                 file_path: row.get(3)?,
                 start_line: row.get::<_, i64>(4)? as u32,
                 end_line: row.get::<_, i64>(5)? as u32,
-                signature: row.get(6)?,
             })
         })
         .map_err(|e| PackError::InvalidField {

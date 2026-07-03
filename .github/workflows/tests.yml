@@ -227,7 +227,7 @@ jobs:
         run: mkdir -p /tmp/sempkg-test-workspace
 
       - name: Initialize sempkg workspace
-        run: ./src/sempkg/target/release/sempkg init --workspace /tmp/sempkg-test-workspace
+        run: ./target/release/sempkg init --workspace /tmp/sempkg-test-workspace
         env:
           SEMPKG_WORKSPACE: /tmp/sempkg-test-workspace
 
@@ -242,19 +242,19 @@ jobs:
           EOF
 
       - name: Download Qwen3-Reranker GGUF model from HuggingFace
-        run: ./src/sempkg/target/release/sempkg reranker pull --workspace /tmp/sempkg-test-workspace
+        run: ./target/release/sempkg reranker pull --workspace /tmp/sempkg-test-workspace
         env:
           SEMPKG_WORKSPACE: /tmp/sempkg-test-workspace
         timeout-minutes: 10
 
       - name: Verify reranker is configured and model is present
-        run: ./src/sempkg/target/release/sempkg reranker status --workspace /tmp/sempkg-test-workspace
+        run: ./target/release/sempkg reranker status --workspace /tmp/sempkg-test-workspace
         env:
           SEMPKG_WORKSPACE: /tmp/sempkg-test-workspace
 
       - name: Install codegraph bundle (fresh build with new sembundle)
         run: |
-          ./src/sempkg/target/release/sempkg add colbymchenry/codegraph@v0.9.7 \
+          ./target/release/sempkg add colbymchenry/codegraph@v0.9.7 \
             --include-source \
             --source-dir src/ \
             --docs-dir docs/ \
@@ -266,7 +266,7 @@ jobs:
 
       - name: Install lancedb bundle for query benchmarks
         run: |
-          ./src/sempkg/target/release/sempkg add lancedb/lancedb@v0.30.0 \
+          ./target/release/sempkg add lancedb/lancedb@v0.30.0 \
             --include-source \
             --source-dir rust/lancedb/src \
             --docs-dir docs/src \
@@ -278,7 +278,7 @@ jobs:
 
       - name: Install local sempkg bundle for query benchmarks
         run: |
-          ./src/sempkg/target/release/sempkg add . \
+          ./target/release/sempkg add . \
             --name sempkg \
             --include-source \
             --source-dir src/sempkg/src \
@@ -291,7 +291,7 @@ jobs:
 
       - name: Install llama-cpp-rs bundle for pooling benchmark
         run: |
-          ./src/sempkg/target/release/sempkg add utilityai/llama-cpp-rs@0.1.150 \
+          ./target/release/sempkg add utilityai/llama-cpp-rs@0.1.150 \
             --include-source \
             --source-dir llama-cpp-2/src \
             --docs-dir examples/reranker \

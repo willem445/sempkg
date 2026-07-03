@@ -10,13 +10,10 @@ updates:
     schedule:
       interval: "weekly"
 
+  # Single cargo workspace rooted at the repo — one manifest/lockfile covers both
+  # member crates (src/sembundle, src/sempkg).
   - package-ecosystem: "cargo"
-    directory: "/src/sembundle"
-    schedule:
-      interval: "weekly"
-
-  - package-ecosystem: "cargo"
-    directory: "/src/sempkg"
+    directory: "/"
     schedule:
       interval: "weekly"
 

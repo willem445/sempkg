@@ -19,27 +19,27 @@ name = "sembundle"
 path = "src/main.rs"
 
 [dependencies]
-clap      = { version = "4", features = ["derive", "env"] }
-serde     = { version = "1", features = ["derive"] }
-serde_json = "1"
-sha2      = "0.11"
-hex       = "0.4"
-tar       = "0.4"
-flate2    = "1"
-chrono    = { version = "0.4", features = ["serde"] }
-walkdir   = "2"
-thiserror = "2"
-tempfile  = "3"
-which     = "8"
-reqwest   = { version = "0.13", features = ["blocking", "multipart"] }
-ed25519-dalek = { version = "2", features = ["pkcs8", "rand_core", "pem"] }
+clap      = { workspace = true }
+serde     = { workspace = true }
+serde_json = { workspace = true }
+sha2      = { workspace = true }
+hex       = { workspace = true }
+tar       = { workspace = true }
+flate2    = { workspace = true }
+chrono    = { workspace = true }
+walkdir   = { workspace = true }
+thiserror = { workspace = true }
+tempfile  = { workspace = true }
+which     = { workspace = true }
+reqwest   = { workspace = true, features = ["blocking", "multipart"] }
+ed25519-dalek = { workspace = true, features = ["rand_core"] }
 rand      = { version = "0.8", features = ["getrandom"] }
 zeroize   = "1"
-lancedb   = "0.30"
-arrow-array  = "58"
-arrow-schema = "58"
-tokio     = { version = "1", features = ["rt", "rt-multi-thread"] }
-glob      = "0.3"
-rusqlite  = { version = "0.31", features = ["bundled"] }
+lancedb   = { workspace = true }
+arrow-array  = { workspace = true }
+arrow-schema = { workspace = true }
+tokio     = { workspace = true, features = ["rt", "rt-multi-thread"] }
+glob      = { workspace = true }
+rusqlite  = { workspace = true }
 
 [dev-dependencies]
