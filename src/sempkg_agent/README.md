@@ -10,7 +10,7 @@ ambiguous it can ask the caller a clarifying question and continue the
 conversation.
 
 This is the local-runnable precursor to the hosted "knowledge agent" described in
-[`docs/plan-knowledge-agent-server.md`](../../docs/plan-knowledge-agent-server.md).
+[`docs/plans/plan-knowledge-agent-server.md`](../../docs/plans/plan-knowledge-agent-server.md).
 
 ---
 

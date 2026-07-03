@@ -2,7 +2,7 @@
 
 > **Status:** Implemented (prototype) · **Date:** 2026-06-27
 > **Code:** [`src/sempkg_agent/`](../../src/sempkg_agent/)
-> **Related:** [plan-knowledge-agent-server.md](../plan-knowledge-agent-server.md)
+> **Related:** [plan-knowledge-agent-server.md](../plans/plan-knowledge-agent-server.md)
 
 This is the local-runnable first cut of the "active knowledge service" vision: an
 agent that receives a request from a calling agent, retrieves version-accurate

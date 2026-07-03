@@ -288,7 +288,7 @@ sempkg's defensible wedge.
 - **Cold-start / chicken-and-egg.** Centralized crawlers (Context7) deliver value with
   zero producer effort; sempkg needs a bundle built and published per version.
   Mitigation: on-the-fly bundle builds from GitHub releases (see
-  `plan-sempkg-add-from-github.md`).
+  `plans/plan-sempkg-add-from-github.md`).
 - **Crowded framing.** "Stops hallucinations" is the literal tagline of multiple tools.
   Lead positioning with **call-graph/impact + reproducible pinning + private/self-hosted**,
   not generic doc lookup.
