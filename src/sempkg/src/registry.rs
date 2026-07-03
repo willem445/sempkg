@@ -165,6 +165,7 @@ impl RegistryClient {
     }
 
     /// List all packages and versions available in the registry.
+    #[allow(dead_code)] // registry-client API surface not yet wired to a CLI command
     pub fn list_available(&self) -> Result<Vec<(String, String)>> {
         let index = self.fetch_index()?;
         let mut entries = Vec::new();
@@ -177,6 +178,7 @@ impl RegistryClient {
         Ok(entries)
     }
 
+    #[allow(dead_code)] // accessor kept alongside list_available for the registry-client API
     pub fn base_url(&self) -> &str {
         &self.base_url
     }

@@ -282,6 +282,9 @@ pub struct NodeRecord {
     pub end_line: u32,
     pub kind: String,
     pub signature: Option<String>,
+    // Part of the CodeGraph node schema; hydrated for completeness even though
+    // no current caller reads it back.
+    #[allow(dead_code)]
     pub docstring: Option<String>,
 }
 
@@ -338,6 +341,7 @@ pub fn db_query_symbol_all(db_path: &Path, symbol: &str) -> Result<Vec<NodeRecor
 /// Returns `None` when there is no match.  When there are multiple matches the
 /// first (highest-priority) row is returned; callers that need to surface
 /// ambiguity should use [`db_query_symbol_all`] instead.
+#[allow(dead_code)] // convenience wrapper over db_query_symbol_all; kept as public API
 pub fn db_query_symbol(db_path: &Path, symbol: &str) -> Result<Option<NodeRecord>> {
     Ok(db_query_symbol_all(db_path, symbol)?.into_iter().next())
 }

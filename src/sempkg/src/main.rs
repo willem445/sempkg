@@ -219,7 +219,7 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
                      or pass a GitHub source URL to `--url` to build from source."
                 )
             })?;
-            let (name, version) = parse_spec(&spec)?;
+            let (name, version) = parse_spec(spec)?;
 
             let mut mf = manifest::load_manifest(dir)?;
 
@@ -901,6 +901,7 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
 ///
 /// Corresponds to QMD's "query" level (BM25 + re-ranking); the existing
 /// `search` and `docs` commands remain the fast BM25-only paths.
+#[allow(clippy::too_many_arguments)]
 fn run_query(
     package: &str,
     query: &str,
@@ -932,12 +933,12 @@ fn run_query(
 
     let mut code_candidates: Vec<reranker::RerankCandidate> = Vec::new();
     if !docs_only {
-        match resolve_codegraph_path(package, workspace) {
-            Ok(path) => match codegraph::query(&path, query, kind, fetch_k) {
+        // package may be docs-only; a resolve error here is not fatal
+        if let Ok(path) = resolve_codegraph_path(package, workspace) {
+            match codegraph::query(&path, query, kind, fetch_k) {
                 Ok(raw) => code_candidates.extend(reranker::codegraph_json_to_candidates(&raw)),
                 Err(e) => eprintln!("Warning: symbol search failed: {e}"),
-            },
-            Err(_) => {} // package may be docs-only; not fatal
+            }
         }
     }
 
@@ -946,14 +947,14 @@ fn run_query(
         if docs_only && kind.is_some() {
             eprintln!("Note: --kind is ignored when --docs is set.");
         }
-        match resolve_lance_path(package, workspace) {
-            Ok(lance_dir) => match lance::search(&lance_dir, query, fetch_k) {
+        // package may be symbols-only; a resolve error here is not fatal
+        if let Ok(lance_dir) = resolve_lance_path(package, workspace) {
+            match lance::search(&lance_dir, query, fetch_k) {
                 Ok(results) => {
                     doc_candidates.extend(reranker::lance_results_to_candidates(&results))
                 }
                 Err(e) => eprintln!("Warning: doc search failed: {e}"),
-            },
-            Err(_) => {} // package may be symbols-only; not fatal
+            }
         }
     }
 
@@ -1770,6 +1771,7 @@ fn add_from_github(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn install_github_bundle(
     bytes: Vec<u8>,
     _sig_url: Option<&str>,
@@ -1826,6 +1828,7 @@ fn install_github_bundle(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn record_github_dep(
     workspace_dir: &Path,
     resolved: &github::ResolvedSource,
@@ -2487,6 +2490,7 @@ fn local_git_sha(path: &Path) -> Option<String> {
 
 /// Write the `{ local = "...", version = "..." }` entry into `sempkg.toml`
 /// and update `sempkg.lock`.
+#[allow(clippy::too_many_arguments)]
 fn record_local_dep(
     workspace_dir: &Path,
     canonical: &Path,

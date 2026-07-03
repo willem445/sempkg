@@ -130,6 +130,7 @@ impl BundleStore {
     }
 
     /// Install a .sembundle file from disk into the store.
+    #[allow(dead_code)] // file-path install kept as public API; the add path uses install_bytes
     pub fn install(&self, bundle_path: &Path) -> Result<BundleInfo> {
         let bytes = std::fs::read(bundle_path)
             .with_context(|| format!("Cannot read bundle: {}", bundle_path.display()))?;
@@ -280,7 +281,7 @@ impl BundleStore {
 
     /// Get a specific installed bundle by name (latest version if multiple).
     pub fn get(&self, name: &str) -> Option<BundleInfo> {
-        self.list().into_iter().filter(|b| b.name == name).last()
+        self.list().into_iter().rfind(|b| b.name == name)
     }
 
     /// Get a specific version of a bundle.

@@ -222,6 +222,7 @@ pub struct LockEntry {
 }
 
 impl LockFile {
+    #[allow(dead_code)] // lookup helper kept as public API on the lock model
     pub fn find(&self, name: &str) -> Option<&LockEntry> {
         self.packages.iter().find(|e| e.name == name)
     }

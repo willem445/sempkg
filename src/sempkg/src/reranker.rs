@@ -324,7 +324,7 @@ pub fn pull_model(
     let model_path = config.resolved_model_path();
     // Priority: CLI --gguf-url flag > toml model_url > built-in default
     let source_url = gguf_url
-        .or_else(|| config.model_url.as_deref())
+        .or(config.model_url.as_deref())
         .unwrap_or(DEFAULT_GGUF_URL);
 
     if model_path.is_file() {

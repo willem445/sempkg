@@ -20,14 +20,17 @@ use crate::error::SempkgError;
 // Paths
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)] // bundle-layout path helpers kept as a symmetric public API
 pub fn lance_dir_path(bundle_dir: &Path) -> PathBuf {
     bundle_dir.join("lance")
 }
 
+#[allow(dead_code)]
 pub fn lance_metadata_path(bundle_dir: &Path) -> PathBuf {
     bundle_dir.join("lance").join("metadata.json")
 }
 
+#[allow(dead_code)]
 pub fn has_lance(bundle_dir: &Path) -> bool {
     lance_dir_path(bundle_dir).is_dir()
 }
@@ -42,6 +45,7 @@ pub struct LanceMetadata {
     pub document_count: Option<u64>,
     pub chunk_count: Option<u64>,
     pub fts_enabled: Option<bool>,
+    #[allow(dead_code)] // part of the on-disk metadata schema; not read back yet
     pub indexed_paths: Option<Vec<String>>,
     pub created_at: Option<String>,
     /// Identifier of the embedding model used to populate the `vector` column,
@@ -84,8 +88,10 @@ pub struct SearchResult {
     /// 1-based line number where this chunk ends in the source file (0 = unknown).
     pub end_line: u32,
     /// Byte offset of the chunk start within the source file (0 = unknown).
+    #[allow(dead_code)] // populated from the index; retained for callers that need byte spans
     pub start_byte: u32,
     /// Byte offset of the chunk end within the source file (0 = unknown).
+    #[allow(dead_code)]
     pub end_byte: u32,
     // Code-index fields (absent for docs results).
     pub symbol: Option<String>,
@@ -138,7 +144,7 @@ pub struct SymbolCandidate {
 ///
 /// - `Unique`      — exactly one match; contains the full source.
 /// - `Ambiguous`   — multiple nodes share the same name; the caller must ask
-///                   the user to disambiguate.
+///   the user to disambiguate.
 /// - `NotFound`    — no node matched the requested symbol name.
 #[derive(Debug)]
 pub enum SymbolLookup {
@@ -147,10 +153,12 @@ pub enum SymbolLookup {
     NotFound,
 }
 
+#[allow(dead_code)] // bundle-layout path helpers kept as a symmetric public API
 pub fn code_dir_path(bundle_dir: &Path) -> PathBuf {
     bundle_dir.join("code")
 }
 
+#[allow(dead_code)]
 pub fn has_code(bundle_dir: &Path) -> bool {
     code_dir_path(bundle_dir).is_dir()
 }
@@ -189,7 +197,7 @@ fn search_table(
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .map_err(|e| SempkgError::Io(e))?;
+        .map_err(SempkgError::Io)?;
 
     let results = rt.block_on(async {
         let db = lancedb::connect(dir.to_str().unwrap_or("."))
@@ -1295,7 +1303,7 @@ pub fn cli_update(
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .map_err(|e| SempkgError::Io(e))?;
+        .map_err(SempkgError::Io)?;
 
     rt.block_on(async {
         let schema = Arc::new(Schema::new(vec![

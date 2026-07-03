@@ -1,5 +1,8 @@
 use thiserror::Error;
 
+// Several variants form the crate's error taxonomy but are not constructed on
+// every build configuration; keep the full set rather than pruning by feature.
+#[allow(dead_code)]
 #[derive(Debug, Error)]
 pub enum SempkgError {
     #[error("Manifest not found at {path}. Run 'sempkg init' to create one.")]
