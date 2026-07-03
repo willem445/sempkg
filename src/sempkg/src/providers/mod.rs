@@ -106,6 +106,13 @@ pub trait Embed: Send + Sync {
 pub trait Rerank: Send + Sync {
     /// Return P(relevant) ∈ [0, 1] for a single (query, document) pair.
     fn score_pair(&self, query: &str, doc: &str) -> Result<f32>;
+    /// Score every document in `docs` against `query`, returning one score per
+    /// document in order. The default implementation calls `score_pair`
+    /// sequentially; batch-aware backends (e.g. the local GGUF reranker)
+    /// override this to reuse a single inference context across the batch.
+    fn score_pairs(&self, query: &str, docs: &[&str]) -> Result<Vec<f32>> {
+        docs.iter().map(|d| self.score_pair(query, d)).collect()
+    }
     /// Candidate pool size passed to the reranker.
     fn top_k(&self) -> usize;
     /// Number of results to keep after reranking.
