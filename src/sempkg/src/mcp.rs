@@ -15,7 +15,9 @@ use serde_json::{json, Value};
 use crate::packages::PackageRegistry;
 use crate::providers::{self, Embed, Expand, Rerank};
 use crate::reranker;
-use crate::store::{list_all_bundles, resolve_bundle, resolve_bundle_spec};
+use crate::store::{
+    list_all_bundles, resolve_bundle, resolve_bundle_spec, resolve_bundle_spec_in, BundleInfo,
+};
 use crate::{codegraph, embedding, lance, query_expansion};
 
 use crate::query_expansion::ExpansionKind;
@@ -1190,6 +1192,12 @@ struct McpContext {
     /// Query-expansion / fusion configuration (used even when the expander
     /// model is absent — the additive-only and anchoring knobs are read here).
     qe_cfg: query_expansion::QueryExpansionConfig,
+    /// `SEMPKG_DEBUG` — verbose per-stage query tracing. Read once at startup
+    /// rather than re-querying the environment on every query.
+    debug: bool,
+    /// `SEMPKG_NO_COMBINE` — disable the adjacent-hit combiner. Read once at
+    /// startup.
+    no_combine: bool,
 }
 
 impl McpContext {
@@ -1249,6 +1257,8 @@ impl McpContext {
             embedder,
             expander,
             qe_cfg,
+            debug: std::env::var("SEMPKG_DEBUG").is_ok(),
+            no_combine: std::env::var("SEMPKG_NO_COMBINE").is_ok(),
         }
     }
 
@@ -1601,8 +1611,13 @@ impl McpContext {
     /// `expanded_text` is set only on hits where the returned content is
     /// strictly longer than the existing snippet, so truncated snippets are
     /// always replaced by something richer.
-    fn expand_pool_hits(&self, hits: &mut Vec<UnifiedHit>, pool_indices: &[usize]) {
-        let debug = std::env::var("SEMPKG_DEBUG").is_ok();
+    fn expand_pool_hits(
+        &self,
+        hits: &mut Vec<UnifiedHit>,
+        pool_indices: &[usize],
+        bundles: &[BundleInfo],
+    ) {
+        let debug = self.debug;
         let mut attempted = 0usize;
         let mut resolved = 0usize;
         let mut expanded = 0usize;
@@ -1624,9 +1639,11 @@ impl McpContext {
             }
             attempted += 1;
 
-            let code_dir = match self.resolve_code_path(&pkg) {
-                Ok(d) => d,
-                Err(_) => continue, // no code index for this package
+            // Resolve against the already-enumerated bundle list instead of
+            // rescanning the store for every pool hit.
+            let code_dir = match resolve_bundle_spec_in(bundles, &pkg) {
+                Some(b) if b.has_code() => b.bundle_dir.join("code"),
+                _ => continue, // no code index for this package
             };
             resolved += 1;
 
@@ -1691,7 +1708,7 @@ impl McpContext {
         hits: &mut [UnifiedHit],
         ranked: Vec<(usize, f32)>,
     ) -> Vec<(usize, f32)> {
-        if std::env::var("SEMPKG_NO_COMBINE").is_ok() || ranked.len() < 2 {
+        if self.no_combine || ranked.len() < 2 {
             return ranked;
         }
 
@@ -1744,6 +1761,7 @@ impl McpContext {
         is_original: bool,
         scope: Option<&str>,
         fetch_limit: usize,
+        bundles: &[BundleInfo],
         hits: &mut Vec<UnifiedHit>,
     ) -> QueryRunStats {
         let mut stats = QueryRunStats::default();
@@ -1858,8 +1876,9 @@ impl McpContext {
             };
 
         // ── Installed bundles ────────────────────────────────────────────
-        let bundles = list_all_bundles(self.workspace().map(|p| p.as_path()));
-        for bundle in &bundles {
+        // Enumerated once by the caller and threaded in, rather than rescanning
+        // the store (and re-parsing every manifest) on each expansion run.
+        for bundle in bundles {
             if !scope_selects(scope, &bundle.name, Some(&bundle.version)) {
                 continue;
             }
@@ -1955,10 +1974,15 @@ impl McpContext {
     }
 
     fn tool_query(&self, query: &str, scope: Option<&str>, limit: usize) -> String {
-        let debug = std::env::var("SEMPKG_DEBUG").is_ok();
+        let debug = self.debug;
         let debug_list_limit = debug_hit_list_limit();
         let fetch_limit = self.reranker_fetch_limit(limit).max(20);
         let mut hits: Vec<UnifiedHit> = Vec::new();
+
+        // Enumerate installed bundles once for the whole request. `collect_query_hits`
+        // (per expansion run), scope validation, and small-to-big expansion all read
+        // this instead of rescanning the store + re-parsing every manifest.
+        let bundles = list_all_bundles(self.workspace().map(|p| p.as_path()));
 
         // ── Optional package scope ────────────────────────────────────────
         // When the agent restricts the search to a single package, validate the
@@ -1970,7 +1994,7 @@ impl McpContext {
                 .list()
                 .iter()
                 .any(|p| scope_selects(scope, &p.name, None))
-                || list_all_bundles(self.workspace().map(|p| p.as_path()))
+                || bundles
                     .iter()
                     .any(|b| scope_selects(scope, &b.name, Some(&b.version)));
             if !matches_any {
@@ -2032,6 +2056,7 @@ impl McpContext {
                 is_original,
                 scope,
                 fetch_limit,
+                &bundles,
                 &mut hits,
             );
             if debug {
@@ -2288,7 +2313,7 @@ impl McpContext {
         // context rather than the truncated 600-char display snippet.
         // Doc hits are left unchanged (their chunks are already the natural
         // retrieval unit).
-        self.expand_pool_hits(&mut hits, &pool_indices);
+        self.expand_pool_hits(&mut hits, &pool_indices, &bundles);
 
         // ── Two-pass reranking ────────────────────────────────────────────
         //
@@ -2331,18 +2356,20 @@ impl McpContext {
                     })
                     .collect();
 
-                // Score every candidate with score_pair() directly — no
-                // top_k or output_n truncation, which rerank() applies
+                // Score every candidate in ONE batched call (a single reused
+                // inference context) rather than a fresh context per pair. No
+                // top_k / output_n truncation here — rerank() applies those
                 // internally and would cap p1_scored to output_n (= 5)
                 // regardless of how large pass2_budget or limit are.
-                let mut p1_scored: Vec<(usize, f32)> = p1_candidates
-                    .iter()
+                let p1_texts: Vec<&str> =
+                    p1_candidates.iter().map(|c| c.text.as_str()).collect();
+                let p1_scores = ranker
+                    .score_pairs(query, &p1_texts)
+                    .unwrap_or_else(|_| vec![0.0; p1_texts.len()]);
+                let mut p1_scored: Vec<(usize, f32)> = p1_scores
+                    .into_iter()
                     .enumerate()
-                    .map(|(pp, c)| {
-                        let score = ranker.score_pair(query, &c.text).unwrap_or(0.0);
-                        let hi = pool_indices[pp];
-                        (hi, score)
-                    })
+                    .map(|(pp, score)| (pool_indices[pp], score))
                     .collect();
                 p1_scored
                     .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -2359,64 +2386,69 @@ impl McpContext {
                     .collect();
 
                 // ── Pass 2: KWIC-windowed scoring on expanded bodies ──────
-                // Call score_pair() directly per window instead of going through
-                // rerank(), which would silently truncate via its top_k cap
-                // (applied before scoring) and output_n cap (applied after) —
-                // both would drop valid windows when total windows > top_k.
-                //
-                // By calling score_pair() ourselves we score every window of
-                // every promoted hit, regardless of how many windows a large
-                // body produces, and accumulate the maximum per hit without
-                // losing any candidates to internal caps.
+                // Use score_pairs() directly (not rerank(), which would silently
+                // truncate via its top_k cap applied before scoring and output_n
+                // cap applied after — both would drop valid windows when total
+                // windows > top_k).  Scoring the windows ourselves keeps every
+                // window of every promoted hit and takes the per-hit maximum,
+                // without losing candidates to those internal caps.
                 reranker_was_active = true;
-                let mut best: HashMap<usize, (f32, usize)> = HashMap::new();
 
-                for (tp, &hi) in top_indices.iter().enumerate() {
-                    let body = {
+                // Compute every promoted hit's KWIC windows once, then score
+                // ALL (query, window) pairs across ALL promoted hits in a single
+                // batched call (one reused inference context) instead of a fresh
+                // context per window.  Windows are owned here and reused for the
+                // write-back below, so nothing is recomputed and there is no
+                // second DB round-trip.
+                let windows_per_tp: Vec<Vec<String>> = top_indices
+                    .iter()
+                    .map(|&hi| {
                         let h = &hits[hi];
-                        h.expanded_text
+                        let body = h
+                            .expanded_text
                             .as_deref()
                             .filter(|s| !s.is_empty())
                             .unwrap_or(if !h.snippet.is_empty() {
                                 h.snippet.as_str()
                             } else {
                                 h.path.as_str()
-                            })
-                            .to_string()
-                    };
-                    let windows = kwic_windows(&body);
-                    for (wi, window) in windows.iter().enumerate() {
-                        let text = hit_candidate_text_with_body(&hits[hi], window);
-                        let score = ranker.score_pair(query, &text).unwrap_or(0.0);
-                        let e = best.entry(tp).or_insert((f32::NEG_INFINITY, 0));
-                        if score > e.0 {
-                            *e = (score, wi);
-                        }
+                            });
+                        kwic_windows(body)
+                    })
+                    .collect();
+
+                let mut window_meta: Vec<(usize, usize)> = Vec::new(); // (tp, wi)
+                let mut window_texts: Vec<String> = Vec::new();
+                for (tp, &hi) in top_indices.iter().enumerate() {
+                    for (wi, window) in windows_per_tp[tp].iter().enumerate() {
+                        window_meta.push((tp, wi));
+                        window_texts.push(hit_candidate_text_with_body(&hits[hi], window));
+                    }
+                }
+
+                let window_refs: Vec<&str> =
+                    window_texts.iter().map(String::as_str).collect();
+                let window_scores = ranker
+                    .score_pairs(query, &window_refs)
+                    .unwrap_or_else(|_| vec![0.0; window_refs.len()]);
+
+                // Reduce to the best-scoring window per promoted hit.
+                let mut best: HashMap<usize, (f32, usize)> = HashMap::new();
+                for (&(tp, wi), &score) in window_meta.iter().zip(window_scores.iter()) {
+                    let e = best.entry(tp).or_insert((f32::NEG_INFINITY, 0));
+                    if score > e.0 {
+                        *e = (score, wi);
                     }
                 }
 
                 // Write best_window / best_window_first / kwic_count back into
-                // each hit.  Body + windows are recomputed cheaply from the
-                // already-fetched expanded_text — no second DB round-trip.
+                // each hit, reusing the windows already computed above.
                 for (tp, &hi) in top_indices.iter().enumerate() {
                     if let Some(&(_, wi)) = best.get(&tp) {
-                        let body = {
-                            let h = &hits[hi];
-                            h.expanded_text
-                                .as_deref()
-                                .filter(|s| !s.is_empty())
-                                .unwrap_or(if !h.snippet.is_empty() {
-                                    h.snippet.as_str()
-                                } else {
-                                    h.path.as_str()
-                                })
-                                .to_string()
-                        };
-                        let windows = kwic_windows(&body);
-                        let n = windows.len();
-                        hits[hi].best_window = windows.into_iter().nth(wi);
+                        let windows = &windows_per_tp[tp];
+                        hits[hi].best_window = windows.get(wi).cloned();
                         hits[hi].best_window_first = wi == 0;
-                        hits[hi].kwic_count = n;
+                        hits[hi].kwic_count = windows.len();
                     }
                 }
 

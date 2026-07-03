@@ -2,9 +2,9 @@
 ///
 /// Queries the LanceDB Arrow table (`lance/docs.lance/`) inside an extracted
 /// bundle directory. All searches are strictly scoped to the bundle.
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use arrow_array::{Array, FixedSizeListArray, Float32Array, RecordBatch, StringArray, UInt32Array};
 use arrow_schema::{DataType, Field, Schema};
@@ -15,6 +15,77 @@ use lancedb::DistanceType;
 use serde::Deserialize;
 
 use crate::error::SempkgError;
+
+// ---------------------------------------------------------------------------
+// Shared tokio runtime + table-handle cache
+// ---------------------------------------------------------------------------
+//
+// LanceDB is async, so every query must run on a tokio runtime. This module
+// used to build a fresh `current_thread` runtime *and* reconnect + re-open the
+// table on every call — dozens of times per MCP `query` (bundles × expansion
+// runs × search calls). Both are now amortised: one process-wide runtime, and a
+// cache of the cheap-to-clone `Table` handles keyed by directory + table name.
+//
+// The MCP server processes one request at a time (see `mcp::run`), so a single
+// runtime and a `Mutex`-guarded cache are sufficient; the `Mutex` only guards
+// against the rare concurrent use from tests.
+
+/// Process-wide tokio runtime shared by every LanceDB call.
+fn lance_runtime() -> &'static tokio::runtime::Runtime {
+    static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("failed to build shared LanceDB tokio runtime")
+    })
+}
+
+/// Cache of open `Table` handles keyed by `"<dir>\0<table>"`. Opening a table
+/// re-reads its manifest from disk; the query path opens the same handful of
+/// tables many times per request, so a cached handle avoids the reconnect.
+fn table_cache() -> &'static Mutex<HashMap<String, lancedb::Table>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, lancedb::Table>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn table_cache_key(dir: &Path, table_name: &str) -> String {
+    format!("{}\u{0}{}", dir.to_string_lossy(), table_name)
+}
+
+/// Open `table_name` in the LanceDB database at `dir`, reusing a cached handle
+/// when one exists. On a miss it connects, opens the table, and stores the
+/// handle for reuse. The `Mutex` is never held across an `.await`.
+async fn open_table_cached(dir: &Path, table_name: &str) -> crate::error::Result<lancedb::Table> {
+    let key = table_cache_key(dir, table_name);
+    if let Some(tbl) = table_cache().lock().unwrap().get(&key).cloned() {
+        return Ok(tbl);
+    }
+    let uri = dir.to_str().ok_or_else(|| {
+        SempkgError::LanceError(format!("non-UTF-8 LanceDB path: {}", dir.display()))
+    })?;
+    let db = lancedb::connect(uri)
+        .execute()
+        .await
+        .map_err(|e| SempkgError::LanceError(e.to_string()))?;
+    let tbl = db
+        .open_table(table_name)
+        .execute()
+        .await
+        .map_err(|e| SempkgError::LanceError(e.to_string()))?;
+    table_cache().lock().unwrap().insert(key, tbl.clone());
+    Ok(tbl)
+}
+
+/// Drop any cached handle for `dir`/`table_name`. Called by the write paths
+/// after they drop + recreate a table so later reads never see a stale handle.
+fn invalidate_table_cache(dir: &Path, table_name: &str) {
+    table_cache()
+        .lock()
+        .unwrap()
+        .remove(&table_cache_key(dir, table_name));
+}
 
 // ---------------------------------------------------------------------------
 // Paths
@@ -186,22 +257,8 @@ fn search_table(
         return Err(SempkgError::NoLanceIndex(dir.to_string_lossy().to_string()));
     }
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| SempkgError::Io(e))?;
-
-    let results = rt.block_on(async {
-        let db = lancedb::connect(dir.to_str().unwrap_or("."))
-            .execute()
-            .await
-            .map_err(|e| SempkgError::LanceError(e.to_string()))?;
-
-        let tbl = db
-            .open_table(table_name)
-            .execute()
-            .await
-            .map_err(|e| SempkgError::LanceError(e.to_string()))?;
+    let results = lance_runtime().block_on(async {
+        let tbl = open_table_cached(dir, table_name).await?;
 
         let batches: Vec<RecordBatch> = tbl
             .query()
@@ -324,23 +381,9 @@ fn search_vector_table(
         return Err(SempkgError::NoLanceIndex(dir.to_string_lossy().to_string()));
     }
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(SempkgError::Io)?;
-
     let query_vec = query_vec.to_vec();
-    let results = rt.block_on(async {
-        let db = lancedb::connect(dir.to_str().unwrap_or("."))
-            .execute()
-            .await
-            .map_err(|e| SempkgError::LanceError(e.to_string()))?;
-
-        let tbl = db
-            .open_table(table_name)
-            .execute()
-            .await
-            .map_err(|e| SempkgError::LanceError(e.to_string()))?;
+    let results = lance_runtime().block_on(async {
+        let tbl = open_table_cached(dir, table_name).await?;
 
         // If the table has no `vector` column, there are no embeddings to query.
         let schema = tbl
@@ -391,12 +434,12 @@ pub fn embed_table(
 
     let model_id = embedder.model_id().to_string();
     let dim = embedder.dim();
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(SempkgError::Io)?;
 
-    let row_count = rt.block_on(async {
+    // Write path: reuse the shared runtime, but connect directly (the drop +
+    // recreate below needs the `Connection`) and drop any cached handle for the
+    // rebuilt table so later reads don't observe the pre-embedding version.
+    invalidate_table_cache(dir, table_name);
+    let row_count = lance_runtime().block_on(async {
         let db = lancedb::connect(dir.to_str().unwrap_or("."))
             .execute()
             .await
@@ -658,22 +701,8 @@ fn fetch_from_code_table(
     node: Option<&crate::codegraph::NodeRecord>,
     hint: &str,
 ) -> crate::error::Result<Option<SymbolSource>> {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(SempkgError::Io)?;
-
-    let result = rt.block_on(async {
-        let db = lancedb::connect(code_dir.to_str().unwrap_or("."))
-            .execute()
-            .await
-            .map_err(|e| SempkgError::LanceError(e.to_string()))?;
-
-        let tbl = db
-            .open_table("code")
-            .execute()
-            .await
-            .map_err(|e| SempkgError::LanceError(e.to_string()))?;
+    let result = lance_runtime().block_on(async {
+        let tbl = open_table_cached(code_dir, "code").await?;
 
         // Build the filter expression from the resolved node or fall back to a
         // full-text search on the symbol/hint name.
@@ -827,22 +856,8 @@ fn fetch_at_location_lance_fallback(
 ) -> crate::error::Result<Option<SymbolSource>> {
     let safe_file = file.replace('\'', "''");
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(SempkgError::Io)?;
-
-    let result = rt.block_on(async {
-        let db = lancedb::connect(code_dir.to_str().unwrap_or("."))
-            .execute()
-            .await
-            .map_err(|e| SempkgError::LanceError(e.to_string()))?;
-
-        let tbl = db
-            .open_table("code")
-            .execute()
-            .await
-            .map_err(|e| SempkgError::LanceError(e.to_string()))?;
+    let result = lance_runtime().block_on(async {
+        let tbl = open_table_cached(code_dir, "code").await?;
 
         let filter = format!(
             "(path = '{safe_file}' OR path LIKE '%/{safe_file}' OR path LIKE '%\\\\{safe_file}') \
@@ -952,22 +967,8 @@ pub fn fetch_doc_lines(
 
     let safe_file = file.replace('\'', "''");
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(SempkgError::Io)?;
-
-    let result = rt.block_on(async {
-        let db = lancedb::connect(lance_dir.to_str().unwrap_or("."))
-            .execute()
-            .await
-            .map_err(|e| SempkgError::LanceError(e.to_string()))?;
-
-        let tbl = db
-            .open_table("docs")
-            .execute()
-            .await
-            .map_err(|e| SempkgError::LanceError(e.to_string()))?;
+    let result = lance_runtime().block_on(async {
+        let tbl = open_table_cached(lance_dir, "docs").await?;
 
         // Match the file with or without a per-chunk `#N` suffix, and whether or
         // not it is stored with a leading directory prefix.
@@ -1292,12 +1293,9 @@ pub fn cli_update(
         ));
     }
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| SempkgError::Io(e))?;
-
-    rt.block_on(async {
+    // Write path: rebuilds the `docs` table, so drop any cached handle first.
+    invalidate_table_cache(&lance_out, "docs");
+    lance_runtime().block_on(async {
         let schema = Arc::new(Schema::new(vec![
             Field::new("path", DataType::Utf8, false),
             Field::new("content", DataType::Utf8, false),

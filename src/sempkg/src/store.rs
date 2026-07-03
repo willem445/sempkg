@@ -487,3 +487,107 @@ pub fn resolve_bundle_spec(spec: &str, workspace_dir: Option<&Path>) -> Option<B
     }
     resolve_bundle(spec, workspace_dir)
 }
+
+/// Like [`resolve_bundle_spec`] but resolves against an already-enumerated
+/// bundle list instead of rescanning the store on disk.
+///
+/// A single MCP `query` resolves a bundle spec once per pool hit; doing that
+/// against `list_all_bundles`' output (built once per request) avoids re-reading
+/// and re-parsing every `manifest.json` on each lookup. The resolution order
+/// mirrors `resolve_bundle_spec` exactly: exact `name@version` (workspace before
+/// global), then a name-only fallback (workspace before global).
+///
+/// `bundles` is expected to be the output of [`list_all_bundles`] (workspace
+/// entries first, then global); scope is read from each [`BundleInfo`] so the
+/// ordering of the slice does not affect correctness.
+pub fn resolve_bundle_spec_in<'a>(bundles: &'a [BundleInfo], spec: &str) -> Option<&'a BundleInfo> {
+    // `rfind` takes the LAST match (searching from the back) without walking
+    // the whole slice — mirroring `BundleStore::get`'s "last version wins".
+    let name_only = |name: &str| -> Option<&'a BundleInfo> {
+        bundles
+            .iter()
+            .rfind(|b| b.name == name && b.scope == BundleScope::Workspace)
+            .or_else(|| {
+                bundles
+                    .iter()
+                    .rfind(|b| b.name == name && b.scope == BundleScope::Global)
+            })
+    };
+
+    if let Some((name, version)) = spec.rsplit_once('@') {
+        if !name.is_empty() && !version.is_empty() {
+            let exact = |scope: BundleScope| {
+                bundles
+                    .iter()
+                    .rfind(|b| b.name == name && b.version == version && b.scope == scope)
+            };
+            if let Some(b) = exact(BundleScope::Workspace).or_else(|| exact(BundleScope::Global)) {
+                return Some(b);
+            }
+            // Exact version not installed — fall back to name-only resolution.
+            return name_only(name);
+        }
+    }
+    name_only(spec)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bundle(name: &str, version: &str, scope: BundleScope) -> BundleInfo {
+        BundleInfo {
+            name: name.to_string(),
+            version: version.to_string(),
+            bundle_dir: PathBuf::from(format!("/{name}/{version}")),
+            manifest: BundleManifest {
+                spec_version: "1.3.0".to_string(),
+                name: name.to_string(),
+                version: version.to_string(),
+                source_repo: String::new(),
+                commit_hash: String::new(),
+                tag: None,
+                created_at: String::new(),
+                codegraph_version: String::new(),
+                extensions: Vec::new(),
+                checksums: std::collections::BTreeMap::new(),
+            },
+            archive_sha256: String::new(),
+            scope,
+        }
+    }
+
+    #[test]
+    fn resolve_spec_in_matches_exact_version_and_prefers_workspace() {
+        let bundles = vec![
+            bundle("lancedb", "0.30.0", BundleScope::Global),
+            bundle("lancedb", "0.30.0", BundleScope::Workspace),
+            bundle("lancedb", "0.29.0", BundleScope::Global),
+        ];
+        // Exact version, workspace preferred over the identical global entry.
+        let hit = resolve_bundle_spec_in(&bundles, "lancedb@0.30.0").unwrap();
+        assert_eq!(hit.version, "0.30.0");
+        assert_eq!(hit.scope, BundleScope::Workspace);
+        // Exact version only in global.
+        let hit = resolve_bundle_spec_in(&bundles, "lancedb@0.29.0").unwrap();
+        assert_eq!(hit.scope, BundleScope::Global);
+    }
+
+    #[test]
+    fn resolve_spec_in_falls_back_to_name_only() {
+        let bundles = vec![bundle("qmd", "2.5.2", BundleScope::Global)];
+        // Unknown exact version falls back to the installed one.
+        assert_eq!(
+            resolve_bundle_spec_in(&bundles, "qmd@9.9.9").unwrap().version,
+            "2.5.2"
+        );
+        // Bare name resolves too.
+        assert_eq!(
+            resolve_bundle_spec_in(&bundles, "qmd").unwrap().version,
+            "2.5.2"
+        );
+        // Missing package resolves to nothing.
+        assert!(resolve_bundle_spec_in(&bundles, "nope").is_none());
+        assert!(resolve_bundle_spec_in(&bundles, "nope@1.0.0").is_none());
+    }
+}

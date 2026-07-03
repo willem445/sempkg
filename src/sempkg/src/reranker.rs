@@ -488,12 +488,77 @@ impl Reranker {
 
         Ok(emb.first().copied().unwrap_or(0.0))
     }
+
+    /// Score many documents against one `query`, reusing a single
+    /// `LlamaContext` for the whole batch and clearing the KV cache between
+    /// decodes — the same pattern as [`crate::embedding::Embedder::
+    /// embed_documents_batch`]. This avoids the per-pair context/KV-cache
+    /// allocation that dominates `score_pair` when the `tool_query` pipeline
+    /// scores an entire candidate pool (pass 1) or every KWIC window (pass 2).
+    ///
+    /// Returns one score in `[0, 1]` per input document, in order.
+    pub fn score_pairs(&self, query: &str, documents: &[&str]) -> Result<Vec<f32>> {
+        use llama_cpp_2::{
+            context::params::LlamaContextParams, llama_batch::LlamaBatch, model::AddBos,
+        };
+
+        if documents.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // One context reused for every pair (model + KV cache allocated once).
+        // Identical params to `score_pair` so scores are unchanged.
+        let ctx_params = LlamaContextParams::default()
+            .with_n_ctx(std::num::NonZeroU32::new(4096))
+            .with_embeddings(true)
+            .with_n_batch(4096)
+            .with_n_ubatch(4096)
+            .with_n_threads(self.n_threads)
+            .with_n_threads_batch(self.n_threads);
+
+        let mut ctx = self
+            .model
+            .new_context(crate::llama_runtime::shared()?, ctx_params)
+            .map_err(|e| anyhow::anyhow!("creating context: {e}"))?;
+        let n_ctx = ctx.n_ctx() as usize;
+
+        let mut scores = Vec::with_capacity(documents.len());
+        for document in documents {
+            let prompt = build_rerank_prompt(query, document);
+            let mut tokens = self
+                .model
+                .str_to_token(&prompt, AddBos::Always)
+                .map_err(|e| anyhow::anyhow!("tokenizing prompt: {e}"))?;
+            tokens.truncate(n_ctx);
+
+            let mut batch = LlamaBatch::new(tokens.len(), 1);
+            batch
+                .add_sequence(&tokens, 0, false)
+                .map_err(|e| anyhow::anyhow!("building batch: {e}"))?;
+
+            // Reset KV cache before each decode so sequences don't accumulate.
+            ctx.clear_kv_cache();
+            ctx.decode(&mut batch)
+                .map_err(|e| anyhow::anyhow!("decoding batch: {e}"))?;
+
+            let emb = ctx
+                .embeddings_seq_ith(0)
+                .map_err(|e| anyhow::anyhow!("reading score: {e}"))?;
+            scores.push(emb.first().copied().unwrap_or(0.0));
+        }
+
+        Ok(scores)
+    }
 }
 
 #[cfg(feature = "reranker")]
 impl Rerank for Reranker {
     fn score_pair(&self, query: &str, doc: &str) -> Result<f32> {
         Reranker::score_pair(self, query, doc)
+    }
+
+    fn score_pairs(&self, query: &str, docs: &[&str]) -> Result<Vec<f32>> {
+        Reranker::score_pairs(self, query, docs)
     }
 
     fn top_k(&self) -> usize {
