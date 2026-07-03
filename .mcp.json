@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "sempkg": {
+      "type": "stdio",
+      "command": "sempkg",
+      "args": ["mcp", "-C", "."]
+    }
+  }
+}

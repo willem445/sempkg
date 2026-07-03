@@ -1,6 +1,13 @@
 *.sembundle
 .sempkg/*
 
+# Local agent/editor scratch state and generated deploy workspaces
+.claude/
+deploy/workspace/
+
+# Windows crash dumps (e.g. from the bundled bash used in dev)
+*.stackdump
+
 # Signing keys — private key must never be committed
 keys/private.pem
 
