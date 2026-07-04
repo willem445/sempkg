@@ -234,7 +234,7 @@ by document + (optional) section rather than line numbers:
 | `src/sempkg/src/lance.rs` | Add `read_code_lines` (Option A) and `read_doc`; keep `fetch_symbol_source`/`fetch_symbol_at_location` for `read_symbol` and the `line` back-compat path. `search_code`/`search` remain (still used internally by `tool_query`). |
 | `.github/agents/sempkg.agent.md` | Rewrite the tool-selection table and workflow to the 3-tier model. Remove references to `search_symbols`, `search_code`, `get_context`, `search_docs`, `docs_metadata`. |
 | `docs/design/query-tool-design.md` | Note the surface reduction and the highlighting addition. |
-| `docs/plan-sembundle-source-code-index.md` | Cross-reference; Phase 3 full-source storage extends it. |
+| `docs/plans/plan-sembundle-source-code-index.md` | Cross-reference; Phase 3 full-source storage extends it. |
 | `src/sembundle/*` *(Phase 3 only)* | `--include-full-source` build flag, `source/` packaging, `manifest`/`validate` updates, `spec_version` bump. |
 
 > Note: `tool_query` still calls `lance::search`, `lance::search_code`, and

@@ -75,7 +75,7 @@ sempkg mcp -C .
 - Keep changes minimal and scoped to the task
 - Update `docs/` when behavior, commands, or architecture meaningfully change
 - Document significant architecture decisions in `docs/arch/adr/`
-- Avoid breaking changes across the three applications unless explicitly requested
+- Avoid breaking changes across the four applications unless explicitly requested
 
 ## MCP (sempkg semantic search)
 The sempkg MCP server is configured in `.mcp.json`. It exposes version-accurate semantic indexes for installed packages declared in `sempkg.toml`.
