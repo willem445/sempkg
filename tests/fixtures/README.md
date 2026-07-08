@@ -25,10 +25,14 @@ about, in each of the three tier-1 languages:
 - **cross-file calls** — every language's entry file calls into its sibling file (e.g. `rust/lib.rs` → `rust/geometry.rs`), producing resolved `calls` edges across `file_path` boundaries
 - **type alias** — `Scalar` (Rust `type` alias and TypeScript `type` alias)
 - **async fn** — `fetchAndMeasure` (TypeScript, flagged `is_async=1`); Rust `fetch_and_measure` and Python `gather_measurements` are also present as nodes
+- **unresolvable references** — `python/unresolved.py` deliberately calls a name
+  defined nowhere (`totally_undefined_symbol`) and imports a non-existent module
+  (`this_module_does_not_exist`), to probe the `unresolved_refs` table (see the
+  empty-tables note below)
 
 ### Observed contents of `codegraph-v4.db`
 
-Indexing produced **6 files, 52 nodes, 113 edges**. As reported by CodeGraph 0.9.7:
+Indexing produced **7 files, 55 nodes, 116 edges**. As reported by CodeGraph 0.9.7:
 
 - Node kinds: `class`, `enum`, `enum_member`, `file`, `function`, `import`, `method`, `struct`, `type_alias`, `variable`
 - Edge kinds: `calls`, `contains`, `imports`, `instantiates`, `references`
@@ -40,6 +44,35 @@ Indexing produced **6 files, 52 nodes, 113 edges**. As reported by CodeGraph 0.9
 >   Python async definitions are recorded as ordinary `function` nodes.
 > - Python's `Scalar = float` is recorded as a `variable`, not a `type_alias`
 >   (only Rust and TypeScript produce `type_alias` nodes here).
+> - The unresolvable call in `python/unresolved.py` produces **no `calls` edge**
+>   — CodeGraph silently drops references it cannot resolve. The non-existent
+>   import is still recorded as an `import` node/edge (imports are not resolved
+>   against real modules).
+
+### Empty tables: `unresolved_refs` and `project_metadata`
+
+Two schema-v4 tables are present but **always contain 0 rows** in a CodeGraph
+0.9.7-produced DB. This is not an artifact of the fixture — it is how 0.9.7
+behaves for **any** input, verified both empirically and against the tool's
+source:
+
+- **`unresolved_refs` — always empty by design.** Indexing resolves references
+  via `resolveAndPersistBatched` (the only path `init --index` / `index` uses).
+  That routine deletes *both* successfully-resolved refs *and* the ones it fails
+  to resolve from `unresolved_refs` after each batch (to avoid reprocessing), so
+  the table is fully drained by the time indexing finishes. `python/unresolved.py`
+  confirms this: even with a call to a nowhere-defined name and an import of a
+  non-existent module, `unresolved_refs` stays at 0. The table is used only as
+  transient scratch space during resolution.
+- **`project_metadata` — never written.** CodeGraph 0.9.7 defines `setMetadata`
+  in its DB layer but never calls it anywhere in the shipped code, so nothing is
+  ever inserted. The `codegraph_version` recorded in a SemBundle's
+  `manifest.json` comes from the `sembundle` build pipeline, **not** from this
+  table.
+
+**Implication for the Phase 1 reader:** do not depend on either table for graph
+data. A reader may still `SELECT` from them (they exist), but must treat 0 rows
+as the normal, expected case for 0.9.7-built bundles.
 
 ## How `codegraph-v4.db` was generated
 
