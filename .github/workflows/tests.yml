@@ -142,6 +142,9 @@ jobs:
       - name: Test sembundle
         run: cargo test --manifest-path src/sembundle/Cargo.toml
 
+      - name: Test semgraph
+        run: cargo test --manifest-path src/semgraph/Cargo.toml
+
       - name: Test sempkg
         run: cargo test --manifest-path src/sempkg/Cargo.toml --features reranker
 
