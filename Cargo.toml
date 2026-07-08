@@ -30,7 +30,7 @@ which = "8"
 reqwest = { version = "0.13" }
 ed25519-dalek = { version = "2", features = ["pkcs8", "pem"] }
 lancedb = "0.31"
-arrow-array = "58"
+arrow-array = "59"
 arrow-schema = "58"
 tokio = { version = "1" }
 glob = "0.3"
