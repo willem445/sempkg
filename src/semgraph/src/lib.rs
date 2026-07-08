@@ -22,6 +22,7 @@
 //! A reader may still `SELECT` from these tables (they exist), but must treat
 //! 0 rows as the normal, expected case.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row};
@@ -331,6 +332,163 @@ impl GraphDb {
         })
     }
 
+    /// Distinct, non-empty `file_path`s recorded in `nodes`, sorted. This backs
+    /// the `list_files` surface; filtering/formatting is the caller's concern.
+    pub fn file_paths(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT file_path FROM nodes \
+             WHERE file_path IS NOT NULL AND file_path != '' ORDER BY file_path",
+        )?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .filter_map(std::result::Result::ok)
+            .collect();
+        Ok(rows)
+    }
+
+    /// Build a relevance-ordered set of nodes for a natural-language `task`.
+    ///
+    /// Strategy (issue #78, Phase 1): FTS seed on the task's significant terms,
+    /// then a bounded breadth-first expansion (≤2 hops) over
+    /// `calls`/`references`/`contains`/`imports` edges, ordered by hop distance
+    /// then symbol-kind weight. This does not replicate CodeGraph's ranking —
+    /// it produces a *useful* candidate set that the caller's reranker refines
+    /// on top of (MCP `get_context` re-ranks the result and only consumes the
+    /// node list).
+    pub fn context(&self, task: &str, max_nodes: usize) -> Result<Vec<GraphNode>> {
+        let cap = max_nodes.max(1);
+        let seeds = self.context_seeds(task, cap)?;
+        if seeds.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // hop distance per node id; seeds are hop 0.
+        let mut hop: HashMap<String, u32> = HashMap::new();
+        for n in &seeds {
+            hop.entry(n.id.clone()).or_insert(0);
+        }
+
+        const MAX_HOP: u32 = 2;
+        let mut frontier: Vec<String> = seeds.iter().map(|n| n.id.clone()).collect();
+        let mut h = 1;
+        while h <= MAX_HOP && hop.len() < cap {
+            let mut next = Vec::new();
+            for id in self.neighbor_ids(&frontier)? {
+                if !hop.contains_key(&id) {
+                    hop.insert(id.clone(), h);
+                    next.push(id);
+                }
+            }
+            if next.is_empty() {
+                break;
+            }
+            frontier = next;
+            h += 1;
+        }
+
+        let ids: Vec<String> = hop.keys().cloned().collect();
+        let mut nodes = self.nodes_by_ids(&ids)?;
+        nodes.sort_by(|a, b| {
+            let ha = hop.get(&a.id).copied().unwrap_or(u32::MAX);
+            let hb = hop.get(&b.id).copied().unwrap_or(u32::MAX);
+            ha.cmp(&hb)
+                .then_with(|| kind_weight(&b.kind).cmp(&kind_weight(&a.kind)))
+                .then_with(|| a.qualified_name.cmp(&b.qualified_name))
+        });
+        nodes.truncate(cap);
+        Ok(nodes)
+    }
+
+    /// FTS seed nodes for [`GraphDb::context`]: match the task's significant
+    /// terms (OR'd), falling back to a whole-string query when the task has no
+    /// usable terms, and to per-term `LIKE` when FTS yields nothing.
+    fn context_seeds(&self, task: &str, limit: usize) -> Result<Vec<GraphNode>> {
+        let tokens = significant_tokens(task);
+        if tokens.is_empty() {
+            return self.query(task, None, limit);
+        }
+
+        let match_expr = tokens
+            .iter()
+            .map(|t| fts_match_phrase(t))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        let sql = format!(
+            "SELECT {NODE_COLUMNS} \
+             FROM nodes_fts JOIN nodes n ON n.rowid = nodes_fts.rowid \
+             WHERE nodes_fts MATCH ?1 ORDER BY nodes_fts.rank LIMIT {}",
+            limit.max(1)
+        );
+        let params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(match_expr)];
+        let fts = self.collect_nodes(&sql, params).unwrap_or_default();
+        if !fts.is_empty() {
+            return Ok(fts);
+        }
+
+        // LIKE fallback: any token as a substring of name/qualified_name.
+        let mut clauses = Vec::new();
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        for (i, tok) in tokens.iter().enumerate() {
+            let p = i + 1;
+            clauses.push(format!(
+                "n.name LIKE ?{p} ESCAPE '\\' OR n.qualified_name LIKE ?{p} ESCAPE '\\'"
+            ));
+            params.push(Box::new(format!("%{}%", escape_like(tok))));
+        }
+        let sql = format!(
+            "SELECT {NODE_COLUMNS} FROM nodes n WHERE {} \
+             ORDER BY (n.end_line - n.start_line) ASC LIMIT {}",
+            clauses.join(" OR "),
+            limit.max(1)
+        );
+        self.collect_nodes(&sql, params)
+    }
+
+    /// Distinct node ids adjacent to any node in `frontier` via a
+    /// context-relevant edge kind (in either direction).
+    fn neighbor_ids(&self, frontier: &[String]) -> Result<Vec<String>> {
+        if frontier.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ph = placeholders(frontier.len());
+        let sql = format!(
+            "SELECT source, target FROM edges \
+             WHERE kind IN ('calls','references','contains','imports') \
+               AND (source IN ({ph}) OR target IN ({ph}))"
+        );
+        // `frontier` is bound twice (once per IN clause).
+        let bound: Vec<&String> = frontier.iter().chain(frontier.iter()).collect();
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(bound), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .filter_map(std::result::Result::ok);
+        let mut out = Vec::new();
+        for (src, tgt) in rows {
+            out.push(src);
+            out.push(tgt);
+        }
+        out.sort();
+        out.dedup();
+        Ok(out)
+    }
+
+    /// Hydrate a set of node ids into [`GraphNode`]s (order unspecified).
+    fn nodes_by_ids(&self, ids: &[String]) -> Result<Vec<GraphNode>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ph = placeholders(ids.len());
+        let sql = format!("SELECT {NODE_COLUMNS} FROM nodes n WHERE n.id IN ({ph})");
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(ids.iter()), row_to_node)?
+            .filter_map(std::result::Result::ok)
+            .collect();
+        Ok(rows)
+    }
+
     /// Resolve `symbol` to node id(s), preferring an exact `qualified_name`
     /// match over a plain `name` match. Multiple ids are returned when the name
     /// is ambiguous (e.g. same method name across languages/files).
@@ -450,6 +608,44 @@ fn to_sqlite_uri(path: &Path) -> String {
     } else {
         format!("file:///{encoded}?immutable=1")
     }
+}
+
+/// Relevance weight of a node kind for context ordering: definitions that carry
+/// behaviour rank above containers, which rank above imports/variables.
+fn kind_weight(kind: &str) -> u8 {
+    match kind {
+        "function" | "method" => 3,
+        "class" | "struct" | "enum" => 2,
+        _ => 1,
+    }
+}
+
+/// Split a natural-language task into significant search terms: alphanumeric/
+/// underscore runs of length ≥3, lowercased, de-duplicated (order-preserving),
+/// minus a few common English stopwords, capped to keep the FTS query small.
+fn significant_tokens(task: &str) -> Vec<String> {
+    const STOPWORDS: &[&str] = &[
+        "the", "and", "for", "with", "that", "this", "from", "into", "how", "does", "what", "when",
+        "where", "which", "all", "any", "get", "set", "use", "using", "via",
+    ];
+    const MAX_TOKENS: usize = 10;
+
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for raw in task.split(|c: char| !(c.is_alphanumeric() || c == '_')) {
+        if raw.len() < 3 {
+            continue;
+        }
+        let tok = raw.to_lowercase();
+        if STOPWORDS.contains(&tok.as_str()) || !seen.insert(tok.clone()) {
+            continue;
+        }
+        out.push(tok);
+        if out.len() >= MAX_TOKENS {
+            break;
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -748,5 +944,39 @@ mod tests {
             "file:///C:/a/b.db?immutable=1"
         );
         assert!(to_sqlite_uri(Path::new("/tmp/a?b#c.db")).contains("%3f"));
+    }
+
+    #[test]
+    fn context_seeds_and_expands_from_task_terms() {
+        let db = open();
+        let names: Vec<String> = db
+            .context("compute the area of a circle", 25)
+            .unwrap()
+            .into_iter()
+            .map(|n| n.qualified_name)
+            .collect();
+        // FTS seeds on "area"/"circle" surface circle_area; expansion over
+        // calls edges pulls in its caller summarize.
+        assert!(names.contains(&"circle_area".to_string()), "{names:?}");
+        assert!(names.contains(&"summarize".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn context_respects_max_nodes_and_empties_gracefully() {
+        let db = open();
+        assert!(db.context("area circle", 3).unwrap().len() <= 3);
+        // A task with no matching terms yields an empty set, not an error.
+        assert!(db
+            .context("zzz nonexistent gibberish", 10)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn significant_tokens_filters_stopwords_and_shorts() {
+        let toks = significant_tokens("How does the Circle area getter work?");
+        assert!(toks.contains(&"circle".to_string()));
+        assert!(toks.contains(&"area".to_string()));
+        assert!(!toks.iter().any(|t| t == "the" || t == "how" || t == "does"));
     }
 }
