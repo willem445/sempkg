@@ -68,6 +68,11 @@ local_settings.py
 db.sqlite3
 db.sqlite3-journal
 
+# SQLite WAL/shared-memory sidecars — created transiently when the semgraph
+# reader (or any tool) opens a WAL-mode codegraph.db fixture; never commit them.
+*.db-wal
+*.db-shm
+
 # Flask stuff:
 instance/
 .webassets-cache

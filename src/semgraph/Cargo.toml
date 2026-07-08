@@ -1,0 +1,16 @@
+[package]
+name = "semgraph"
+version = "0.6.0"
+edition = "2021"
+description = "Native reader/writer for CodeGraph `codegraph.db` graph databases (schema v4), shared by sempkg (read path) and sembundle (Phase 2 write path)"
+
+[lib]
+name = "semgraph"
+path = "src/lib.rs"
+
+[dependencies]
+rusqlite  = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
