@@ -72,6 +72,13 @@ const NODE_COLUMNS: &str = "\
     n.start_line, n.end_line, n.signature, n.docstring, n.is_async";
 
 /// A node read from the `nodes` table.
+///
+/// This is a **read projection**: it carries the columns the query surfaces
+/// consume today, not the full schema-v4 node. The remaining columns
+/// (`start_column`/`end_column`, `visibility`, the `is_exported`/`is_static`/
+/// `is_abstract` flags, `decorators`, `type_parameters`, `updated_at`) — and a
+/// companion `EdgeRecord` — are added alongside the Phase 2a writer, which
+/// needs to round-trip the whole schema.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GraphNode {
     pub id: String,
@@ -107,6 +114,7 @@ pub struct GraphStatus {
 }
 
 /// A read-only handle to a CodeGraph `codegraph.db`.
+#[derive(Debug)]
 pub struct GraphDb {
     conn: Connection,
     schema_version: i64,
@@ -117,10 +125,20 @@ impl GraphDb {
     ///
     /// Returns [`Error::UnsupportedSchema`] when the database declares a schema
     /// newer than [`SUPPORTED_SCHEMA_VERSION`].
+    ///
+    /// The database is opened `immutable=1` (via a `file:` URI): bundle graphs
+    /// ship as read-only, checkpointed artifacts, so promising SQLite the file
+    /// will not change lets it read a WAL-mode DB without creating `-wal`/`-shm`
+    /// sidecars — which matters on genuinely read-only installs where creating
+    /// them would fail. (The `.gitignore` rule for the sidecars is thus only a
+    /// belt-and-suspenders backstop.)
     pub fn open(db_path: &Path) -> Result<Self> {
+        let uri = to_sqlite_uri(db_path);
         let conn = Connection::open_with_flags(
-            db_path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            &uri,
+            OpenFlags::SQLITE_OPEN_READ_ONLY
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | OpenFlags::SQLITE_OPEN_URI,
         )
         .map_err(|source| Error::Open {
             path: db_path.display().to_string(),
@@ -155,6 +173,12 @@ impl GraphDb {
     /// tolerates arbitrary user input and catches partial-token matches FTS
     /// cannot (e.g. `ircle` → `Circle`). `kind` filters to a single node kind.
     pub fn query(&self, search: &str, kind: Option<&str>, limit: usize) -> Result<Vec<GraphNode>> {
+        // Empty/whitespace-only input has no meaningful match. Short-circuit to
+        // an empty result rather than letting the `LIKE '%%'` fallback match
+        // every node in the graph.
+        if search.trim().is_empty() {
+            return Ok(Vec::new());
+        }
         let fts = self.query_fts(search, kind, limit).unwrap_or_default();
         if !fts.is_empty() {
             return Ok(fts);
@@ -404,6 +428,30 @@ fn placeholders(n: usize) -> String {
     vec!["?"; n].join(",")
 }
 
+/// Render a filesystem path as a SQLite `file:` URI so the connection can pass
+/// `?immutable=1`. Backslashes become forward slashes; Windows drive paths
+/// (`C:/…`) get the `file:///` authority form; `%`/`?`/`#` are percent-encoded
+/// so they aren't mistaken for URI query/fragment syntax.
+fn to_sqlite_uri(path: &Path) -> String {
+    let forward = path.to_string_lossy().replace('\\', "/");
+    let mut encoded = String::with_capacity(forward.len() + 8);
+    for ch in forward.chars() {
+        match ch {
+            '%' => encoded.push_str("%25"),
+            '?' => encoded.push_str("%3f"),
+            '#' => encoded.push_str("%23"),
+            _ => encoded.push(ch),
+        }
+    }
+    // Unix absolute paths already start with '/', giving file:///abs; Windows
+    // drive paths (C:/…) need the extra leading slash to reach file:///C:/….
+    if encoded.starts_with('/') {
+        format!("file://{encoded}?immutable=1")
+    } else {
+        format!("file:///{encoded}?immutable=1")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -559,5 +607,146 @@ mod tests {
         assert!(db.callers("no_such_symbol_xyz", 10).unwrap().is_empty());
         assert!(db.callees("no_such_symbol_xyz", 10).unwrap().is_empty());
         assert!(db.impact("no_such_symbol_xyz", 2, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn empty_search_short_circuits_to_no_results() {
+        // Empty/whitespace input must not fall through to `LIKE '%%'` and match
+        // every node; it returns nothing.
+        let db = open();
+        assert!(db.query("", None, 50).unwrap().is_empty());
+        assert!(db.query("   ", None, 50).unwrap().is_empty());
+        // Sanity: the same DB does return rows for a real term.
+        assert!(!db.query("Circle", None, 50).unwrap().is_empty());
+    }
+
+    // ---- Schema-guard / error-path coverage (temp DBs) --------------------
+
+    use tempfile::TempDir;
+
+    /// Create a minimal but valid schema-v4 DB with zero graph rows.
+    fn make_empty_v4_db(path: &Path) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schema_versions(version INTEGER NOT NULL, applied_at INTEGER, description TEXT);
+             INSERT INTO schema_versions(version) VALUES (4);
+             CREATE TABLE nodes(id TEXT PRIMARY KEY, kind TEXT NOT NULL, name TEXT NOT NULL, \
+                 qualified_name TEXT NOT NULL, file_path TEXT NOT NULL, language TEXT NOT NULL, \
+                 start_line INTEGER NOT NULL, end_line INTEGER NOT NULL, signature TEXT, \
+                 docstring TEXT, is_async INTEGER DEFAULT 0);
+             CREATE TABLE edges(id INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT NOT NULL, \
+                 target TEXT NOT NULL, kind TEXT NOT NULL, line INTEGER);
+             CREATE TABLE files(path TEXT PRIMARY KEY);
+             CREATE TABLE unresolved_refs(id INTEGER PRIMARY KEY AUTOINCREMENT, from_node_id TEXT);
+             CREATE TABLE project_metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             CREATE VIRTUAL TABLE nodes_fts USING fts5(id, name, qualified_name, docstring, \
+                 signature, content='nodes', content_rowid='rowid');",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn rejects_newer_schema_version_with_actionable_error() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("v5.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE schema_versions(version INTEGER NOT NULL); \
+                 INSERT INTO schema_versions(version) VALUES (4),(5);",
+            )
+            .unwrap();
+        }
+        match GraphDb::open(&path) {
+            Err(Error::UnsupportedSchema {
+                found, supported, ..
+            }) => {
+                assert_eq!(found, 5);
+                assert_eq!(supported, SUPPORTED_SCHEMA_VERSION);
+            }
+            Err(e) => panic!("expected UnsupportedSchema, got {e:?}"),
+            Ok(_) => panic!("expected UnsupportedSchema, got Ok"),
+        }
+        let msg = GraphDb::open(&path).unwrap_err().to_string();
+        assert!(msg.contains("schema version 5"), "not actionable: {msg}");
+    }
+
+    #[test]
+    fn missing_schema_versions_table_is_invalid() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("noschema.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("CREATE TABLE nodes(id TEXT);").unwrap();
+        }
+        match GraphDb::open(&path) {
+            Err(Error::Invalid { .. }) => {}
+            Err(e) => panic!("expected Invalid, got {e:?}"),
+            Ok(_) => panic!("expected Invalid, got Ok"),
+        }
+    }
+
+    #[test]
+    fn missing_file_is_open_error() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("does-not-exist.db");
+        match GraphDb::open(&path) {
+            Err(Error::Open { .. }) => {}
+            Err(e) => panic!("expected Open, got {e:?}"),
+            Ok(_) => panic!("expected Open, got Ok"),
+        }
+    }
+
+    #[test]
+    fn empty_v4_db_reads_as_empty() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("empty.db");
+        make_empty_v4_db(&path);
+        let db = GraphDb::open(&path).unwrap();
+        assert_eq!(db.schema_version(), 4);
+        assert_eq!(
+            db.status().unwrap(),
+            GraphStatus {
+                schema_version: 4,
+                file_count: 0,
+                node_count: 0,
+                edge_count: 0,
+            }
+        );
+        assert!(db.query("anything", None, 10).unwrap().is_empty());
+        assert!(db.callers("x", 10).unwrap().is_empty());
+        assert!(db.callees("x", 10).unwrap().is_empty());
+        assert!(db.impact("x", 2, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn immutable_open_creates_no_sidecars_on_wal_db() {
+        // Copy the WAL-mode fixture into a temp dir; an immutable open must read
+        // it without spawning -wal/-shm next to it.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("copy.db");
+        std::fs::copy(fixture_path(), &path).unwrap();
+        {
+            let db = GraphDb::open(&path).unwrap();
+            assert_eq!(db.status().unwrap().node_count, 55);
+            let _ = db.query("Circle", None, 5).unwrap();
+        }
+        let wal = PathBuf::from(format!("{}-wal", path.display()));
+        let shm = PathBuf::from(format!("{}-shm", path.display()));
+        assert!(!wal.exists(), "immutable open must not create -wal");
+        assert!(!shm.exists(), "immutable open must not create -shm");
+    }
+
+    #[test]
+    fn sqlite_uri_encoding_forms() {
+        assert_eq!(
+            to_sqlite_uri(Path::new("/home/u/x.db")),
+            "file:///home/u/x.db?immutable=1"
+        );
+        assert_eq!(
+            to_sqlite_uri(Path::new(r"C:\a\b.db")),
+            "file:///C:/a/b.db?immutable=1"
+        );
+        assert!(to_sqlite_uri(Path::new("/tmp/a?b#c.db")).contains("%3f"));
     }
 }

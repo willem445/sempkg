@@ -5468,6 +5468,7 @@ name = "semgraph"
 version = "0.6.0"
 dependencies = [
  "rusqlite",
+ "tempfile",
  "thiserror",
 ]
 
