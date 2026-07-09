@@ -229,3 +229,39 @@ following, all additive to the model above:
   un-inferrable receivers (field-of-external-type, chained, return-typed) that
   semgraph precisely declines — the intended tradeoff, **not** whitelisted, so the
   number stays honest rather than inflated to the ≥90 bar.
+
+## Addendum — evidence-based receiver-type inference (calls recall)
+
+A residual-sample analysis of the declined method calls showed roughly half were
+CodeGraph fabrications (correctly declined) and half were *genuine* — real calls
+whose receiver type semgraph simply didn't infer. To close that genuine half
+**without** relaxing precision, receiver typing is now resolved in two stages:
+
+- **Pass 1** (`crate::parse`) describes each method-call receiver as a
+  [`crate::resolve::RecvExpr`]: a concrete `Type` known syntactically (a typed
+  parameter/local, `self`, a `self.field`, a constructor value), or — new — the
+  **return value of a call** (`Return`/`Element`), captured as a
+  [`crate::resolve::CallRef`] (bare `f()`, qualified `T::assoc()`, or a recursive
+  method call for chains). An un-inferrable receiver carries *no* `RecvExpr` and is
+  dropped, exactly as before.
+- **Pass 2** (`crate::resolve`) types a `Return` receiver from the callee's
+  resolved *return type* (parsed from its stored `signature`, with transparent
+  wrappers `Result`/`Option`/`Promise`/`Optional`/… peeled and Rust `Self`
+  resolved to the callee's enclosing type), and an `Element` receiver (a `for x in
+  coll()` loop variable) from that return type's collection element. Every step
+  reuses the same language-scoped, ambiguity-dropping call resolution, so an
+  ambiguous or un-resolvable callee yields no type — precision stands.
+
+This covers three forms from the sample: **return-type-of-local**
+(`let db = open()?; db.query()`), **chained calls**
+(`SymbolTable::build(&n).resolve_all()`), and **typed-Python receivers**
+(parameter/variable annotations and constructor assignments), plus **for-loop
+variables** iterating a typed collection. Inference is strictly evidence-based
+(a resolved return type or annotation), never name-frequency; semgraph still emits
+**zero** fabricated calls.
+
+Measured on this repo's `src/` (live, convention-normalized): `calls` **83.4% →
+86.3%**, and the true *genuine*-calls recall (fabrications excluded from the
+denominator) **~82.6% → ~86.8%**. The remaining genuine gap is receivers with no
+static evidence — untyped Python fixture parameters and iteration over a bare
+local collection — which remain dropped rather than guessed.
