@@ -1,10 +1,49 @@
-//! Native Rust reader for a CodeGraph `codegraph.db` (SQLite, schema v4).
+//! Native Rust reader **and writer** for a CodeGraph `codegraph.db` (SQLite,
+//! schema v4).
 //!
-//! This crate owns the read path for a bundle's graph database, replacing the
-//! former shell-out to the `codegraph` CLI for query operations (issue #78,
-//! Phase 1). It is a standalone library so the read path and the future Phase 2
-//! writer (used by `sembundle`) share one definition of the schema and types.
-//! All access here is read-only and scoped to a single database file.
+//! This crate owns both the read path for a bundle's graph database — replacing
+//! the former shell-out to the `codegraph` CLI for query operations (issue #78,
+//! Phase 1) — and the native write path that produces such a database from
+//! source without any external tooling (issue #78, Phase 2a). Sharing one crate
+//! keeps a single definition of the schema and record types across both sides.
+//!
+//! ## Reader ([`GraphDb`])
+//!
+//! Read-only, scoped to a single database file: [`GraphDb::query`],
+//! [`GraphDb::callers`]/[`GraphDb::callees`], [`GraphDb::impact`],
+//! [`GraphDb::context`], [`GraphDb::status`], [`GraphDb::file_paths`].
+//!
+//! ## Writer / indexer ([`index_roots`], [`GraphWriter`], [`extract`])
+//!
+//! [`index_roots`] is the entry point: it walks one or more source roots, parses
+//! every supported file **in parallel** (rayon) with tree-sitter, extracts
+//! definition nodes and structural `contains` edges (see [`parse`]), and writes
+//! one schema-v4 database through a single-writer [`GraphWriter`] in one
+//! transaction. The result is byte-compatible with a CodeGraph-built DB — the
+//! reader above opens it unchanged.
+//!
+//! Only *definitions* and `contains` edges are produced in Phase 2a;
+//! call/reference/import **edge resolution is Phase 2b** and is deliberately not
+//! built here. The per-file symbol output ([`FileExtract`] with qualified names
+//! and stable [`node_id`]s) is exactly what a pass-2 resolver will consume.
+//!
+//! ### Multi-root indexing and file-path representation (issue #79)
+//!
+//! [`index_roots`] takes **multiple** source roots and writes **one** database —
+//! the proper fix for #79, where multiple `-s`/`--source-dir` roots used to make
+//! the last root silently overwrite the rest. Stored `file_path`s are chosen to
+//! be unambiguous across roots yet consistent with how consumers resolve paths
+//! back to disk: a single root keeps CodeGraph-relative paths (`python/main.py`);
+//! multiple roots are namespaced by the shortest distinguishing suffix of each
+//! root path. [`resolve_stored_path`] maps a stored path back to
+//! `(root, relative)` for the code-index/`read_code` cutover. See the [`index`]
+//! module docs for the full rule.
+//!
+//! ### `files.content_hash`
+//!
+//! [`content_hash`] (SHA-256 of the file bytes) is written to every `files` row
+//! and is the anchor for Phase 2b incremental sync: an unchanged file hashes the
+//! same and can be skipped on re-index.
 //!
 //! ## CodeGraph 0.9.7 quirks the reader must tolerate
 //!
@@ -27,6 +66,16 @@ use std::path::Path;
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row};
 use thiserror::Error;
+
+pub mod index;
+pub mod model;
+pub mod parse;
+pub mod writer;
+
+pub use index::{index_roots, namespaces_for_roots, resolve_stored_path, IndexOptions, IndexStats};
+pub use model::{content_hash, node_id, EdgeRecord, FileRecord, Language, NodeRecord};
+pub use parse::{extract, FileExtract};
+pub use writer::GraphWriter;
 
 /// The maximum `schema_versions.version` this reader understands.
 ///
