@@ -55,7 +55,28 @@ pub(super) fn spec() -> LangSpec {
         extract_field: None,
         call_payload,
         bare_call: None,
+        inheritance: Some(inheritance),
+        type_refs: None,
     }
+}
+
+/// Scala inheritance: CodeGraph 0.9.7 records ONLY the primary parent — the first
+/// type after `extends` — as an `extends` edge (whether it is a class or a
+/// trait). The `with Trait` mixins that follow produce NO edge, and Scala never
+/// emits `implements`. No Scala type references.
+fn inheritance(node: Node, src: &str) -> Vec<super::InheritSite> {
+    use super::{InheritEdge, InheritSite};
+    let Some(ec) = node.child_by_field_name("extend") else {
+        return Vec::new();
+    };
+    // The first `type` field is the primary parent; `with` mixins are ignored.
+    let Some(first) = ec.child_by_field_name("type") else {
+        return Vec::new();
+    };
+    let t = text(first, src);
+    let name = t.rsplit('.').next().unwrap_or(t);
+    let name = name.split(['[', '<']).next().unwrap_or(name);
+    vec![InheritSite::at(name, first, InheritEdge::Extends)]
 }
 
 fn text<'a>(node: Node, src: &'a str) -> &'a str {

@@ -21,7 +21,9 @@ data class Point(val x: Scalar, val y: Scalar) {
     }
 }
 
-class Circle(val radius: Scalar) : Shape {
+abstract class Base(val tag: Scalar)
+
+class Circle(val radius: Scalar) : Base(radius), Shape {
     override fun area(): Scalar {
         return circleArea(radius)
     }

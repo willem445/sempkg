@@ -55,7 +55,57 @@ pub(super) fn spec() -> LangSpec {
         extract_field: Some(extract_field),
         call_payload,
         bare_call: None,
+        inheritance: Some(inheritance),
+        type_refs: None,
     }
+}
+
+/// PHP inheritance: `extends Base` (a `base_clause`) → `extends`; `implements I`
+/// (a `class_interface_clause`) → `implements`; and `use SomeTrait;` inside the
+/// class body (a `use_declaration`) → `implements` (CodeGraph 0.9.7 records a
+/// trait use as an `implements` edge to the trait). No type references in PHP.
+fn inheritance(node: Node, src: &str) -> Vec<super::InheritSite> {
+    use super::{named_children_of, InheritEdge, InheritSite};
+    let name_of = |n: Node| {
+        let t = text(n, src);
+        t.rsplit('\\').next().unwrap_or(t).to_string()
+    };
+    let mut out = Vec::new();
+    for ch in named_children_of(node) {
+        match ch.kind() {
+            "base_clause" => {
+                for n in class_names(ch) {
+                    out.push(InheritSite::at(&name_of(n), n, InheritEdge::Extends));
+                }
+            }
+            "class_interface_clause" => {
+                for n in class_names(ch) {
+                    out.push(InheritSite::at(&name_of(n), n, InheritEdge::Implements));
+                }
+            }
+            "declaration_list" => {
+                for d in named_children_of(ch) {
+                    if d.kind() == "use_declaration" {
+                        // CodeGraph anchors a trait-use `implements` edge at the
+                        // `use` statement itself, not at the trait name.
+                        for n in class_names(d) {
+                            out.push(InheritSite::at(&name_of(n), d, InheritEdge::Implements));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// The `name`/`qualified_name` type children of an inheritance clause.
+fn class_names(node: Node) -> Vec<Node> {
+    super::named_children_of(node)
+        .into_iter()
+        .filter(|c| matches!(c.kind(), "name" | "qualified_name"))
+        .collect()
 }
 
 fn text<'a>(node: Node, src: &'a str) -> &'a str {

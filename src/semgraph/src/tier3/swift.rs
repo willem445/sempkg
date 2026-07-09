@@ -55,7 +55,55 @@ pub(super) fn spec() -> LangSpec {
         extract_field: None,
         call_payload,
         bare_call: None,
+        inheritance: Some(inheritance),
+        type_refs: Some(type_refs),
     }
+}
+
+/// Swift inheritance from the `inheritance_specifier` clauses (`class C: Base,
+/// Proto`). Swift has no syntactic superclass-vs-protocol marker, so each base is
+/// [`InheritEdge::Auto`]: the resolver classifies a target `interface` (protocol)
+/// as `implements` and a class base as `extends`. Structs (parsed as
+/// `class_declaration`) conforming to a protocol likewise resolve to `implements`.
+fn inheritance(node: Node, src: &str) -> Vec<super::InheritSite> {
+    use super::{named_children_of, InheritEdge, InheritSite};
+    let mut out = Vec::new();
+    for ch in named_children_of(node) {
+        if ch.kind() != "inheritance_specifier" {
+            continue;
+        }
+        let ut = ch
+            .child_by_field_name("inherits_from")
+            .or_else(|| ch.named_child(0));
+        if let Some(id) = ut.and_then(type_id) {
+            out.push(InheritSite::at(text(id, src), id, InheritEdge::Auto));
+        }
+    }
+    out
+}
+
+/// Swift type references: CodeGraph 0.9.7 records ONLY the *return* type of a
+/// function/method (not parameter types). The return type is the `user_type`
+/// that is a direct child of `function_declaration`; parameter types are nested
+/// inside `parameter` nodes and are not referenced.
+fn type_refs(node: Node, src: &str) -> Vec<super::TypeRefSite> {
+    use super::{named_children_of, TypeRefSite};
+    let mut out = Vec::new();
+    for ch in named_children_of(node) {
+        if ch.kind() == "user_type" {
+            if let Some(id) = type_id(ch) {
+                out.push(TypeRefSite::at(text(id, src), id));
+            }
+        }
+    }
+    out
+}
+
+/// The `type_identifier` leaf of a Swift `user_type`.
+fn type_id(ut: Node) -> Option<Node> {
+    named_children_of(ut)
+        .into_iter()
+        .find(|n| n.kind() == "type_identifier")
 }
 
 fn text<'a>(node: Node, src: &'a str) -> &'a str {

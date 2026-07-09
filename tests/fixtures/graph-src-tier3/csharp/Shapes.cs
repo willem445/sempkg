@@ -24,7 +24,12 @@ namespace App.Geo
         public double Y;
     }
 
-    public class Circle : IShape
+    public abstract class Base
+    {
+        public double Tag;
+    }
+
+    public class Circle : Base, IShape
     {
         public double Radius { get; set; }
 
@@ -39,6 +44,15 @@ namespace App.Geo
         public double Area()
         {
             return MathUtil.CircleArea(Radius);
+        }
+
+        // A method whose signature references user types → `references` edges to
+        // Base (return) and Base (parameter). Base is abstract with no declared
+        // constructor, so unlike a `Circle` return there is no type-name→
+        // constructor collision to resolve.
+        public Base Merge(Base other)
+        {
+            return other;
         }
     }
 

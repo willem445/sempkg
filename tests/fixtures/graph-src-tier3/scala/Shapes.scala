@@ -21,6 +21,14 @@ class Circle(val radius: Scalar) extends Shape {
   }
 }
 
+abstract class Base(val tag: Scalar)
+
+// The primary parent after `extends` (Base) is the only `extends` edge; the
+// `with Shape` mixin produces no edge, matching CodeGraph 0.9.7.
+class Ring(val r: Scalar) extends Base(r) with Shape {
+  def area(): Scalar = r
+}
+
 object Registry {
   def count(): Int = 0
 }

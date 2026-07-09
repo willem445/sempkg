@@ -19,7 +19,11 @@ trait Named {
     }
 }
 
-class Circle implements Shape {
+abstract class Base {
+    public float $tag = 0.0;
+}
+
+class Circle extends Base implements Shape {
     use Named;
 
     public float $radius;
