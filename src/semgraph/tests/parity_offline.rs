@@ -57,7 +57,7 @@ fn fixture_clears_acceptance_thresholds() {
     // gating on the issue's actual thresholds.
     assert!(
         report.passes(95.0, 90.0),
-        "fixture must clear ≥95% nodes / ≥90% calls; got nodes={:.2}% calls={:.2}%",
+        "fixture must clear ≥95% nodes / ≥90% calls; got nodes={:.2}% calls={:?}",
         report.node_match_pct(),
         report.calls_match_pct()
     );
@@ -68,8 +68,13 @@ fn fixture_clears_acceptance_thresholds() {
     );
     assert_eq!(
         report.calls_match_pct(),
-        100.0,
+        Some(100.0),
         "fixture calls parity is exact"
+    );
+    // The fixture aligns exactly, so there are no reconvention pairs to normalize.
+    assert_eq!(
+        report.node_total.reconvention, 0,
+        "fixture qns align; no reconvention expected"
     );
 }
 
@@ -172,7 +177,7 @@ fn without_whitelist_the_known_better_deltas_still_do_not_break_node_or_calls_re
         &CompareOptions::default(),
     );
     assert_eq!(report.node_match_pct(), 100.0);
-    assert_eq!(report.calls_match_pct(), 100.0);
+    assert_eq!(report.calls_match_pct(), Some(100.0));
     // But references now show an (un-whitelisted) deficit of 5.
     let refs = report
         .edges_by_kind

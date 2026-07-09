@@ -5,22 +5,26 @@
     "A whitelisted diff is reported separately and does NOT count as a parity",
     "failure. Every entry carries a justification. Do not add an entry to paper",
     "over a genuine regression — only for a documented, intentional improvement.",
-    "Fields: node_attrs[].attr in {is_async,docstring,signature,line_range};",
-    "edges[].side in {missing,extra}; nodes[].side in {missing,extra}.",
-    "qualified_name/file/source/target accept a simple glob where '*' matches any run."
+    "Fields: node_attrs[].attr in {is_async,docstring,signature,line_range} with a",
+    "REQUIRED direction so only the documented-better side is forgiven; edges[].side",
+    "in {missing,extra}; nodes[].side in {missing,extra}. qualified_name/file/source/",
+    "target accept a simple glob where '*' matches any run. node_attrs[].direction in",
+    "{semgraph_true,semgraph_false,semgraph_nonempty,codegraph_empty}."
   ],
   "node_attrs": [
     {
       "attr": "is_async",
       "qualified_name": "*",
       "file": "*",
-      "justification": "ADR-003: semgraph sets is_async correctly for EVERY language (Rust async fn, Python async def), whereas CodeGraph 0.9.7 flags only TypeScript. Where our is_async differs it is authoritative and better; is_async is not part of the node match key, so this never affects the node match percentage."
+      "direction": "semgraph_true",
+      "justification": "ADR-003: semgraph sets is_async correctly for EVERY language (Rust async fn, Python async def), whereas CodeGraph 0.9.7 flags only TypeScript. Only the better direction is forgiven (semgraph=true where CodeGraph=false); a semgraph regression that DROPS is_async (semgraph=false, CodeGraph=true) is NOT whitelisted and counts as a delta. is_async is not part of the node match key, so this never affects the node match percentage."
     },
     {
       "attr": "docstring",
       "qualified_name": "*",
       "file": "*",
-      "justification": "ADR-003: semgraph captures clean, complete docstrings (Rust /// doc comments, TS/JS block comments) where CodeGraph 0.9.7 leaves Python NULL, keeps a stray leading '/'/'!' on Rust doc comments, bleeds a module //! header into the first definition, and misses export-wrapped TS declarations."
+      "direction": "semgraph_nonempty",
+      "justification": "ADR-003: semgraph captures clean, complete docstrings (Rust /// doc comments, TS/JS block comments) where CodeGraph 0.9.7 leaves Python NULL, keeps a stray leading '/'/'!' on Rust doc comments, bleeds a module //! header into the first definition, and misses export-wrapped TS declarations. Only forgiven when semgraph's docstring is non-empty (we kept/added it); if semgraph DROPS a docstring CodeGraph had, that is a regression and counts."
     }
   ],
   "edges": [

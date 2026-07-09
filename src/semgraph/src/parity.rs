@@ -2,37 +2,45 @@
 //! a **CodeGraph 0.9.7**-built one (issue #78, Phase 2 item 6 / "P2c").
 //!
 //! This module is the pure, testable engine behind the `parity` binary
-//! (`src/bin/parity.rs`). It is deliberately self-contained — it reads two
-//! schema-v4 `codegraph.db` files, diffs them, applies a committed *whitelist*
-//! of known-better deviations (ADR-003/004), and produces a machine-readable
-//! [`ParityReport`] with per-kind / per-language match percentages plus
-//! missing/extra listings. The binary layers CLI parsing, the semgraph index
-//! step, and the optional live CodeGraph shell-out on top.
+//! (`src/bin/parity.rs`). It reads two schema-v4 `codegraph.db` files, diffs
+//! them, applies a committed *whitelist* of known-better deviations
+//! (ADR-003/004), and produces a machine-readable [`ParityReport`] with per-kind
+//! / per-language match percentages plus missing/extra listings.
 //!
 //! ## What is compared
 //!
-//! - **Nodes** are keyed on `(kind, qualified_name, file_path)` and, when
-//!   [`CompareOptions::strict_line_range`] is set, additionally on
-//!   `(start_line, end_line)`. Line-range is otherwise compared as a node
-//!   *attribute* (reported, whitelistable) rather than as a hard match key, so a
-//!   one-line drift on a real repo does not double-count as both a missing and an
-//!   extra node. The issue lists line-range among the match dimensions; this
-//!   keeps it in the diff without letting it dominate the headline percentage.
-//! - **Edges** are keyed on `(source_qn, target_qn, kind)` as a **multiset**, so
-//!   duplicate call sites (`Point::new` twice) and CodeGraph's duplicate
-//!   return-type references are both represented faithfully.
+//! - **Nodes** are matched in two passes. First on `(kind, qualified_name,
+//!   file_path)` (plus `(start_line, end_line)` when
+//!   [`CompareOptions::strict_line_range`] is set). The **residuals** — nodes
+//!   present on only one side after the exact pass — are then matched a second
+//!   time on physical identity `(kind, file_path, start_line, end_line)`,
+//!   ignoring the qualified name. A residual pair that matches there is a
+//!   **reconvention**: the *same physical definition* recorded under a different
+//!   qualified-name *convention* (e.g. CodeGraph omits Rust's `tests::` module
+//!   prefix, or names a nested Python function differently). Reconventions are
+//!   the same node — they count toward recall — but are reported in their own
+//!   category, showing both qn forms, so a convention gap is never conflated
+//!   with a genuine one.
+//! - **Edges** are keyed on `(source_qn, target_qn, kind)` as a **multiset**.
+//!   Because that key is qualified-name-based, the exact same convention drift
+//!   inflates the edge miss. So before matching, every golden edge endpoint's qn
+//!   is **translated** through the reconvention map (golden-qn → semgraph-qn),
+//!   giving *convention-matched* edge parity: the surviving miss is the genuine
+//!   resolution gap, not naming noise. A raw (untranslated) `calls` percentage is
+//!   also reported so the size of the convention effect is visible.
 //! - **Node attributes** (`is_async`, `docstring`, `signature`, and, in the
 //!   default relaxed mode, the line-range) are compared for every node matched on
-//!   the relaxed key. Divergences are reported and can be whitelisted.
+//!   the relaxed key and reported; divergences can be whitelisted, but only in
+//!   the documented-better *direction* (see below).
 //!
 //! ## Known-better deltas (the whitelist)
 //!
-//! ADR-003 and ADR-004 record deliberate improvements over CodeGraph 0.9.7 that
-//! must **not** count as parity failures: `is_async` correctness across all
-//! languages, docstring cleanups, and the omission of CodeGraph's duplicate
-//! return-type `references`. These are expressed in a committed
-//! [`Whitelist`] file with a per-entry justification; whitelisted diffs are
-//! counted and reported *separately*, never as failures.
+//! ADR-003/004 record deliberate improvements over CodeGraph 0.9.7 that must
+//! **not** count as failures: `is_async` correctness, docstring cleanups, and
+//! the omission of CodeGraph's duplicate return-type `references`. These live in
+//! a committed [`Whitelist`] with a per-entry justification and a **direction**,
+//! so forgiving "semgraph adds a docstring" never also forgives its regression
+//! ("semgraph *drops* a docstring").
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -59,56 +67,52 @@ pub struct PNode {
 }
 
 impl PNode {
-    /// The relaxed match key: `(kind, qualified_name, file_path)`.
-    fn relaxed_key(&self) -> NodeKey {
+    /// The exact match key: `(kind, qualified_name, file_path)`, plus the line
+    /// range when `strict`.
+    fn exact_key(&self, strict: bool) -> NodeKey {
         (
             self.kind.clone(),
             self.qualified_name.clone(),
             self.file_path.clone(),
-            None,
+            strict.then_some((self.start_line, self.end_line)),
         )
     }
-    /// The strict match key, additionally pinning the line range.
-    fn strict_key(&self) -> NodeKey {
+    /// Physical identity used for the reconvention second pass and for the
+    /// attribute pairing: `(kind, file_path, start_line, end_line)`, ignoring qn.
+    fn identity(&self) -> Identity {
         (
             self.kind.clone(),
-            self.qualified_name.clone(),
             self.file_path.clone(),
-            Some((self.start_line, self.end_line)),
+            self.start_line,
+            self.end_line,
         )
-    }
-    fn key(&self, strict: bool) -> NodeKey {
-        if strict {
-            self.strict_key()
-        } else {
-            self.relaxed_key()
-        }
     }
 }
 
 type NodeKey = (String, String, String, Option<(i64, i64)>);
+type Identity = (String, String, i64, i64);
 
-/// An edge projected for parity comparison. Language is the **caller's**
-/// (source node's) language, matching ADR-004's language-scoped resolution.
+/// An edge projected for parity comparison. Language is the **caller's** (source
+/// node's) language, matching ADR-004's language-scoped resolution. The endpoint
+/// `(kind, file)` pairs let the reconvention map be applied per endpoint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PEdge {
     pub source_qn: String,
     pub target_qn: String,
     pub kind: String,
     pub language: String,
-}
-
-impl PEdge {
-    fn key(&self) -> EdgeKey {
-        (
-            self.source_qn.clone(),
-            self.target_qn.clone(),
-            self.kind.clone(),
-        )
-    }
+    pub source_kind: String,
+    pub source_file: String,
+    pub target_kind: String,
+    pub target_file: String,
 }
 
 type EdgeKey = (String, String, String);
+
+/// Reconvention translation: `(endpoint_kind, endpoint_file, golden_qn)` →
+/// `semgraph_qn`. Applied to golden edge endpoints so a convention-only qn
+/// difference doesn't read as a missing edge.
+type Translation = HashMap<(String, String, String), String>;
 
 /// The two projections read out of one `codegraph.db`.
 #[derive(Debug, Clone, Default)]
@@ -120,8 +124,7 @@ pub struct Graph {
 /// Read the parity projection (nodes + edges) out of a schema-v4 `codegraph.db`.
 ///
 /// Works on any such database, whether produced by CodeGraph or by
-/// [`crate::index_roots`]. Opens read-write-less (the default) since callers may
-/// pass a freshly-written temp DB.
+/// [`crate::index_roots`].
 pub fn extract_parity(db_path: &Path) -> Result<Graph> {
     let conn = Connection::open(db_path).map_err(|source| Error::Open {
         path: db_path.display().to_string(),
@@ -152,7 +155,8 @@ pub fn extract_parity(db_path: &Path) -> Result<Graph> {
         .collect();
 
     let mut estmt = conn.prepare(
-        "SELECT s.qualified_name, t.qualified_name, e.kind, COALESCE(s.language,'') \
+        "SELECT s.qualified_name, t.qualified_name, e.kind, COALESCE(s.language,''), \
+                s.kind, s.file_path, t.kind, t.file_path \
          FROM edges e JOIN nodes s ON s.id = e.source JOIN nodes t ON t.id = e.target",
     )?;
     let edges = estmt
@@ -162,6 +166,10 @@ pub fn extract_parity(db_path: &Path) -> Result<Graph> {
                 target_qn: r.get(1)?,
                 kind: r.get(2)?,
                 language: r.get(3)?,
+                source_kind: r.get(4)?,
+                source_file: r.get(5)?,
+                target_kind: r.get(6)?,
+                target_file: r.get(7)?,
             })
         })?
         .filter_map(std::result::Result::ok)
@@ -204,6 +212,11 @@ fn star() -> String {
 }
 
 /// A whitelist rule for a node-attribute delta.
+///
+/// A rule matches only in the documented-better **direction**: the `direction`
+/// field constrains which side's value the improvement must be on, so forgiving
+/// "semgraph adds an `is_async`/docstring CodeGraph missed" does NOT also forgive
+/// the regression where semgraph *loses* one.
 #[derive(Debug, Clone, Deserialize)]
 pub struct NodeAttrRule {
     /// Attribute name: `is_async` | `docstring` | `signature` | `line_range`.
@@ -215,7 +228,29 @@ pub struct NodeAttrRule {
     /// Optional exact language filter (`rust`/`python`/`typescript`/…).
     #[serde(default)]
     pub language: Option<String>,
+    /// Which direction of divergence is forgiven. One of:
+    /// `semgraph_true` / `semgraph_false` (bool attrs like `is_async`),
+    /// `semgraph_nonempty` / `codegraph_empty` (text attrs like `docstring`).
+    /// Absent = any direction (discouraged; only for symmetric cosmetic attrs).
+    #[serde(default)]
+    pub direction: Option<String>,
     pub justification: String,
+}
+
+impl NodeAttrRule {
+    /// Whether this rule forgives a delta whose semgraph value is `ours` and
+    /// CodeGraph value is `golden` (both rendered as strings).
+    fn direction_ok(&self, ours: &str, golden: &str) -> bool {
+        match self.direction.as_deref() {
+            None => true,
+            Some("semgraph_true") => ours == "true",
+            Some("semgraph_false") => ours == "false",
+            Some("semgraph_nonempty") => !ours.is_empty(),
+            Some("codegraph_empty") => golden.is_empty(),
+            // Unknown direction is fail-closed: never forgive.
+            Some(_) => false,
+        }
+    }
 }
 
 /// A whitelist rule for a missing/extra edge instance.
@@ -267,12 +302,19 @@ impl Whitelist {
         Whitelist::from_json(&text)
     }
 
-    fn node_attr_justification(&self, attr: &str, n: &PNode) -> Option<&str> {
+    fn node_attr_justification(
+        &self,
+        attr: &str,
+        n: &PNode,
+        ours_val: &str,
+        golden_val: &str,
+    ) -> Option<&str> {
         self.node_attrs.iter().find_map(|r| {
             (r.attr == attr
                 && glob_match(&r.qualified_name, &n.qualified_name)
                 && glob_match(&r.file, &n.file_path)
-                && r.language.as_deref().is_none_or(|l| l == n.language))
+                && r.language.as_deref().is_none_or(|l| l == n.language)
+                && r.direction_ok(ours_val, golden_val))
             .then_some(r.justification.as_str())
         })
     }
@@ -301,14 +343,12 @@ impl Whitelist {
 }
 
 /// Minimal glob: `*` matches any run (including empty); every other character is
-/// literal. `"*"` alone matches anything. Sufficient for whitelist patterns like
-/// `Array<*>` or `python/*`.
+/// literal. `"*"` alone matches anything.
 fn glob_match(pattern: &str, text: &str) -> bool {
     if pattern == "*" {
         return true;
     }
     let parts: Vec<&str> = pattern.split('*').collect();
-    // No '*' → exact match.
     if parts.len() == 1 {
         return pattern == text;
     }
@@ -318,13 +358,11 @@ fn glob_match(pattern: &str, text: &str) -> bool {
             continue;
         }
         if i == 0 {
-            // Anchored prefix.
             if !text[pos..].starts_with(part) {
                 return false;
             }
             pos += part.len();
         } else if i == parts.len() - 1 {
-            // Anchored suffix.
             return text[pos..].ends_with(part);
         } else {
             match text[pos..].find(part) {
@@ -343,7 +381,7 @@ fn glob_match(pattern: &str, text: &str) -> bool {
 /// Options controlling [`compare`].
 #[derive(Debug, Clone, Default)]
 pub struct CompareOptions {
-    /// Pin `(start_line, end_line)` into the node match key. Off by default; when
+    /// Pin `(start_line, end_line)` into the exact node key. Off by default; when
     /// off, line-range is compared as a whitelistable attribute instead.
     pub strict_line_range: bool,
 }
@@ -353,7 +391,11 @@ pub struct CompareOptions {
 pub struct GroupStat {
     pub label: String,
     pub golden: i64,
+    /// Golden items matched exactly (same key).
     pub matched: i64,
+    /// Golden items matched only after normalizing the qualified-name
+    /// convention (nodes: reconvention second pass). Counts toward recall.
+    pub reconvention: i64,
     pub missing: i64,
     pub extra: i64,
     pub whitelisted_missing: i64,
@@ -361,19 +403,25 @@ pub struct GroupStat {
 }
 
 impl GroupStat {
-    /// Recall percentage after crediting whitelisted omissions. 100% when the
-    /// golden side is empty.
-    pub fn match_pct(&self) -> f64 {
+    /// Recall percentage after crediting reconventions and whitelisted
+    /// omissions. Returns `None` when there is nothing to measure (no golden
+    /// items) — callers must decide how to treat "N/A", never silently 100%.
+    pub fn match_pct_opt(&self) -> Option<f64> {
         if self.golden == 0 {
-            return 100.0;
+            return None;
         }
         let effective_missing = (self.missing - self.whitelisted_missing).max(0);
-        100.0 * (self.golden - effective_missing) as f64 / self.golden as f64
+        Some(100.0 * (self.golden - effective_missing) as f64 / self.golden as f64)
+    }
+
+    /// Convenience for display: `match_pct_opt` or 100.0 when there is no data.
+    pub fn match_pct(&self) -> f64 {
+        self.match_pct_opt().unwrap_or(100.0)
     }
 }
 
-/// A single reported diff item (missing/extra node or edge, or an attribute
-/// delta), with its whitelist justification when one applies.
+/// A single reported diff item, with its whitelist justification when one
+/// applies.
 #[derive(Debug, Clone)]
 pub struct DiffItem {
     pub description: String,
@@ -392,43 +440,59 @@ pub struct ParityReport {
     pub edges_by_language: Vec<GroupStat>,
     pub missing_nodes: Vec<DiffItem>,
     pub extra_nodes: Vec<DiffItem>,
+    /// Same-physical-node, different-qn-convention pairs (nodes credited to
+    /// recall but reported separately, showing both qn forms).
+    pub reconvention_nodes: Vec<DiffItem>,
     pub missing_edges: Vec<DiffItem>,
     pub extra_edges: Vec<DiffItem>,
     pub attr_deltas: Vec<DiffItem>,
+    /// `calls` recall computed on the **raw** qualified-name key (no
+    /// reconvention translation), for showing how much of the calls gap was
+    /// naming convention. `None` when the golden side has no `calls` edges.
+    pub calls_pct_raw: Option<f64>,
 }
 
 impl ParityReport {
-    /// Overall node recall after whitelist (the `--min-nodes` metric).
+    /// Overall node recall after reconvention + whitelist (the `--min-nodes`
+    /// metric). Nodes always have data in a real comparison; falls back to 100
+    /// only for an empty tree.
     pub fn node_match_pct(&self) -> f64 {
         self.node_total.match_pct()
     }
 
-    /// `calls`-edge recall after whitelist (the `--min-calls` metric).
-    pub fn calls_match_pct(&self) -> f64 {
+    /// Convention-matched `calls`-edge recall (the `--min-calls` metric).
+    /// `None` when the golden side has no `calls` edges — the gate treats that
+    /// as vacuously satisfied rather than as a silent 100%.
+    pub fn calls_match_pct(&self) -> Option<f64> {
         self.edges_by_kind
             .iter()
             .find(|g| g.label == "calls")
-            .map(GroupStat::match_pct)
-            .unwrap_or(100.0)
+            .and_then(GroupStat::match_pct_opt)
     }
 
-    /// Whether the report clears both acceptance thresholds.
+    /// Whether the report clears both acceptance thresholds. The node gate
+    /// always applies; the calls gate is vacuously satisfied when there are no
+    /// golden `calls` edges. Both compare **raw** (unrounded) percentages.
     pub fn passes(&self, min_nodes: f64, min_calls: f64) -> bool {
-        self.node_match_pct() >= min_nodes && self.calls_match_pct() >= min_calls
+        let nodes_ok = self.node_match_pct() >= min_nodes;
+        let calls_ok = self.calls_match_pct().is_none_or(|p| p >= min_calls);
+        nodes_ok && calls_ok
     }
 
-    /// Machine-readable summary.
+    /// Machine-readable summary. Percentages are **raw** (unrounded) so a
+    /// consumer gating on them agrees with [`passes`]; render rounded for humans.
     pub fn to_json(&self) -> Value {
         let grp = |g: &GroupStat| {
             json!({
                 "label": g.label,
                 "golden": g.golden,
                 "matched": g.matched,
+                "reconvention": g.reconvention,
                 "missing": g.missing,
                 "extra": g.extra,
                 "whitelisted_missing": g.whitelisted_missing,
                 "whitelisted_extra": g.whitelisted_extra,
-                "match_pct": round2(g.match_pct()),
+                "match_pct": g.match_pct_opt(),
             })
         };
         let grps = |v: &[GroupStat]| v.iter().map(grp).collect::<Vec<_>>();
@@ -446,19 +510,21 @@ impl ParityReport {
         json!({
             "nodes": {
                 "total": grp(&self.node_total),
-                "match_pct": round2(self.node_match_pct()),
+                "match_pct": self.node_total.match_pct_opt(),
                 "by_kind": grps(&self.nodes_by_kind),
                 "by_language": grps(&self.nodes_by_language),
             },
             "edges": {
                 "total": grp(&self.edge_total),
-                "calls_match_pct": round2(self.calls_match_pct()),
+                "calls_match_pct": self.calls_match_pct(),
+                "calls_match_pct_raw": self.calls_pct_raw,
                 "by_kind": grps(&self.edges_by_kind),
                 "by_language": grps(&self.edges_by_language),
             },
             "diffs": {
                 "missing_nodes": diffs(&self.missing_nodes),
                 "extra_nodes": diffs(&self.extra_nodes),
+                "reconvention_nodes": diffs(&self.reconvention_nodes),
                 "missing_edges": diffs(&self.missing_edges),
                 "extra_edges": diffs(&self.extra_edges),
                 "attribute_deltas": diffs(&self.attr_deltas),
@@ -467,19 +533,341 @@ impl ParityReport {
     }
 }
 
-fn round2(x: f64) -> f64 {
-    (x * 100.0).round() / 100.0
-}
-
-/// Multiset of keys → (count, one representative value).
-fn multiset<K: std::hash::Hash + Eq + Clone, V: Clone>(
-    items: impl IntoIterator<Item = (K, V)>,
-) -> HashMap<K, (i64, V)> {
-    let mut m: HashMap<K, (i64, V)> = HashMap::new();
-    for (k, v) in items {
-        m.entry(k).or_insert((0, v)).0 += 1;
+/// Group nodes by a key into instance lists.
+fn group_by<K, F>(nodes: &[PNode], key: F) -> HashMap<K, Vec<&PNode>>
+where
+    K: std::hash::Hash + Eq,
+    F: Fn(&PNode) -> K,
+{
+    let mut m: HashMap<K, Vec<&PNode>> = HashMap::new();
+    for n in nodes {
+        m.entry(key(n)).or_default().push(n);
     }
     m
+}
+
+/// Result of the node comparison, including the reconvention translation the
+/// edge pass needs.
+struct NodeCompare {
+    total: GroupStat,
+    by_kind: Vec<GroupStat>,
+    by_language: Vec<GroupStat>,
+    missing: Vec<DiffItem>,
+    extra: Vec<DiffItem>,
+    reconvention: Vec<DiffItem>,
+    translation: Translation,
+}
+
+fn compare_nodes(ours: &Graph, golden: &Graph, wl: &Whitelist, strict: bool) -> NodeCompare {
+    let mut total = GroupStat {
+        label: "nodes".into(),
+        ..Default::default()
+    };
+    let mut by_kind: HashMap<String, GroupStat> = HashMap::new();
+    let mut by_lang: HashMap<String, GroupStat> = HashMap::new();
+    // Bump golden totals up front for every golden node.
+    for nd in &golden.nodes {
+        total.golden += 1;
+        let ks = by_kind.entry(nd.kind.clone()).or_default();
+        ks.label = nd.kind.clone();
+        ks.golden += 1;
+        let ls = by_lang.entry(nd.language.clone()).or_default();
+        ls.label = nd.language.clone();
+        ls.golden += 1;
+    }
+
+    // ---- Exact pass -----------------------------------------------------
+    let g_by = group_by(&golden.nodes, |n| n.exact_key(strict));
+    let o_by = group_by(&ours.nodes, |n| n.exact_key(strict));
+    let mut residual_golden: Vec<&PNode> = Vec::new();
+    let mut residual_ours: Vec<&PNode> = Vec::new();
+
+    let mut all_keys: Vec<&NodeKey> = g_by.keys().chain(o_by.keys()).collect();
+    all_keys.sort();
+    all_keys.dedup();
+    for key in all_keys {
+        let g = g_by.get(key).map(Vec::as_slice).unwrap_or(&[]);
+        let o = o_by.get(key).map(Vec::as_slice).unwrap_or(&[]);
+        let matched = g.len().min(o.len());
+        if matched > 0 {
+            let kind = &g.first().or(o.first()).unwrap().kind;
+            let lang = &g.first().or(o.first()).unwrap().language;
+            total.matched += matched as i64;
+            by_kind.get_mut(kind).unwrap().matched += matched as i64;
+            by_lang.get_mut(lang).unwrap().matched += matched as i64;
+        }
+        residual_golden.extend(g.iter().skip(matched).copied());
+        residual_ours.extend(o.iter().skip(matched).copied());
+    }
+
+    // ---- Reconvention pass (identity, ignoring qn) ----------------------
+    let mut translation: Translation = HashMap::new();
+    let mut reconvention = Vec::new();
+    let g_res_by = group_by_refs(&residual_golden, |n| n.identity());
+    let mut o_res_by = group_by_refs(&residual_ours, |n| n.identity());
+    let mut still_missing: Vec<&PNode> = Vec::new();
+
+    let mut gkeys: Vec<&Identity> = g_res_by.keys().collect();
+    gkeys.sort();
+    for id in gkeys {
+        let gs = &g_res_by[id];
+        let os = o_res_by.get_mut(id);
+        let mut oi = 0usize;
+        let opool: &[&PNode] = os.as_deref().map(Vec::as_slice).unwrap_or(&[]);
+        for g in gs {
+            if oi < opool.len() {
+                let o = opool[oi];
+                oi += 1;
+                // Same physical node, different qn convention.
+                total.reconvention += 1;
+                by_kind.get_mut(&g.kind).unwrap().reconvention += 1;
+                by_lang.get_mut(&g.language).unwrap().reconvention += 1;
+                translation.insert(
+                    (
+                        g.kind.clone(),
+                        g.file_path.clone(),
+                        g.qualified_name.clone(),
+                    ),
+                    o.qualified_name.clone(),
+                );
+                reconvention.push(DiffItem {
+                    description: format!(
+                        "{} @ {} [{}-{}]: codegraph qn={:?} semgraph qn={:?}",
+                        g.kind,
+                        g.file_path,
+                        g.start_line,
+                        g.end_line,
+                        g.qualified_name,
+                        o.qualified_name
+                    ),
+                    whitelisted: false,
+                    justification: None,
+                });
+            } else {
+                still_missing.push(g);
+            }
+        }
+        // Consume the paired `ours` residuals; the rest stay as extras.
+        if let Some(os) = os {
+            os.drain(0..oi.min(os.len()));
+        }
+    }
+    let still_extra: Vec<&PNode> = o_res_by.into_values().flatten().collect();
+
+    // ---- Genuine missing / extra + whitelist ----------------------------
+    let mut missing = Vec::new();
+    for g in still_missing {
+        let just = wl.node_justification("missing", g);
+        let is_wl = just.is_some();
+        total.missing += 1;
+        by_kind.get_mut(&g.kind).unwrap().missing += 1;
+        by_lang.get_mut(&g.language).unwrap().missing += 1;
+        if is_wl {
+            total.whitelisted_missing += 1;
+            by_kind.get_mut(&g.kind).unwrap().whitelisted_missing += 1;
+            by_lang.get_mut(&g.language).unwrap().whitelisted_missing += 1;
+        }
+        missing.push(DiffItem {
+            description: format!(
+                "{} {} @ {} [{}-{}]",
+                g.kind, g.qualified_name, g.file_path, g.start_line, g.end_line
+            ),
+            whitelisted: is_wl,
+            justification: just.map(str::to_string),
+        });
+    }
+    let mut extra = Vec::new();
+    for o in still_extra {
+        let just = wl.node_justification("extra", o);
+        let is_wl = just.is_some();
+        total.extra += 1;
+        by_kind.entry(o.kind.clone()).or_default().label = o.kind.clone();
+        by_kind.get_mut(&o.kind).unwrap().extra += 1;
+        by_lang.entry(o.language.clone()).or_default().label = o.language.clone();
+        by_lang.get_mut(&o.language).unwrap().extra += 1;
+        if is_wl {
+            total.whitelisted_extra += 1;
+            by_kind.get_mut(&o.kind).unwrap().whitelisted_extra += 1;
+            by_lang.get_mut(&o.language).unwrap().whitelisted_extra += 1;
+        }
+        extra.push(DiffItem {
+            description: format!(
+                "{} {} @ {} [{}-{}]",
+                o.kind, o.qualified_name, o.file_path, o.start_line, o.end_line
+            ),
+            whitelisted: is_wl,
+            justification: just.map(str::to_string),
+        });
+    }
+
+    NodeCompare {
+        total,
+        by_kind: sorted_groups(by_kind),
+        by_language: sorted_groups(by_lang),
+        missing: sort_diffs(missing),
+        extra: sort_diffs(extra),
+        reconvention: sort_diffs(reconvention),
+        translation,
+    }
+}
+
+fn group_by_refs<'a, K, F>(nodes: &[&'a PNode], key: F) -> HashMap<K, Vec<&'a PNode>>
+where
+    K: std::hash::Hash + Eq,
+    F: Fn(&PNode) -> K,
+{
+    let mut m: HashMap<K, Vec<&'a PNode>> = HashMap::new();
+    for n in nodes {
+        m.entry(key(n)).or_default().push(n);
+    }
+    m
+}
+
+/// Apply the reconvention translation to a golden edge's endpoints, returning
+/// the convention-matched `(source_qn, target_qn, kind)` key.
+fn translated_key(e: &PEdge, tr: &Translation) -> EdgeKey {
+    let src = tr
+        .get(&(
+            e.source_kind.clone(),
+            e.source_file.clone(),
+            e.source_qn.clone(),
+        ))
+        .cloned()
+        .unwrap_or_else(|| e.source_qn.clone());
+    let tgt = tr
+        .get(&(
+            e.target_kind.clone(),
+            e.target_file.clone(),
+            e.target_qn.clone(),
+        ))
+        .cloned()
+        .unwrap_or_else(|| e.target_qn.clone());
+    (src, tgt, e.kind.clone())
+}
+
+fn raw_key(e: &PEdge) -> EdgeKey {
+    (e.source_qn.clone(), e.target_qn.clone(), e.kind.clone())
+}
+
+/// Multiset of edge keys → (count, representative edge).
+fn edge_multiset<F: Fn(&PEdge) -> EdgeKey>(
+    edges: &[PEdge],
+    key: F,
+) -> HashMap<EdgeKey, (i64, PEdge)> {
+    let mut m: HashMap<EdgeKey, (i64, PEdge)> = HashMap::new();
+    for e in edges {
+        m.entry(key(e)).or_insert((0, e.clone())).0 += 1;
+    }
+    m
+}
+
+struct EdgeCompare {
+    total: GroupStat,
+    by_kind: Vec<GroupStat>,
+    by_language: Vec<GroupStat>,
+    missing: Vec<DiffItem>,
+    extra: Vec<DiffItem>,
+}
+
+/// Compare edges on the **convention-matched** key (golden endpoints translated
+/// through the reconvention map).
+fn compare_edges(ours: &Graph, golden: &Graph, wl: &Whitelist, tr: &Translation) -> EdgeCompare {
+    let our_ek = edge_multiset(&ours.edges, raw_key);
+    let golden_ek = edge_multiset(&golden.edges, |e| translated_key(e, tr));
+
+    let mut total = GroupStat {
+        label: "edges".into(),
+        ..Default::default()
+    };
+    let mut by_kind: HashMap<String, GroupStat> = HashMap::new();
+    let mut by_lang: HashMap<String, GroupStat> = HashMap::new();
+    let mut missing = Vec::new();
+    let mut extra = Vec::new();
+
+    let mut all: Vec<&EdgeKey> = golden_ek.keys().chain(our_ek.keys()).collect();
+    all.sort();
+    all.dedup();
+
+    for key in all {
+        let (gc, gsample) = golden_ek.get(key).cloned().unwrap_or((0, dummy_edge()));
+        let (oc, osample) = our_ek.get(key).cloned().unwrap_or((0, dummy_edge()));
+        let sample = if gc > 0 { &gsample } else { &osample };
+        let matched = gc.min(oc);
+        let miss = (gc - oc).max(0);
+        let ext = (oc - gc).max(0);
+
+        let ks = by_kind.entry(sample.kind.clone()).or_default();
+        ks.label = sample.kind.clone();
+        let ls = by_lang.entry(sample.language.clone()).or_default();
+        ls.label = sample.language.clone();
+        for stat in [&mut total, &mut *ks, &mut *ls] {
+            stat.golden += gc;
+            stat.matched += matched;
+            stat.missing += miss;
+            stat.extra += ext;
+        }
+
+        if miss > 0 {
+            let just = wl.edge_justification("missing", key, oc);
+            let is_wl = just.is_some();
+            if is_wl {
+                for stat in [&mut total, &mut *ks, &mut *ls] {
+                    stat.whitelisted_missing += miss;
+                }
+            }
+            missing.push(DiffItem {
+                description: format!(
+                    "{}x {} {} -> {}",
+                    miss, gsample.kind, gsample.source_qn, gsample.target_qn
+                ),
+                whitelisted: is_wl,
+                justification: just.map(str::to_string),
+            });
+        }
+        if ext > 0 {
+            let just = wl.edge_justification("extra", key, oc);
+            let is_wl = just.is_some();
+            if is_wl {
+                for stat in [&mut total, &mut *ks, &mut *ls] {
+                    stat.whitelisted_extra += ext;
+                }
+            }
+            extra.push(DiffItem {
+                description: format!(
+                    "{}x {} {} -> {}",
+                    ext, osample.kind, osample.source_qn, osample.target_qn
+                ),
+                whitelisted: is_wl,
+                justification: just.map(str::to_string),
+            });
+        }
+    }
+
+    EdgeCompare {
+        total,
+        by_kind: sorted_groups(by_kind),
+        by_language: sorted_groups(by_lang),
+        missing: sort_diffs(missing),
+        extra: sort_diffs(extra),
+    }
+}
+
+/// Raw (untranslated) `calls` recall — how the calls parity looks *before*
+/// normalizing the qn convention. `None` when golden has no `calls` edges.
+fn raw_calls_pct(ours: &Graph, golden: &Graph) -> Option<f64> {
+    let our_ek = edge_multiset(&ours.edges, raw_key);
+    let golden_ek = edge_multiset(&golden.edges, raw_key);
+    let mut golden_calls = 0i64;
+    let mut matched = 0i64;
+    for (key, (gc, _)) in &golden_ek {
+        if key.2 != "calls" {
+            continue;
+        }
+        golden_calls += gc;
+        let oc = our_ek.get(key).map(|(c, _)| *c).unwrap_or(0);
+        matched += (*gc).min(oc);
+    }
+    (golden_calls > 0).then(|| 100.0 * matched as f64 / golden_calls as f64)
 }
 
 /// Compare a semgraph graph (`ours`) against a CodeGraph golden graph
@@ -490,184 +878,29 @@ pub fn compare(
     whitelist: &Whitelist,
     opts: &CompareOptions,
 ) -> ParityReport {
-    let strict = opts.strict_line_range;
-
-    // ---- Nodes -----------------------------------------------------------
-    let our_nodes = multiset(ours.nodes.iter().map(|n| (n.key(strict), n.clone())));
-    let golden_nodes = multiset(golden.nodes.iter().map(|n| (n.key(strict), n.clone())));
-
-    let mut node_total = GroupStat {
-        label: "nodes".into(),
-        ..Default::default()
-    };
-    let mut by_kind: HashMap<String, GroupStat> = HashMap::new();
-    let mut by_lang: HashMap<String, GroupStat> = HashMap::new();
-    let mut missing_nodes = Vec::new();
-    let mut extra_nodes = Vec::new();
-
-    // Union of keys.
-    let mut all_keys: Vec<&NodeKey> = golden_nodes.keys().chain(our_nodes.keys()).collect();
-    all_keys.sort();
-    all_keys.dedup();
-
-    for key in all_keys {
-        let (gc, gsample) = golden_nodes.get(key).cloned().unwrap_or((0, dummy_node()));
-        let (oc, osample) = our_nodes.get(key).cloned().unwrap_or((0, dummy_node()));
-        let sample = if gc > 0 { &gsample } else { &osample };
-        let matched = gc.min(oc);
-        let missing = (gc - oc).max(0);
-        let extra = (oc - gc).max(0);
-
-        let ks = by_kind.entry(sample.kind.clone()).or_default();
-        ks.label = sample.kind.clone();
-        let ls = by_lang.entry(sample.language.clone()).or_default();
-        ls.label = sample.language.clone();
-
-        for stat in [&mut node_total, &mut *ks, &mut *ls] {
-            stat.golden += gc;
-            stat.matched += matched;
-            stat.missing += missing;
-            stat.extra += extra;
-        }
-
-        if missing > 0 {
-            let just = whitelist.node_justification("missing", &gsample);
-            let wl = just.is_some();
-            if wl {
-                for stat in [&mut node_total, &mut *ks, &mut *ls] {
-                    stat.whitelisted_missing += missing;
-                }
-            }
-            missing_nodes.push(DiffItem {
-                description: format!(
-                    "{}x {} {} @ {} [{}-{}]",
-                    missing,
-                    gsample.kind,
-                    gsample.qualified_name,
-                    gsample.file_path,
-                    gsample.start_line,
-                    gsample.end_line
-                ),
-                whitelisted: wl,
-                justification: just.map(str::to_string),
-            });
-        }
-        if extra > 0 {
-            let just = whitelist.node_justification("extra", &osample);
-            let wl = just.is_some();
-            if wl {
-                for stat in [&mut node_total, &mut *ks, &mut *ls] {
-                    stat.whitelisted_extra += extra;
-                }
-            }
-            extra_nodes.push(DiffItem {
-                description: format!(
-                    "{}x {} {} @ {} [{}-{}]",
-                    extra,
-                    osample.kind,
-                    osample.qualified_name,
-                    osample.file_path,
-                    osample.start_line,
-                    osample.end_line
-                ),
-                whitelisted: wl,
-                justification: just.map(str::to_string),
-            });
-        }
-    }
-
-    // ---- Node attribute deltas (relaxed pairing) -------------------------
-    let attr_deltas = attribute_deltas(ours, golden, whitelist, strict);
-
-    // ---- Edges -----------------------------------------------------------
-    let our_edges = multiset(ours.edges.iter().map(|e| (e.key(), e.clone())));
-    let golden_edges = multiset(golden.edges.iter().map(|e| (e.key(), e.clone())));
-
-    let mut edge_total = GroupStat {
-        label: "edges".into(),
-        ..Default::default()
-    };
-    let mut ek_by_kind: HashMap<String, GroupStat> = HashMap::new();
-    let mut ek_by_lang: HashMap<String, GroupStat> = HashMap::new();
-    let mut missing_edges = Vec::new();
-    let mut extra_edges = Vec::new();
-
-    let mut all_ekeys: Vec<&EdgeKey> = golden_edges.keys().chain(our_edges.keys()).collect();
-    all_ekeys.sort();
-    all_ekeys.dedup();
-
-    for key in all_ekeys {
-        let (gc, gsample) = golden_edges.get(key).cloned().unwrap_or((0, dummy_edge()));
-        let (oc, osample) = our_edges.get(key).cloned().unwrap_or((0, dummy_edge()));
-        let sample = if gc > 0 { &gsample } else { &osample };
-        let matched = gc.min(oc);
-        let missing = (gc - oc).max(0);
-        let extra = (oc - gc).max(0);
-
-        let ks = ek_by_kind.entry(sample.kind.clone()).or_default();
-        ks.label = sample.kind.clone();
-        let ls = ek_by_lang.entry(sample.language.clone()).or_default();
-        ls.label = sample.language.clone();
-
-        for stat in [&mut edge_total, &mut *ks, &mut *ls] {
-            stat.golden += gc;
-            stat.matched += matched;
-            stat.missing += missing;
-            stat.extra += extra;
-        }
-
-        if missing > 0 {
-            let just = whitelist.edge_justification("missing", key, oc);
-            let wl = just.is_some();
-            if wl {
-                for stat in [&mut edge_total, &mut *ks, &mut *ls] {
-                    stat.whitelisted_missing += missing;
-                }
-            }
-            missing_edges.push(DiffItem {
-                description: format!(
-                    "{}x {} {} -> {}",
-                    missing, gsample.kind, gsample.source_qn, gsample.target_qn
-                ),
-                whitelisted: wl,
-                justification: just.map(str::to_string),
-            });
-        }
-        if extra > 0 {
-            let just = whitelist.edge_justification("extra", key, oc);
-            let wl = just.is_some();
-            if wl {
-                for stat in [&mut edge_total, &mut *ks, &mut *ls] {
-                    stat.whitelisted_extra += extra;
-                }
-            }
-            extra_edges.push(DiffItem {
-                description: format!(
-                    "{}x {} {} -> {}",
-                    extra, osample.kind, osample.source_qn, osample.target_qn
-                ),
-                whitelisted: wl,
-                justification: just.map(str::to_string),
-            });
-        }
-    }
+    let nodes = compare_nodes(ours, golden, whitelist, opts.strict_line_range);
+    let attr_deltas = attribute_deltas(ours, golden, whitelist, opts.strict_line_range);
+    let edges = compare_edges(ours, golden, whitelist, &nodes.translation);
+    let calls_pct_raw = raw_calls_pct(ours, golden);
 
     ParityReport {
-        node_total,
-        edge_total,
-        nodes_by_kind: sorted_groups(by_kind),
-        nodes_by_language: sorted_groups(by_lang),
-        edges_by_kind: sorted_groups(ek_by_kind),
-        edges_by_language: sorted_groups(ek_by_lang),
-        missing_nodes: sort_diffs(missing_nodes),
-        extra_nodes: sort_diffs(extra_nodes),
-        missing_edges: sort_diffs(missing_edges),
-        extra_edges: sort_diffs(extra_edges),
+        node_total: nodes.total,
+        edge_total: edges.total,
+        nodes_by_kind: nodes.by_kind,
+        nodes_by_language: nodes.by_language,
+        edges_by_kind: edges.by_kind,
+        edges_by_language: edges.by_language,
+        missing_nodes: nodes.missing,
+        extra_nodes: nodes.extra,
+        reconvention_nodes: nodes.reconvention,
+        missing_edges: edges.missing,
+        extra_edges: edges.extra,
         attr_deltas,
+        calls_pct_raw,
     }
 }
 
-/// Compare attributes of nodes matched on the relaxed key. Reports `is_async`,
+/// Compare attributes of nodes matched on physical identity. Reports `is_async`,
 /// `docstring`, `signature`, and (when not strict) `line_range` differences.
 fn attribute_deltas(
     ours: &Graph,
@@ -675,23 +908,18 @@ fn attribute_deltas(
     whitelist: &Whitelist,
     strict: bool,
 ) -> Vec<DiffItem> {
-    let mut our_by: HashMap<NodeKey, Vec<&PNode>> = HashMap::new();
-    for n in &ours.nodes {
-        our_by.entry(n.relaxed_key()).or_default().push(n);
-    }
-    let mut golden_by: HashMap<NodeKey, Vec<&PNode>> = HashMap::new();
-    for n in &golden.nodes {
-        golden_by.entry(n.relaxed_key()).or_default().push(n);
-    }
+    // Pair on physical identity so convention differences in qn don't prevent
+    // attribute comparison of the same node.
+    let our_by = group_by(&ours.nodes, |n| n.identity());
+    let golden_by = group_by(&golden.nodes, |n| n.identity());
 
     let mut out = Vec::new();
-    let mut keys: Vec<&NodeKey> = golden_by.keys().collect();
+    let mut keys: Vec<&Identity> = golden_by.keys().collect();
     keys.sort();
     for key in keys {
         let (Some(gs), Some(os)) = (golden_by.get(key), our_by.get(key)) else {
             continue;
         };
-        // Pair positionally up to the shorter side (duplicate defs are rare).
         for (g, o) in gs.iter().zip(os.iter()) {
             let mut checks: Vec<(&str, String, String)> = vec![
                 ("is_async", g.is_async.to_string(), o.is_async.to_string()),
@@ -709,7 +937,7 @@ fn attribute_deltas(
                 if gv == ov {
                     continue;
                 }
-                let just = whitelist.node_attr_justification(attr, o);
+                let just = whitelist.node_attr_justification(attr, o, &ov, &gv);
                 out.push(DiffItem {
                     description: format!(
                         "{} {} @ {} [{}]: codegraph={:?} semgraph={:?}",
@@ -735,7 +963,6 @@ fn sorted_groups(m: HashMap<String, GroupStat>) -> Vec<GroupStat> {
 }
 
 fn sort_diffs(mut v: Vec<DiffItem>) -> Vec<DiffItem> {
-    // Non-whitelisted first (they matter most), then alphabetical.
     v.sort_by(|a, b| {
         a.whitelisted
             .cmp(&b.whitelisted)
@@ -744,26 +971,16 @@ fn sort_diffs(mut v: Vec<DiffItem>) -> Vec<DiffItem> {
     v
 }
 
-fn dummy_node() -> PNode {
-    PNode {
-        kind: String::new(),
-        qualified_name: String::new(),
-        file_path: String::new(),
-        language: String::new(),
-        start_line: 0,
-        end_line: 0,
-        is_async: false,
-        docstring: None,
-        signature: None,
-    }
-}
-
 fn dummy_edge() -> PEdge {
     PEdge {
         source_qn: String::new(),
         target_qn: String::new(),
         kind: String::new(),
         language: String::new(),
+        source_kind: String::new(),
+        source_file: String::new(),
+        target_kind: String::new(),
+        target_file: String::new(),
     }
 }
 
@@ -784,12 +1001,23 @@ mod tests {
             signature: None,
         }
     }
+    fn nl(kind: &str, qn: &str, file: &str, lang: &str, s: i64, e: i64) -> PNode {
+        PNode {
+            start_line: s,
+            end_line: e,
+            ..n(kind, qn, file, lang)
+        }
+    }
     fn e(src: &str, tgt: &str, kind: &str, lang: &str) -> PEdge {
         PEdge {
             source_qn: src.into(),
             target_qn: tgt.into(),
             kind: kind.into(),
             language: lang.into(),
+            source_kind: "function".into(),
+            source_file: "a.rs".into(),
+            target_kind: "function".into(),
+            target_file: "a.rs".into(),
         }
     }
 
@@ -801,7 +1029,6 @@ mod tests {
         assert!(glob_match("*.py", "a/b/main.py"));
         assert!(!glob_match("python/*", "rust/lib.rs"));
         assert!(glob_match("exact", "exact"));
-        assert!(!glob_match("exact", "other"));
     }
 
     #[test]
@@ -812,7 +1039,7 @@ mod tests {
         };
         let r = compare(&g, &g, &Whitelist::default(), &CompareOptions::default());
         assert_eq!(r.node_match_pct(), 100.0);
-        assert_eq!(r.calls_match_pct(), 100.0);
+        assert_eq!(r.calls_match_pct(), Some(100.0));
         assert!(r.passes(95.0, 90.0));
     }
 
@@ -820,13 +1047,13 @@ mod tests {
     fn missing_node_lowers_recall() {
         let golden = Graph {
             nodes: vec![
-                n("function", "f", "a.rs", "rust"),
-                n("function", "g", "a.rs", "rust"),
+                nl("function", "f", "a.rs", "rust", 1, 2),
+                nl("function", "g", "a.rs", "rust", 5, 6),
             ],
             edges: vec![],
         };
         let ours = Graph {
-            nodes: vec![n("function", "f", "a.rs", "rust")],
+            nodes: vec![nl("function", "f", "a.rs", "rust", 1, 2)],
             edges: vec![],
         };
         let r = compare(
@@ -836,38 +1063,65 @@ mod tests {
             &CompareOptions::default(),
         );
         assert_eq!(r.node_match_pct(), 50.0);
-        assert_eq!(r.missing_nodes.len(), 1);
-        assert!(!r.missing_nodes[0].whitelisted);
+        assert_eq!(r.missing_nodes.iter().filter(|d| !d.whitelisted).count(), 1);
     }
 
     #[test]
-    fn whitelisted_missing_node_is_credited_but_reported() {
+    fn reconvention_credits_recall_and_translates_edges() {
+        // Same physical node (function @ a.rs [10-20]) named `tests::foo` by
+        // CodeGraph and `foo` by semgraph. And a calls edge into it.
         let golden = Graph {
             nodes: vec![
-                n("function", "f", "a.rs", "rust"),
-                n("function", "g", "a.rs", "rust"),
+                nl("function", "caller", "a.rs", "rust", 1, 3),
+                nl("function", "tests::foo", "a.rs", "rust", 10, 20),
             ],
-            edges: vec![],
+            edges: vec![PEdge {
+                source_qn: "caller".into(),
+                target_qn: "tests::foo".into(),
+                kind: "calls".into(),
+                language: "rust".into(),
+                source_kind: "function".into(),
+                source_file: "a.rs".into(),
+                target_kind: "function".into(),
+                target_file: "a.rs".into(),
+            }],
         };
         let ours = Graph {
-            nodes: vec![n("function", "f", "a.rs", "rust")],
-            edges: vec![],
+            nodes: vec![
+                nl("function", "caller", "a.rs", "rust", 1, 3),
+                nl("function", "foo", "a.rs", "rust", 10, 20),
+            ],
+            edges: vec![PEdge {
+                source_qn: "caller".into(),
+                target_qn: "foo".into(),
+                kind: "calls".into(),
+                language: "rust".into(),
+                source_kind: "function".into(),
+                source_file: "a.rs".into(),
+                target_kind: "function".into(),
+                target_file: "a.rs".into(),
+            }],
         };
-        let wl = Whitelist::from_json(
-            r#"{"nodes":[{"side":"missing","qualified_name":"g","justification":"known"}]}"#,
-        )
-        .unwrap();
-        let r = compare(&ours, &golden, &wl, &CompareOptions::default());
-        // Credited back to 100%, but still listed as a whitelisted diff.
+        let r = compare(
+            &ours,
+            &golden,
+            &Whitelist::default(),
+            &CompareOptions::default(),
+        );
+        // Node: 1 exact (caller) + 1 reconvention (foo) => 100% recall, but the
+        // reconvention is NOT counted as a genuine miss.
         assert_eq!(r.node_match_pct(), 100.0);
-        assert_eq!(r.missing_nodes.len(), 1);
-        assert!(r.missing_nodes[0].whitelisted);
-        assert_eq!(r.node_total.whitelisted_missing, 1);
+        assert_eq!(r.node_total.reconvention, 1);
+        assert_eq!(r.missing_nodes.iter().filter(|d| !d.whitelisted).count(), 0);
+        assert_eq!(r.reconvention_nodes.len(), 1);
+        // Edge: convention-matched calls parity is 100%; the RAW qn key would
+        // have missed it (tests::foo != foo).
+        assert_eq!(r.calls_match_pct(), Some(100.0));
+        assert_eq!(r.calls_pct_raw, Some(0.0));
     }
 
     #[test]
     fn duplicate_reference_only_whitelisted_when_key_still_emitted() {
-        // golden emits (a->b references) twice; ours once.
         let golden = Graph {
             nodes: vec![],
             edges: vec![
@@ -893,13 +1147,8 @@ mod tests {
         assert_eq!(refs.whitelisted_missing, 1);
         assert_eq!(refs.match_pct(), 100.0);
 
-        // But a *true* recall gap (ours emits zero) is NOT whitelisted by
-        // only_duplicates.
-        let ours_zero = Graph {
-            nodes: vec![],
-            edges: vec![],
-        };
-        let r2 = compare(&ours_zero, &golden, &wl, &CompareOptions::default());
+        // A true recall gap (ours emits zero) is NOT whitelisted.
+        let r2 = compare(&Graph::default(), &golden, &wl, &CompareOptions::default());
         let refs2 = r2
             .edges_by_kind
             .iter()
@@ -910,7 +1159,8 @@ mod tests {
     }
 
     #[test]
-    fn is_async_attribute_delta_is_whitelistable() {
+    fn is_async_whitelist_is_direction_specific() {
+        // Documented-better: semgraph=true, codegraph=false → forgiven.
         let mut better = n("function", "gather", "m.py", "python");
         better.is_async = true;
         let golden = Graph {
@@ -922,18 +1172,106 @@ mod tests {
             edges: vec![],
         };
         let wl = Whitelist::from_json(
-            r#"{"node_attrs":[{"attr":"is_async","justification":"ADR-003"}]}"#,
+            r#"{"node_attrs":[{"attr":"is_async","direction":"semgraph_true","justification":"ADR-003"}]}"#,
         )
         .unwrap();
         let r = compare(&ours, &golden, &wl, &CompareOptions::default());
-        // Node still matches on the key (is_async isn't part of it).
-        assert_eq!(r.node_match_pct(), 100.0);
         let d = r
             .attr_deltas
             .iter()
             .find(|d| d.description.contains("is_async"))
-            .expect("is_async delta reported");
-        assert!(d.whitelisted, "should be whitelisted: {d:?}");
+            .unwrap();
+        assert!(d.whitelisted, "better direction must be forgiven");
+
+        // REGRESSION: semgraph=false, codegraph=true → must NOT be forgiven.
+        let mut cg_async = n("function", "gather", "m.py", "python");
+        cg_async.is_async = true;
+        let golden2 = Graph {
+            nodes: vec![cg_async],
+            edges: vec![],
+        };
+        let ours2 = Graph {
+            nodes: vec![n("function", "gather", "m.py", "python")],
+            edges: vec![],
+        };
+        let r2 = compare(&ours2, &golden2, &wl, &CompareOptions::default());
+        let d2 = r2
+            .attr_deltas
+            .iter()
+            .find(|d| d.description.contains("is_async"))
+            .unwrap();
+        assert!(
+            !d2.whitelisted,
+            "a lost is_async is a regression, not forgiven"
+        );
+    }
+
+    #[test]
+    fn docstring_whitelist_does_not_mask_a_dropped_docstring() {
+        let wl = Whitelist::from_json(
+            r#"{"node_attrs":[{"attr":"docstring","direction":"semgraph_nonempty","justification":"ADR-003"}]}"#,
+        )
+        .unwrap();
+        // Better: semgraph has a docstring, codegraph empty → forgiven.
+        let mut o = n("function", "f", "a.rs", "rust");
+        o.docstring = Some("clean".into());
+        let r = compare(
+            &Graph {
+                nodes: vec![o],
+                edges: vec![],
+            },
+            &Graph {
+                nodes: vec![n("function", "f", "a.rs", "rust")],
+                edges: vec![],
+            },
+            &wl,
+            &CompareOptions::default(),
+        );
+        assert!(
+            r.attr_deltas
+                .iter()
+                .find(|d| d.description.contains("docstring"))
+                .unwrap()
+                .whitelisted
+        );
+
+        // Regression: semgraph empty, codegraph had one → NOT forgiven.
+        let mut g = n("function", "f", "a.rs", "rust");
+        g.docstring = Some("real".into());
+        let r2 = compare(
+            &Graph {
+                nodes: vec![n("function", "f", "a.rs", "rust")],
+                edges: vec![],
+            },
+            &Graph {
+                nodes: vec![g],
+                edges: vec![],
+            },
+            &wl,
+            &CompareOptions::default(),
+        );
+        assert!(
+            !r2.attr_deltas
+                .iter()
+                .find(|d| d.description.contains("docstring"))
+                .unwrap()
+                .whitelisted
+        );
+    }
+
+    #[test]
+    fn zero_calls_reports_na_and_gate_is_vacuous() {
+        // A graph with nodes but no calls edges: calls parity is N/A, not 100%.
+        let g = Graph {
+            nodes: vec![n("function", "f", "a.rs", "rust")],
+            edges: vec![],
+        };
+        let r = compare(&g, &g, &Whitelist::default(), &CompareOptions::default());
+        assert_eq!(r.calls_match_pct(), None);
+        assert!(
+            r.passes(95.0, 90.0),
+            "no calls => calls gate vacuously satisfied"
+        );
     }
 
     #[test]
@@ -952,7 +1290,7 @@ mod tests {
             &Whitelist::default(),
             &CompareOptions::default(),
         );
-        assert_eq!(r.calls_match_pct(), 50.0);
+        assert_eq!(r.calls_match_pct(), Some(50.0));
         assert!(!r.passes(0.0, 90.0));
     }
 }

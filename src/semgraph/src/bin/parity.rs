@@ -155,7 +155,19 @@ fn run(cli: &Cli) -> std::result::Result<bool, String> {
     // ---- Output ----------------------------------------------------------
     print_human(&report, cli.min_nodes, cli.min_calls);
 
-    let json = report.to_json();
+    // Augment the JSON with an explicit acceptance verdict so a machine consumer
+    // gates on the tool's decision (raw percentages) rather than re-deriving it
+    // from the rounded display values.
+    let mut json = report.to_json();
+    let passed = report.passes(cli.min_nodes, cli.min_calls);
+    json["acceptance"] = serde_json::json!({
+        "min_nodes": cli.min_nodes,
+        "min_calls": cli.min_calls,
+        "node_match_pct": report.node_match_pct(),
+        "calls_match_pct": report.calls_match_pct(),
+        "calls_match_pct_raw": report.calls_pct_raw,
+        "passed": passed,
+    });
     if let Some(path) = &cli.json_out {
         let text = serde_json::to_string_pretty(&json).map_err(|e| e.to_string())?;
         std::fs::write(path, text).map_err(|e| format!("writing {}: {e}", path.display()))?;
@@ -168,7 +180,7 @@ fn run(cli: &Cli) -> std::result::Result<bool, String> {
         );
     }
 
-    Ok(report.passes(cli.min_nodes, cli.min_calls))
+    Ok(passed)
 }
 
 /// A scratch directory removed on drop.
@@ -334,6 +346,13 @@ fn build_command(exe: &Path, args: &[&str]) -> Command {
 // Human-readable report
 // ---------------------------------------------------------------------------
 
+fn pct_str(p: Option<f64>) -> String {
+    match p {
+        Some(v) => format!("{v:>6.2}%"),
+        None => "   N/A".to_string(),
+    }
+}
+
 fn print_human(report: &ParityReport, min_nodes: f64, min_calls: f64) {
     let node_pct = report.node_match_pct();
     let calls_pct = report.calls_match_pct();
@@ -341,33 +360,48 @@ fn print_human(report: &ParityReport, min_nodes: f64, min_calls: f64) {
     eprintln!();
     eprintln!("==================== PARITY REPORT ====================");
     eprintln!(
-        "Nodes:  {:>6.2}%   ({}/{} golden matched, {} extra, {} whitelisted-missing)",
+        "Nodes:  {:>6.2}%   ({}/{} golden identified [{} exact + {} reconvention], \
+         {} genuine-missing, {} extra)",
         node_pct,
-        report.node_total.matched + report.node_total.whitelisted_missing,
+        report.node_total.matched
+            + report.node_total.reconvention
+            + report.node_total.whitelisted_missing,
         report.node_total.golden,
+        report.node_total.matched,
+        report.node_total.reconvention,
+        report.node_total.missing - report.node_total.whitelisted_missing,
         report.node_total.extra,
-        report.node_total.whitelisted_missing,
     );
     eprintln!(
-        "Edges:  {:>6.2}%   ({}/{} golden matched, {} extra, {} whitelisted-missing)",
+        "Edges:  {:>6.2}%   ({}/{} golden matched [convention-normalized], {} extra, \
+         {} whitelisted-missing)",
         report.edge_total.match_pct(),
         report.edge_total.matched + report.edge_total.whitelisted_missing,
         report.edge_total.golden,
         report.edge_total.extra,
         report.edge_total.whitelisted_missing,
     );
+    eprintln!(
+        "calls:  {} normalized  vs  {} raw-qn  (the gap the qn convention hid)",
+        pct_str(calls_pct),
+        pct_str(report.calls_pct_raw),
+    );
 
     eprintln!("\n-- Nodes by kind --");
     print_groups(&report.nodes_by_kind);
     eprintln!("\n-- Nodes by language --");
     print_groups(&report.nodes_by_language);
-    eprintln!("\n-- Edges by kind --");
+    eprintln!("\n-- Edges by kind (convention-normalized) --");
     print_groups(&report.edges_by_kind);
-    eprintln!("\n-- Edges by language --");
+    eprintln!("\n-- Edges by language (convention-normalized) --");
     print_groups(&report.edges_by_language);
 
     print_diffs(
-        "Missing nodes (in CodeGraph, not semgraph)",
+        "Reconvention nodes (same node, different qn convention — credited to recall)",
+        &report.reconvention_nodes,
+    );
+    print_diffs(
+        "Missing nodes (genuinely in CodeGraph, not semgraph)",
         &report.missing_nodes,
     );
     print_diffs(
@@ -375,7 +409,7 @@ fn print_human(report: &ParityReport, min_nodes: f64, min_calls: f64) {
         &report.extra_nodes,
     );
     print_diffs(
-        "Missing edges (in CodeGraph, not semgraph)",
+        "Missing edges (in CodeGraph, not semgraph, after normalization)",
         &report.missing_edges,
     );
     print_diffs(
@@ -386,7 +420,8 @@ fn print_human(report: &ParityReport, min_nodes: f64, min_calls: f64) {
 
     eprintln!("\n-- Acceptance --");
     let node_ok = node_pct >= min_nodes;
-    let calls_ok = calls_pct >= min_calls;
+    // A missing calls metric (no golden calls) is vacuously satisfied.
+    let calls_ok = calls_pct.is_none_or(|p| p >= min_calls);
     eprintln!(
         "  nodes  {:>6.2}%  >= {:>5.1}%  {}",
         node_pct,
@@ -394,8 +429,8 @@ fn print_human(report: &ParityReport, min_nodes: f64, min_calls: f64) {
         if node_ok { "PASS" } else { "FAIL" }
     );
     eprintln!(
-        "  calls  {:>6.2}%  >= {:>5.1}%  {}",
-        calls_pct,
+        "  calls  {}  >= {:>5.1}%  {}",
+        pct_str(calls_pct),
         min_calls,
         if calls_ok { "PASS" } else { "FAIL" }
     );
@@ -409,11 +444,12 @@ fn print_human(report: &ParityReport, min_nodes: f64, min_calls: f64) {
 fn print_groups(groups: &[semgraph::parity::GroupStat]) {
     for g in groups {
         eprintln!(
-            "  {:<14} {:>6.2}%   golden={:<4} matched={:<4} missing={:<3} extra={:<3} wl_missing={}",
+            "  {:<14} {}   golden={:<5} exact={:<5} reconv={:<4} missing={:<4} extra={:<4} wl_missing={}",
             g.label,
-            g.match_pct(),
+            pct_str(g.match_pct_opt()),
             g.golden,
             g.matched,
+            g.reconvention,
             g.missing,
             g.extra,
             g.whitelisted_missing,

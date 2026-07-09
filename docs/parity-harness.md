@@ -21,14 +21,19 @@ Both graphs are read out of a schema-v4 `codegraph.db` and diffed:
 
 | Entity | Match key | Notes |
 |--------|-----------|-------|
-| **Nodes** | `(kind, qualified_name, file_path)` | `--strict-line-range` additionally pins `(start_line, end_line)`. Otherwise the line range is compared as a whitelistable *attribute* so a one-line drift doesn't count as both a missing and an extra node. |
-| **Edges** | `(source_qn, target_qn, kind)`, as a **multiset** | Preserves duplicate call sites and CodeGraph's duplicate return-type references. Edges are attributed to the **caller's** (source node's) language. |
-| **Node attributes** | per matched node | `is_async`, `docstring`, `signature`, and (relaxed mode) line-range differences are reported and can be whitelisted. |
+| **Nodes** | `(kind, qualified_name, file_path)` | `--strict-line-range` additionally pins `(start_line, end_line)`. Otherwise line range is a whitelistable *attribute*, not a hard key. |
+| **Reconvention** (nodes) | second pass on `(kind, file_path, start_line, end_line)` | Residual nodes (unmatched after the exact pass) are re-matched on **physical identity**, ignoring the qualified name. A match here is the *same physical definition under a different qn convention* (e.g. CodeGraph drops Rust's `tests::` prefix, or names a nested Python function differently). Reconventions **count toward recall** but are reported separately, showing both qn forms — so convention drift is never conflated with a genuine gap. |
+| **Edges** | `(source_qn, target_qn, kind)`, as a **multiset** | Golden endpoints are **translated through the reconvention map** first, so the same qn-convention drift doesn't inflate the edge miss. Preserves duplicate call sites / return-type references. Attributed to the **caller's** language. A **raw** (untranslated) `calls` percentage is also reported, so the size of the convention effect is visible. |
+| **Node attributes** | per identity-matched node | `is_async`, `docstring`, `signature`, and (relaxed mode) line-range differences are reported and can be whitelisted — but only in the documented-better *direction* (see below). |
 
 The report gives **per-kind** and **per-language** match percentages for nodes
-and edges, plus missing/extra listings, plus a machine-readable JSON summary.
-Match percentage is *recall* (golden items reproduced), crediting whitelisted
-omissions.
+and edges, plus missing/extra/reconvention listings, plus a machine-readable JSON
+summary. Match percentage is *recall* (golden items reproduced), crediting
+reconventions and whitelisted omissions.
+
+**`calls` = N/A.** When the golden side has no `calls` edges, the calls metric is
+reported as `N/A` (JSON `null`), not a misleading 100%, and the calls threshold is
+treated as vacuously satisfied.
 
 ### Acceptance thresholds
 
@@ -116,7 +121,17 @@ regression — only a documented improvement.
 ```
 
 - **`node_attrs[]`** — `attr` ∈ `{is_async, docstring, signature, line_range}`;
-  optional `qualified_name`/`file` globs and an exact `language`.
+  optional `qualified_name`/`file` globs and an exact `language`. A **required
+  `direction`** constrains which side's value the improvement must be on, so a
+  rule only forgives the documented-better direction and never masks its
+  regression:
+  - `semgraph_true` / `semgraph_false` — for boolean attrs (`is_async`): forgive
+    only when semgraph's value is true/false. `is_async` uses `semgraph_true`
+    (we correctly flag async CodeGraph missed); a *dropped* `is_async`
+    (semgraph=false, CodeGraph=true) is **not** forgiven.
+  - `semgraph_nonempty` / `codegraph_empty` — for text attrs (`docstring`):
+    `docstring` uses `semgraph_nonempty` (we kept/added a docstring); a *dropped*
+    docstring (semgraph empty, CodeGraph non-empty) is **not** forgiven.
 - **`edges[]`** — `side` ∈ `{missing, extra}`; optional `kind`, `source`/`target`
   globs. `only_duplicates: true` whitelists a *missing* edge instance **only**
   when semgraph still emits that key at least once (a duplicate-multiplicity
@@ -169,3 +184,14 @@ large real tree will surface genuine gaps (unsupported node/edge kinds,
 name-resolution recall at scale). Those are the actionable signal the harness
 exists to produce: a language stays behind the CodeGraph default until it clears
 the thresholds on real code, not just on the fixture.
+
+**Read the reconvention split first.** On a real tree, a large fraction of the
+apparent node/edge "miss" is usually qualified-name *convention* drift, not
+genuine absence — semgraph found the definition but named it differently
+(`tests::` prefixes, nested-scope prefixes). The reconvention pass separates
+those out and translates edge endpoints through them, so the reported node recall
+and the *convention-normalized* calls percentage reflect **genuine** parity. The
+`raw` calls percentage shows how much the convention was hiding. Scope hardening
+work from the genuine, post-normalization gaps (e.g. unsupported kinds like
+`trait`/`extends`/`implements`, or surviving call-resolution recall), not from
+the raw numbers.
