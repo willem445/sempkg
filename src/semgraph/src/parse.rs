@@ -34,7 +34,7 @@ use streaming_iterator::StreamingIterator;
 use tree_sitter::{Node, Parser, Query, QueryCursor};
 
 use crate::model::{content_hash, EdgeRecord, FileRecord, Language, NodeRecord};
-use crate::resolve::{bare_type_name, RawSite, SitePayload};
+use crate::resolve::{bare_type_name, CallRef, RawSite, RecvExpr, SitePayload};
 
 /// The nodes + edges extracted from one source file, plus its `files` row.
 ///
@@ -316,7 +316,7 @@ fn collect_sites(
         })
         .collect();
     // Cache of locals maps, computed lazily per enclosing callable.
-    let mut locals_cache: HashMap<String, HashMap<String, String>> = HashMap::new();
+    let mut locals_cache: HashMap<String, HashMap<String, RecvExpr>> = HashMap::new();
     // type name → (field name → field type name), so a `self.field.method()`
     // receiver can be typed from the enclosing type's declared fields.
     let field_types = collect_field_types(root, src, lang);
@@ -783,7 +783,7 @@ fn call_payload(
     def_node_by_id: &HashMap<String, Node>,
     encl_type_by_id: &HashMap<String, String>,
     field_types: &HashMap<String, HashMap<String, String>>,
-    locals_cache: &mut HashMap<String, HashMap<String, String>>,
+    locals_cache: &mut HashMap<String, HashMap<String, RecvExpr>>,
 ) -> Option<SitePayload> {
     // Java call sites are `method_invocation` nodes (no `function` field).
     if lang == Language::Java {
@@ -856,7 +856,7 @@ fn call_payload(
             "field_expression" => {
                 let name = field_text(func, "field", src)?;
                 let recv = func.child_by_field_name("value")?;
-                let recv_type = receiver_type(
+                let recv = recv_of(
                     recv,
                     src,
                     from_id,
@@ -866,7 +866,7 @@ fn call_payload(
                     locals_cache,
                     lang,
                 );
-                Some(SitePayload::MethodCall { recv_type, name })
+                Some(SitePayload::MethodCall { recv, name })
             }
             _ => None,
         },
@@ -877,7 +877,7 @@ fn call_payload(
             "attribute" => {
                 let name = field_text(func, "attribute", src)?;
                 let recv = func.child_by_field_name("object")?;
-                let recv_type = receiver_type(
+                let recv = recv_of(
                     recv,
                     src,
                     from_id,
@@ -887,7 +887,7 @@ fn call_payload(
                     locals_cache,
                     lang,
                 );
-                Some(SitePayload::MethodCall { recv_type, name })
+                Some(SitePayload::MethodCall { recv, name })
             }
             _ => None,
         },
@@ -898,7 +898,7 @@ fn call_payload(
             "member_expression" => {
                 let name = field_text(func, "property", src)?;
                 let recv = func.child_by_field_name("object")?;
-                let recv_type = receiver_type(
+                let recv = recv_of(
                     recv,
                     src,
                     from_id,
@@ -908,7 +908,7 @@ fn call_payload(
                     locals_cache,
                     lang,
                 );
-                Some(SitePayload::MethodCall { recv_type, name })
+                Some(SitePayload::MethodCall { recv, name })
             }
             _ => None,
         },
@@ -952,15 +952,17 @@ fn java_call_payload(
     def_node_by_id: &HashMap<String, Node>,
     encl_type_by_id: &HashMap<String, String>,
     field_types: &HashMap<String, HashMap<String, String>>,
-    locals_cache: &mut HashMap<String, HashMap<String, String>>,
+    locals_cache: &mut HashMap<String, HashMap<String, RecvExpr>>,
 ) -> Option<SitePayload> {
     let name = field_text(call, "name", src)?;
     let Some(obj) = call.child_by_field_name("object") else {
         return Some(SitePayload::CallOrCtor { name });
     };
     let pkg = java_package(call, src);
-    // A typed local/parameter receiver (or `this`) resolves via its type.
-    if let Some(ty) = receiver_type(
+    // A typed local/parameter receiver (or `this`) resolves via its type. Java
+    // locals are explicitly typed, so only a concrete `Type` receiver is used
+    // (Java doesn't use the return-type/chained inference tier-1 languages do).
+    if let Some(RecvExpr::Type(ty)) = recv_of(
         obj,
         src,
         from_id,
@@ -998,51 +1000,379 @@ fn starts_uppercase(s: &str) -> bool {
     s.chars().next().is_some_and(|c| c.is_uppercase())
 }
 
-/// Infer a receiver expression's type name: `self`/`this` → the enclosing type;
-/// `self.field` → the enclosing type's declared field type; a bare identifier →
-/// its locally inferred type; anything else → `None`.
+/// Describe a method-call receiver as a [`RecvExpr`] (a concrete type, or a call
+/// whose return type will type it at resolve time), memoizing the enclosing
+/// callable's local-variable types in `locals_cache`. `None` when the receiver
+/// can't be typed from evidence (then the method call is dropped).
 #[allow(clippy::too_many_arguments)]
-fn receiver_type(
+fn recv_of(
     recv: Node,
     src: &str,
     from_id: &str,
     def_node_by_id: &HashMap<String, Node>,
     encl_type_by_id: &HashMap<String, String>,
     field_types: &HashMap<String, HashMap<String, String>>,
-    locals_cache: &mut HashMap<String, HashMap<String, String>>,
+    locals_cache: &mut HashMap<String, HashMap<String, RecvExpr>>,
     lang: Language,
-) -> Option<String> {
-    if matches!(recv.kind(), "self" | "this") {
-        return encl_type_by_id.get(from_id).cloned();
-    }
-    // `self.field` / `this.field`: type the receiver from the enclosing type's
-    // declared field, so `self.graph.callees()` resolves through `graph: GraphDb`.
-    if let Some(field) = self_field_name(recv, src, lang) {
-        let encl = encl_type_by_id.get(from_id)?;
-        return field_types.get(encl)?.get(&field).cloned();
-    }
-    if recv.kind() != "identifier" {
-        return None;
-    }
-    let name = node_text(recv, src);
-    if matches!(name, "self" | "this") {
-        return encl_type_by_id.get(from_id).cloned();
-    }
+) -> Option<RecvExpr> {
+    let ctx = RecvCtx {
+        src,
+        lang,
+        encl_type: encl_type_by_id.get(from_id).map(|s| s.as_str()),
+        field_types,
+    };
     if !locals_cache.contains_key(from_id) {
         let locals = def_node_by_id
             .get(from_id)
-            .map(|n| {
-                infer_locals(
-                    *n,
-                    src,
-                    lang,
-                    encl_type_by_id.get(from_id).map(|s| s.as_str()),
-                )
-            })
+            .map(|n| ctx.infer_locals(*n))
             .unwrap_or_default();
         locals_cache.insert(from_id.to_string(), locals);
     }
-    locals_cache.get(from_id)?.get(name).cloned()
+    let locals = locals_cache.get(from_id)?;
+    ctx.recv_expr(recv, locals)
+}
+
+/// Immutable context for typing receivers within one enclosing callable.
+struct RecvCtx<'a> {
+    src: &'a str,
+    lang: Language,
+    /// The enclosing type, if the callable is a method (for `self`/`this`).
+    encl_type: Option<&'a str>,
+    field_types: &'a HashMap<String, HashMap<String, String>>,
+}
+
+impl RecvCtx<'_> {
+    /// Type a receiver expression from `locals` (a partial map while building, or
+    /// the complete map at a call site).
+    fn recv_expr(&self, recv: Node, locals: &HashMap<String, RecvExpr>) -> Option<RecvExpr> {
+        // `self`/`this` → the enclosing type.
+        if matches!(recv.kind(), "self" | "this") {
+            return self.encl_type.map(|t| RecvExpr::Type(t.to_string()));
+        }
+        // `self.field` / `this.field` → the enclosing type's declared field type.
+        if let Some(field) = self_field_name(recv, self.src, self.lang) {
+            let encl = self.encl_type?;
+            return self
+                .field_types
+                .get(encl)?
+                .get(&field)
+                .cloned()
+                .map(RecvExpr::Type);
+        }
+        match recv.kind() {
+            "identifier" => {
+                let name = node_text(recv, self.src);
+                if matches!(name, "self" | "this") {
+                    return self.encl_type.map(|t| RecvExpr::Type(t.to_string()));
+                }
+                locals.get(name).cloned()
+            }
+            // A chained receiver `a.b()` — its type is that call's return type.
+            "call_expression" | "call" => {
+                Some(RecvExpr::Return(Box::new(self.call_ref(recv, locals)?)))
+            }
+            // Transparent Rust wrappers around the real receiver expression.
+            "try_expression"
+            | "await_expression"
+            | "parenthesized_expression"
+            | "reference_expression" => self.recv_expr(recv.named_child(0)?, locals),
+            _ => None,
+        }
+    }
+
+    /// Describe a call node as a [`CallRef`] (bare / qualified / method), so its
+    /// return type can be resolved in pass 2. `None` for a callee shape we can't
+    /// resolve (e.g. a call through an index or an un-typed receiver).
+    fn call_ref(&self, call: Node, locals: &HashMap<String, RecvExpr>) -> Option<CallRef> {
+        let func = call.child_by_field_name("function")?;
+        match self.lang {
+            Language::Rust => match func.kind() {
+                "identifier" => Some(CallRef::Bare {
+                    name: node_text(func, self.src).to_string(),
+                }),
+                "scoped_identifier" => {
+                    let name = field_text(func, "name", self.src)?;
+                    let path = func.child_by_field_name("path")?;
+                    Some(CallRef::Qualified {
+                        qualifier: last_path_segment(node_text(path, self.src)),
+                        name,
+                    })
+                }
+                "field_expression" => {
+                    let name = field_text(func, "field", self.src)?;
+                    let recv = self.recv_expr(func.child_by_field_name("value")?, locals)?;
+                    Some(CallRef::Method { recv, name })
+                }
+                _ => None,
+            },
+            Language::Python => match func.kind() {
+                "identifier" => Some(CallRef::Bare {
+                    name: node_text(func, self.src).to_string(),
+                }),
+                "attribute" => {
+                    let name = field_text(func, "attribute", self.src)?;
+                    let recv = self.recv_expr(func.child_by_field_name("object")?, locals)?;
+                    Some(CallRef::Method { recv, name })
+                }
+                _ => None,
+            },
+            Language::TypeScript | Language::Tsx | Language::JavaScript => match func.kind() {
+                "identifier" => Some(CallRef::Bare {
+                    name: node_text(func, self.src).to_string(),
+                }),
+                "member_expression" => {
+                    let name = field_text(func, "property", self.src)?;
+                    let recv = self.recv_expr(func.child_by_field_name("object")?, locals)?;
+                    Some(CallRef::Method { recv, name })
+                }
+                _ => None,
+            },
+            // C/C++/Go/Java resolve method calls by name / explicit types, not
+            // through this return-type chain.
+            _ => None,
+        }
+    }
+
+    /// Build the `var → RecvExpr` map for one callable: typed parameters, `self`,
+    /// and locals bound by a `let`/assignment (to a constructor → its type, or to
+    /// a call → that call's return type). A single document-order pass, so an
+    /// earlier local is available to a later one.
+    fn infer_locals(&self, func: Node) -> HashMap<String, RecvExpr> {
+        let mut locals: HashMap<String, RecvExpr> = HashMap::new();
+        if let Some(t) = self.encl_type {
+            locals.insert("self".to_string(), RecvExpr::Type(t.to_string()));
+            locals.insert("this".to_string(), RecvExpr::Type(t.to_string()));
+        }
+        if let Some(params) = func.child_by_field_name("parameters") {
+            let mut c = params.walk();
+            for p in params.named_children(&mut c) {
+                self.infer_param(p, &mut locals);
+            }
+        }
+        if let Some(body) = func.child_by_field_name("body") {
+            self.walk_assignments(body, &mut locals);
+        }
+        locals
+    }
+
+    fn infer_param(&self, p: Node, locals: &mut HashMap<String, RecvExpr>) {
+        let mut put = |name: &str, ty: &str| {
+            if let Some(t) = bare_type_name(ty) {
+                locals.insert(name.to_string(), RecvExpr::Type(t));
+            }
+        };
+        match self.lang {
+            Language::Rust => {
+                if p.kind() == "self_parameter" {
+                    if let Some(t) = self.encl_type {
+                        locals.insert("self".to_string(), RecvExpr::Type(t.to_string()));
+                    }
+                } else if p.kind() == "parameter" {
+                    if let (Some(pat), Some(ty)) = (
+                        p.child_by_field_name("pattern"),
+                        p.child_by_field_name("type"),
+                    ) {
+                        if pat.kind() == "identifier" {
+                            put(node_text(pat, self.src), node_text(ty, self.src));
+                        }
+                    }
+                }
+            }
+            Language::Python => {
+                if p.kind() == "typed_parameter" {
+                    let mut c = p.walk();
+                    let name = p.named_children(&mut c).find(|n| n.kind() == "identifier");
+                    if let (Some(name), Some(ty)) = (name, p.child_by_field_name("type")) {
+                        put(node_text(name, self.src), node_text(ty, self.src));
+                    }
+                }
+            }
+            Language::TypeScript | Language::Tsx | Language::JavaScript => {
+                if matches!(p.kind(), "required_parameter" | "optional_parameter") {
+                    if let (Some(pat), Some(ann)) = (
+                        p.child_by_field_name("pattern"),
+                        p.child_by_field_name("type"),
+                    ) {
+                        if pat.kind() == "identifier" {
+                            let inner = ann.named_child(0).unwrap_or(ann);
+                            put(node_text(pat, self.src), node_text(inner, self.src));
+                        }
+                    }
+                }
+            }
+            Language::Java => {
+                if p.kind() == "formal_parameter" {
+                    if let (Some(ty), Some(nm)) =
+                        (p.child_by_field_name("type"), p.child_by_field_name("name"))
+                    {
+                        put(node_text(nm, self.src), node_text(ty, self.src));
+                    }
+                }
+            }
+            Language::C | Language::Cpp | Language::Go => {}
+            Language::Ruby
+            | Language::Php
+            | Language::Kotlin
+            | Language::Swift
+            | Language::Scala
+            | Language::CSharp => unreachable!("tier-3 handled by tier3::extract"),
+        }
+    }
+
+    /// Record `var → RecvExpr` for each `let`/assignment in a callable body: a
+    /// constructor value → its concrete type; a call value → that call's return
+    /// type ([`RecvExpr::Return`], resolved in pass 2). Recurses over the body.
+    fn walk_assignments(&self, node: Node, locals: &mut HashMap<String, RecvExpr>) {
+        // Loop variable over a call's collection: `for x in reg.list() { x.m() }`
+        // types `x` as the collection's element type.
+        if let Some((var, call)) = self.for_binding(node) {
+            if let Some(cref) = self.call_ref(call, locals) {
+                locals.insert(var, RecvExpr::Element(Box::new(cref)));
+            }
+        }
+        match self.lang {
+            Language::Rust => {
+                if node.kind() == "let_declaration" {
+                    if let (Some(pat), Some(val)) = (
+                        node.child_by_field_name("pattern"),
+                        node.child_by_field_name("value"),
+                    ) {
+                        if pat.kind() == "identifier" {
+                            if let Some(re) = self.value_type(val, locals) {
+                                locals.insert(node_text(pat, self.src).to_string(), re);
+                            }
+                        }
+                    }
+                }
+            }
+            Language::Python => {
+                if node.kind() == "assignment" {
+                    // Prefer an explicit annotation (`x: T = …`); else the RHS value.
+                    if let Some(left) = node.child_by_field_name("left") {
+                        if left.kind() == "identifier" {
+                            let re = node
+                                .child_by_field_name("type")
+                                .and_then(|ty| bare_type_name(node_text(ty, self.src)))
+                                .map(RecvExpr::Type)
+                                .or_else(|| {
+                                    node.child_by_field_name("right")
+                                        .and_then(|v| self.value_type(v, locals))
+                                });
+                            if let Some(re) = re {
+                                locals.insert(node_text(left, self.src).to_string(), re);
+                            }
+                        }
+                    }
+                }
+            }
+            Language::TypeScript | Language::Tsx | Language::JavaScript => {
+                if node.kind() == "variable_declarator" {
+                    if let (Some(name), Some(val)) = (
+                        node.child_by_field_name("name"),
+                        node.child_by_field_name("value"),
+                    ) {
+                        if name.kind() == "identifier" {
+                            // An explicit `: T` annotation wins over the initializer.
+                            let re = node
+                                .child_by_field_name("type")
+                                .map(|ann| ann.named_child(0).unwrap_or(ann))
+                                .and_then(|t| bare_type_name(node_text(t, self.src)))
+                                .map(RecvExpr::Type)
+                                .or_else(|| self.value_type(val, locals));
+                            if let Some(re) = re {
+                                locals.insert(node_text(name, self.src).to_string(), re);
+                            }
+                        }
+                    }
+                }
+            }
+            Language::Java => {
+                if node.kind() == "local_variable_declaration" {
+                    if let Some(ty) = node.child_by_field_name("type") {
+                        if let Some(t) = bare_type_name(node_text(ty, self.src)) {
+                            let mut c = node.walk();
+                            for d in node.named_children(&mut c) {
+                                if d.kind() == "variable_declarator" {
+                                    if let Some(nm) = d.child_by_field_name("name") {
+                                        locals.insert(
+                                            node_text(nm, self.src).to_string(),
+                                            RecvExpr::Type(t.clone()),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Language::C | Language::Cpp | Language::Go => {}
+            Language::Ruby
+            | Language::Php
+            | Language::Kotlin
+            | Language::Swift
+            | Language::Scala
+            | Language::CSharp => unreachable!("tier-3 handled by tier3::extract"),
+        }
+        let mut c = node.walk();
+        for child in node.children(&mut c) {
+            self.walk_assignments(child, locals);
+        }
+    }
+
+    /// The [`RecvExpr`] a right-hand-side *value* produces: a Rust struct literal
+    /// or a construction → its concrete type; a call → that call's return type; a
+    /// transparent wrapper (`v?`, `v.await`, `(v)`) → its inner value.
+    fn value_type(&self, val: Node, locals: &HashMap<String, RecvExpr>) -> Option<RecvExpr> {
+        match val.kind() {
+            "try_expression"
+            | "await_expression"
+            | "parenthesized_expression"
+            | "reference_expression" => self.value_type(val.named_child(0)?, locals),
+            "struct_expression" => {
+                let name = val.child_by_field_name("name")?;
+                Some(RecvExpr::Type(last_path_segment(node_text(name, self.src))))
+            }
+            "new_expression" => {
+                let ctor = val.child_by_field_name("constructor")?;
+                (ctor.kind() == "identifier")
+                    .then(|| RecvExpr::Type(node_text(ctor, self.src).to_string()))
+            }
+            "call_expression" | "call" => {
+                Some(RecvExpr::Return(Box::new(self.call_ref(val, locals)?)))
+            }
+            _ => None,
+        }
+    }
+
+    /// If `node` is a `for x in <call>` loop (Rust/Python) whose loop variable is
+    /// a plain identifier and whose iterable is a *call* (after stripping a Rust
+    /// `&`/`&mut`), return `(var, call_node)`. The element type of the call's
+    /// collection return type will type the loop variable. Iterating a bare local
+    /// (`for x in &v`) is not handled — no collection-element evidence.
+    fn for_binding<'t>(&self, node: Node<'t>) -> Option<(String, Node<'t>)> {
+        let (pat_field, val_field, kind) = match self.lang {
+            Language::Rust => ("pattern", "value", "for_expression"),
+            Language::Python => ("left", "right", "for_statement"),
+            _ => return None,
+        };
+        if node.kind() != kind {
+            return None;
+        }
+        let pat = node.child_by_field_name(pat_field)?;
+        if pat.kind() != "identifier" {
+            return None;
+        }
+        let mut val = node.child_by_field_name(val_field)?;
+        // Rust `for x in &coll` / `&mut coll` — the call, if any, is inside.
+        if val.kind() == "reference_expression" {
+            val = val.named_child(val.named_child_count().checked_sub(1)?)?;
+        }
+        if matches!(val.kind(), "call_expression" | "call") {
+            Some((node_text(pat, self.src).to_string(), val))
+        } else {
+            None
+        }
+    }
 }
 
 /// The last `::`-segment of a Rust path (`geometry::Point` → `Point`).
@@ -1154,223 +1484,6 @@ fn collect_field_types(
         _ => {}
     }
     out
-}
-
-/// Build a `variable name → type name` map for one callable body: parameter
-/// type annotations plus locals assigned from a constructor/associated call.
-/// Deliberately shallow (precision over recall): an un-inferrable receiver
-/// yields no entry and the method call is later dropped rather than guessed.
-fn infer_locals(
-    func: Node,
-    src: &str,
-    lang: Language,
-    encl_type: Option<&str>,
-) -> HashMap<String, String> {
-    let mut locals = HashMap::new();
-    if let Some(t) = encl_type {
-        locals.insert("self".to_string(), t.to_string());
-        locals.insert("this".to_string(), t.to_string());
-    }
-
-    // Parameters with type annotations.
-    if let Some(params) = func.child_by_field_name("parameters") {
-        let mut c = params.walk();
-        for p in params.named_children(&mut c) {
-            infer_param(p, src, lang, encl_type, &mut locals);
-        }
-    }
-
-    // Locals assigned from a constructor / associated call in the body.
-    if let Some(body) = func.child_by_field_name("body") {
-        walk_assignments(body, src, lang, &mut locals);
-    }
-    locals
-}
-
-fn infer_param(
-    p: Node,
-    src: &str,
-    lang: Language,
-    encl_type: Option<&str>,
-    locals: &mut HashMap<String, String>,
-) {
-    match lang {
-        Language::Ruby
-        | Language::Php
-        | Language::Kotlin
-        | Language::Swift
-        | Language::Scala
-        | Language::CSharp => unreachable!("tier-3 handled by tier3::extract"),
-        Language::Rust => {
-            if p.kind() == "self_parameter" {
-                if let Some(t) = encl_type {
-                    locals.insert("self".to_string(), t.to_string());
-                }
-            } else if p.kind() == "parameter" {
-                if let (Some(pat), Some(ty)) = (
-                    p.child_by_field_name("pattern"),
-                    p.child_by_field_name("type"),
-                ) {
-                    if pat.kind() == "identifier" {
-                        if let Some(t) = bare_type_name(node_text(ty, src)) {
-                            locals.insert(node_text(pat, src).to_string(), t);
-                        }
-                    }
-                }
-            }
-        }
-        Language::Python => {
-            if p.kind() == "typed_parameter" {
-                let mut c = p.walk();
-                let name = p.named_children(&mut c).find(|n| n.kind() == "identifier");
-                if let (Some(name), Some(ty)) = (name, p.child_by_field_name("type")) {
-                    if let Some(t) = bare_type_name(node_text(ty, src)) {
-                        locals.insert(node_text(name, src).to_string(), t);
-                    }
-                }
-            }
-        }
-        Language::TypeScript | Language::Tsx | Language::JavaScript => {
-            if matches!(p.kind(), "required_parameter" | "optional_parameter") {
-                if let (Some(pat), Some(ann)) = (
-                    p.child_by_field_name("pattern"),
-                    p.child_by_field_name("type"),
-                ) {
-                    if pat.kind() == "identifier" {
-                        // `type` is a `type_annotation` (`: T`); read its inner type.
-                        let inner = ann.named_child(0).unwrap_or(ann);
-                        if let Some(t) = bare_type_name(node_text(inner, src)) {
-                            locals.insert(node_text(pat, src).to_string(), t);
-                        }
-                    }
-                }
-            }
-        }
-        Language::Java => {
-            // `Point a` → a : Point.
-            if p.kind() == "formal_parameter" {
-                if let (Some(ty), Some(nm)) =
-                    (p.child_by_field_name("type"), p.child_by_field_name("name"))
-                {
-                    if let Some(t) = bare_type_name(node_text(ty, src)) {
-                        locals.insert(node_text(nm, src).to_string(), t);
-                    }
-                }
-            }
-        }
-        // C++/Go resolve method calls by name, so per-parameter local type
-        // inference is unused for them.
-        Language::C | Language::Cpp | Language::Go => {}
-    }
-}
-
-/// Recursively scan a callable body for `var = Ctor(...)` / `let v = Type::f(..)`
-/// / `const v = new T(...)` assignments, recording `var → Type`.
-fn walk_assignments(node: Node, src: &str, lang: Language, locals: &mut HashMap<String, String>) {
-    match lang {
-        Language::Ruby
-        | Language::Php
-        | Language::Kotlin
-        | Language::Swift
-        | Language::Scala
-        | Language::CSharp => unreachable!("tier-3 handled by tier3::extract"),
-        Language::Rust => {
-            if node.kind() == "let_declaration" {
-                if let (Some(pat), Some(val)) = (
-                    node.child_by_field_name("pattern"),
-                    node.child_by_field_name("value"),
-                ) {
-                    if pat.kind() == "identifier" {
-                        if let Some(t) = rust_ctor_type(val, src) {
-                            locals.insert(node_text(pat, src).to_string(), t);
-                        }
-                    }
-                }
-            }
-        }
-        Language::Python => {
-            if node.kind() == "assignment" {
-                if let (Some(left), Some(right)) = (
-                    node.child_by_field_name("left"),
-                    node.child_by_field_name("right"),
-                ) {
-                    if left.kind() == "identifier" && right.kind() == "call" {
-                        if let Some(func) = right.child_by_field_name("function") {
-                            if func.kind() == "identifier" {
-                                locals.insert(
-                                    node_text(left, src).to_string(),
-                                    node_text(func, src).to_string(),
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        Language::TypeScript | Language::Tsx | Language::JavaScript => {
-            if node.kind() == "variable_declarator" {
-                if let (Some(name), Some(val)) = (
-                    node.child_by_field_name("name"),
-                    node.child_by_field_name("value"),
-                ) {
-                    if name.kind() == "identifier" && val.kind() == "new_expression" {
-                        if let Some(ctor) = val.child_by_field_name("constructor") {
-                            if ctor.kind() == "identifier" {
-                                locals.insert(
-                                    node_text(name, src).to_string(),
-                                    node_text(ctor, src).to_string(),
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        Language::Java => {
-            // `Point origin = …;` → origin : Point (the declared type, not the
-            // initializer — Java locals are explicitly typed).
-            if node.kind() == "local_variable_declaration" {
-                if let Some(ty) = node.child_by_field_name("type") {
-                    if let Some(t) = bare_type_name(node_text(ty, src)) {
-                        let mut c = node.walk();
-                        for d in node.named_children(&mut c) {
-                            if d.kind() == "variable_declarator" {
-                                if let Some(nm) = d.child_by_field_name("name") {
-                                    locals.insert(node_text(nm, src).to_string(), t.clone());
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        // C/C++/Go do not use body-assignment local inference.
-        Language::C | Language::Cpp | Language::Go => {}
-    }
-    let mut c = node.walk();
-    for child in node.children(&mut c) {
-        walk_assignments(child, src, lang, locals);
-    }
-}
-
-/// The constructed type of a Rust initializer: `Type::assoc(...)` → `Type`,
-/// `Type { .. }` → `Type`.
-fn rust_ctor_type(val: Node, src: &str) -> Option<String> {
-    match val.kind() {
-        "call_expression" => {
-            let func = val.child_by_field_name("function")?;
-            if func.kind() == "scoped_identifier" {
-                let path = func.child_by_field_name("path")?;
-                return Some(last_path_segment(node_text(path, src)));
-            }
-            None
-        }
-        "struct_expression" => {
-            let name = val.child_by_field_name("name")?;
-            Some(last_path_segment(node_text(name, src)))
-        }
-        _ => None,
-    }
 }
 
 /// Emit a `TypeRef` site for every type identifier appearing in a definition's
@@ -3074,6 +3187,127 @@ impl App {
                 .iter()
                 .any(|e| e.kind == "calls" && target_qn(&e.target) == "Db::query"),
             "self.db.query() resolves to Db::query via field typing"
+        );
+    }
+
+    /// End-to-end (parse → resolve) receiver-type inference: return-type-of-local,
+    /// chained call, and for-loop element — all evidence-based, and an
+    /// un-inferrable receiver (`x` from an unknown source) still drops.
+    #[test]
+    fn receiver_inference_end_to_end() {
+        use crate::resolve::SymbolTable;
+        let src = "\
+pub struct Db;
+impl Db {
+    pub fn open() -> Db { Db }
+    pub fn query(&self) {}
+    pub fn rows(&self) -> Vec<Row> { Vec::new() }
+}
+pub struct Row;
+impl Row { pub fn cell(&self) {} }
+pub fn all() -> Vec<Db> { Vec::new() }
+pub fn go(x: Unknown) {
+    let db = Db::open();
+    db.query();                 // return-type-of-local -> Db::query
+    Db::open().query();         // chained -> Db::query
+    for d in all() { d.query(); } // for-loop element -> Db::query
+    for r in db.rows() { r.cell(); } // chained-call for-loop -> Row::cell
+    x.mystery();                // un-inferrable receiver -> dropped
+}
+";
+        let ex = extract(src, "a.rs", Language::Rust, 0, 0);
+        let edges = SymbolTable::build(&ex.nodes).resolve_all(&ex.sites);
+        let tqn = |id: &str| {
+            ex.nodes
+                .iter()
+                .find(|n| n.id == id)
+                .map(|n| n.qualified_name.clone())
+                .unwrap_or_default()
+        };
+        let calls: Vec<String> = edges
+            .iter()
+            .filter(|e| e.kind == "calls")
+            .map(|e| tqn(&e.target))
+            .collect();
+        // Db::query resolved from a local, a chain, and a for-loop element.
+        assert!(
+            calls.iter().filter(|q| *q == "Db::query").count() >= 3,
+            "expected >=3 Db::query calls, got {calls:?}"
+        );
+        // The chained-call for-loop `for r in db.rows()` types `r` as Row.
+        assert!(calls.iter().any(|q| q == "Row::cell"), "{calls:?}");
+        // The un-inferrable `x.mystery()` is dropped (no `mystery` target).
+        assert!(
+            !calls
+                .iter()
+                .any(|q| q.ends_with("::mystery") || q == "mystery"),
+            "un-inferrable receiver must drop: {calls:?}"
+        );
+    }
+
+    /// Typed-Python: a parameter annotation and a constructor assignment type the
+    /// receiver.
+    #[test]
+    fn python_typed_receiver_inference() {
+        use crate::resolve::SymbolTable;
+        let src = "\
+class Agent:
+    def ask(self): ...
+
+class Client:
+    def send(self): ...
+
+def run(c: Client):
+    c.send()          # param annotation -> Client::send
+    agent = Agent()
+    agent.ask()       # constructor assignment -> Agent::ask
+";
+        let ex = extract(src, "a.py", Language::Python, 0, 0);
+        let edges = SymbolTable::build(&ex.nodes).resolve_all(&ex.sites);
+        let tqn = |id: &str| {
+            ex.nodes
+                .iter()
+                .find(|n| n.id == id)
+                .map(|n| n.qualified_name.clone())
+                .unwrap_or_default()
+        };
+        let calls: Vec<String> = edges
+            .iter()
+            .filter(|e| e.kind == "calls")
+            .map(|e| tqn(&e.target))
+            .collect();
+        assert!(calls.iter().any(|q| q == "Client::send"), "{calls:?}");
+        assert!(calls.iter().any(|q| q == "Agent::ask"), "{calls:?}");
+    }
+
+    /// rev-44 BLOCKER (end-to-end): a TS/JS `T[]`-returning call must not
+    /// fabricate an element-type method call. `const list = items(); list.find()`
+    /// is `Array.prototype.find`, not `Query::find`.
+    #[test]
+    fn ts_array_return_does_not_fabricate_method_call() {
+        use crate::resolve::SymbolTable;
+        let src = "\
+class Query { run(): void {} }
+function items(): Query[] { return []; }
+function go(): void {
+  const list = items();
+  list.run();
+}
+";
+        let ex = extract(src, "a.ts", Language::TypeScript, 0, 0);
+        let edges = SymbolTable::build(&ex.nodes).resolve_all(&ex.sites);
+        let tqn = |id: &str| {
+            ex.nodes
+                .iter()
+                .find(|n| n.id == id)
+                .map(|n| n.qualified_name.clone())
+                .unwrap_or_default()
+        };
+        assert!(
+            !edges
+                .iter()
+                .any(|e| e.kind == "calls" && tqn(&e.target) == "Query::run"),
+            "list.run() on a Query[] must not resolve to Query::run"
         );
     }
 }

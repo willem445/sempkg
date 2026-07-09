@@ -66,10 +66,13 @@ pub(crate) enum SitePayload {
     CallOrCtor { name: String },
     /// A qualified `qualifier::name(...)` path call (Rust) → `calls`.
     QualifiedCall { qualifier: String, name: String },
-    /// A `recv.name(...)` method call. `recv_type` is the receiver's locally
-    /// inferred type, or `None` when it could not be inferred (then dropped).
+    /// A `recv.name(...)` method call. `recv` describes the receiver — a concrete
+    /// type known at parse time, or a call whose *return type* types the receiver
+    /// (`let db = open(); db.query()`, or a chain `build().resolve_all()`). `None`
+    /// when the receiver could not be typed at all (then dropped — precision over
+    /// recall; a bare method name is never guessed).
     MethodCall {
-        recv_type: Option<String>,
+        recv: Option<RecvExpr>,
         name: String,
     },
     /// A `new Name(...)` expression (TS/JS) → `instantiates`.
@@ -99,6 +102,39 @@ pub(crate) enum SitePayload {
     /// 0.9.7: a target `interface` (Swift protocol / C# interface) → `implements`,
     /// anything else (a class/struct base) → `extends`. `parent` is the type name.
     InheritAuto { parent: String },
+}
+
+/// How a method call's receiver is typed. Either a concrete type known at parse
+/// time, or a call whose *return type* types the receiver (resolved in pass 2,
+/// where the global symbol table's signatures are available).
+#[derive(Debug, Clone)]
+pub(crate) enum RecvExpr {
+    /// A concrete type name known at parse time — `self`/`this` → the enclosing
+    /// type, a `self.field` → the field's declared type, a typed parameter, or a
+    /// constructor-typed local.
+    Type(String),
+    /// The receiver is the value of a call; its type is that call's resolved
+    /// return type. Covers `let x = f(); x.m()` (a local bound to a call) and a
+    /// chain `a.b().m()` (the receiver *is* a call).
+    Return(Box<CallRef>),
+    /// The receiver is a loop variable over a call's collection return type; its
+    /// type is that collection's element type — `for x in reg.list() { x.m() }`
+    /// with `list() -> Vec<Pkg>` types `x` as `Pkg`.
+    Element(Box<CallRef>),
+}
+
+/// A syntactic reference to a called function/method, resolved in pass 2 to its
+/// definition (and thence its return type). Precision-preserving: each variant
+/// resolves through the same language-scoped, ambiguity-dropping lookups as a
+/// direct call, so an ambiguous or un-inferrable callee yields no type.
+#[derive(Debug, Clone)]
+pub(crate) enum CallRef {
+    /// `f(...)` — a bare function call.
+    Bare { name: String },
+    /// `Type::assoc(...)` (Rust) — a qualified associated-function call.
+    Qualified { qualifier: String, name: String },
+    /// `recv.m(...)` — a method call; `recv` is itself typed recursively.
+    Method { recv: RecvExpr, name: String },
 }
 
 /// A resolved target plus how it was found (for the edge's `metadata`).
@@ -256,18 +292,17 @@ impl<'a> SymbolTable<'a> {
                 let r = self.resolve_qualified(from_file, &qn, QUALIFIED_CALL_KINDS)?;
                 Some(self.edge_meta(site, "calls", r.node, "qualified-name", 0.95))
             }
-            SitePayload::MethodCall { recv_type, name } => {
-                // Resolve ONLY when the receiver's type was inferred locally (a
-                // typed local/parameter, `self`, or a `self.field` typed from the
-                // enclosing type's fields) → `Type::name`. An un-inferrable
-                // receiver is DROPPED, never resolved by method name alone: a bare
-                // method name routinely collides with a std/library method of the
-                // same name (`.as_str()` on a `String`, `.get()` on a `HashMap`),
-                // so name-based resolution would *fabricate* an edge to a
-                // same-named project symbol. Precision over recall (issue #78);
-                // CodeGraph's name-resolved edges that we decline are whitelisted
-                // as fabrications, not imitated.
-                let ty = recv_type.as_ref()?;
+            SitePayload::MethodCall { recv, name } => {
+                // Resolve ONLY when the receiver's type is *evidence-based*: a
+                // typed local/parameter, `self`, a `self.field`, or the resolved
+                // return type of a call (`let db = open(); db.query()`, a chain
+                // `build().resolve_all()`). An un-inferrable receiver is DROPPED,
+                // never resolved by method name alone — a bare method name
+                // routinely collides with a std/library method (`.as_str()` on a
+                // `String`, `.get()` on a `HashMap`), so name-based resolution
+                // would *fabricate* an edge to a same-named project symbol.
+                // Precision over recall (issue #78).
+                let ty = self.resolve_recv(from_file, recv.as_ref()?, 0)?;
                 let qn = format!("{ty}::{name}");
                 let r = self.resolve_qualified(from_file, &qn, CALLABLE_KINDS)?;
                 Some(self.edge_meta(site, "calls", r.node, "instance-method", 0.7))
@@ -467,6 +502,149 @@ impl<'a> SymbolTable<'a> {
         })
     }
 
+    /// Like [`Self::resolve_qualified`] but **drops** on same-language ambiguity
+    /// instead of a lexicographic tie-break. Used when the resolved callee's
+    /// *return type* matters (return-type / chained inference): two same-named
+    /// methods can have different return types, so picking one arbitrarily would
+    /// fabricate a downstream edge. Same-file / imported-file evidence still pins
+    /// unambiguously; a genuinely ambiguous global name yields `None` — matching
+    /// the bare-name path (rev-44).
+    fn resolve_qualified_strict(
+        &self,
+        from_file: &str,
+        qn: &str,
+        kinds: &[&str],
+    ) -> Option<Resolved<'a>> {
+        let caller_lang = self.language_of(from_file);
+        let cands: Vec<usize> = self
+            .by_qn
+            .get(qn)
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|&i| kinds.contains(&self.nodes[i].kind.as_str()))
+            .filter(|&i| caller_lang.is_none_or(|l| self.nodes[i].language == l))
+            .collect();
+        let i = self
+            .pick(&cands, |n| n.file_path == from_file)
+            .or_else(|| {
+                self.imported_files.get(from_file).and_then(|imports| {
+                    self.pick(&cands, |n| imports.iter().any(|f| f == &n.file_path))
+                })
+            })
+            // No same-file/import pin: resolve only when globally unambiguous.
+            .or_else(|| (cands.len() == 1).then(|| cands[0]))?;
+        Some(Resolved {
+            node: &self.nodes[i],
+            resolved_by: "qualified-name",
+            confidence: 0.95,
+        })
+    }
+
+    /// Type a method-call receiver ([`RecvExpr`]) to a concrete type name, or
+    /// `None` if the evidence doesn't pin one. `depth` bounds a `a.b().c()…` chain.
+    fn resolve_recv(&self, from_file: &str, recv: &RecvExpr, depth: usize) -> Option<String> {
+        // Bound the chain walk so a pathological signature graph can't loop.
+        if depth > 16 {
+            return None;
+        }
+        match recv {
+            RecvExpr::Type(t) => Some(t.clone()),
+            RecvExpr::Return(cref) => self.callref_type(from_file, cref, depth),
+            RecvExpr::Element(cref) => {
+                // The element type of the call's collection return type.
+                let full = self.callref_return_full(from_file, cref, depth)?;
+                element_type(&full)
+            }
+        }
+    }
+
+    /// The type produced by a [`CallRef`]: a function/method call yields its
+    /// resolved *return type*; a constructor call (a bare name that resolves to a
+    /// class/struct, e.g. Python `Agent(...)`) yields that type. Every lookup is
+    /// the same language-scoped, ambiguity-dropping resolution used for a direct
+    /// call, so an ambiguous or un-inferrable callee yields `None`.
+    fn callref_type(&self, from_file: &str, cref: &CallRef, depth: usize) -> Option<String> {
+        match cref {
+            CallRef::Bare { name } => {
+                if let Some(r) = self.resolve_name(from_file, name, CALLABLE_KINDS) {
+                    return self.return_type_of(r.node);
+                }
+                // A bare call to a class/struct is a constructor → that type.
+                self.resolve_name(from_file, name, CLASS_KINDS)
+                    .map(|r| r.node.name.clone())
+            }
+            CallRef::Qualified { qualifier, name } => {
+                let qn = format!("{qualifier}::{name}");
+                let r = self.resolve_qualified_strict(from_file, &qn, CALLABLE_KINDS)?;
+                self.return_type_of(r.node)
+            }
+            CallRef::Method { recv, name } => {
+                let ty = self.resolve_recv(from_file, recv, depth + 1)?;
+                let qn = format!("{ty}::{name}");
+                let r = self.resolve_qualified_strict(from_file, &qn, CALLABLE_KINDS)?;
+                self.return_type_of(r.node)
+            }
+        }
+    }
+
+    /// The bare type NAME a callable returns (`GraphDb`, `Vec` from `Vec<T>`),
+    /// for `Type::method` resolution. See [`Self::return_type_full`] for the
+    /// generic-preserving form used by element inference.
+    fn return_type_of(&self, node: &NodeRecord) -> Option<String> {
+        let full = self.return_type_full(node)?;
+        // A collection or union return is NOT a project type to resolve methods
+        // on: `items(): Query[]` returns an Array (its `.find()` is
+        // Array.prototype.find, not Query::find), and `A | B` has no single type.
+        // Bare-naming would strip `Query[]` to `Query` and pick a union arm — both
+        // fabricate. The for-loop `Element` path uses `return_type_full` directly,
+        // so element inference still works.
+        if is_collection_type(&full) || is_union_type(&full) {
+            return None;
+        }
+        bare_type_name(&full)
+    }
+
+    /// The type a callable returns, keeping collection generics intact
+    /// (`Vec<LocalPackage>`) and with transparent wrappers unwrapped and Rust
+    /// `Self` resolved to the callee's enclosing type. A class-like callee (a
+    /// bare constructor call) returns its own name.
+    fn return_type_full(&self, node: &NodeRecord) -> Option<String> {
+        if CLASS_KINDS.contains(&node.kind.as_str()) || node.kind == "enum" {
+            return Some(node.name.clone());
+        }
+        let sig = node.signature.as_deref()?;
+        let ret = extract_return_type(sig)?;
+        if ret == "Self" {
+            // The callee's enclosing type: `GraphDb::open` → `GraphDb`.
+            return node
+                .qualified_name
+                .rsplit_once("::")
+                .map(|(ty, _)| ty.to_string());
+        }
+        Some(ret)
+    }
+
+    /// Like [`Self::callref_type`] but keeps the callee's full generic return type
+    /// (`Vec<LocalPackage>`), so a loop variable's element type can be read.
+    fn callref_return_full(&self, from_file: &str, cref: &CallRef, depth: usize) -> Option<String> {
+        let node = match cref {
+            CallRef::Bare { name } => self.resolve_name(from_file, name, CALLABLE_KINDS)?.node,
+            CallRef::Qualified { qualifier, name } => {
+                let qn = format!("{qualifier}::{name}");
+                self.resolve_qualified_strict(from_file, &qn, CALLABLE_KINDS)?
+                    .node
+            }
+            CallRef::Method { recv, name } => {
+                let ty = self.resolve_recv(from_file, recv, depth + 1)?;
+                let qn = format!("{ty}::{name}");
+                self.resolve_qualified_strict(from_file, &qn, CALLABLE_KINDS)?
+                    .node
+            }
+        };
+        self.return_type_full(node)
+    }
+
     /// Pick the candidate (lowest index for stability, then smallest file path)
     /// satisfying `pred`, if any.
     fn pick(&self, cands: &[usize], pred: impl Fn(&NodeRecord) -> bool) -> Option<usize> {
@@ -613,6 +791,205 @@ fn join_relative(dir: &str, rel: &str) -> String {
     parts.join("/")
 }
 
+/// Extract the bare return-type name from a stored callable `signature`
+/// (`(params) -> Ret` for Rust/Python, `(params): Ret` for TS/JS). Transparent
+/// wrappers are unwrapped to the value type and the result is reduced to a bare
+/// name; `Self` is passed through for the caller to resolve to the callee's type.
+/// Returns `None` when the signature has no return type.
+///
+/// Robust to `->`/`:` inside the parameter list (a `fn`-typed param, a typed TS
+/// param) by matching the parameter list's parentheses first.
+fn extract_return_type(sig: &str) -> Option<String> {
+    let bytes = sig.as_bytes();
+    if bytes.first() != Some(&b'(') {
+        return None;
+    }
+    let mut depth = 0i32;
+    let mut close = None;
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let tail = sig.get(close? + 1..)?.trim_start();
+    let ret = if let Some(r) = tail.strip_prefix("->") {
+        r.trim()
+    } else if let Some(r) = tail.strip_prefix(':') {
+        r.trim()
+    } else {
+        return None;
+    };
+    if ret.is_empty() {
+        return None;
+    }
+    // Unwrap transparent wrappers but keep any collection generics intact
+    // (`Result<Vec<Pkg>>` → `Vec<Pkg>`), so both a bare-name and an element-type
+    // reading are possible. `Self` is passed through for the caller to resolve.
+    let unwrapped = unwrap_transparent(ret);
+    if unwrapped.is_empty() {
+        None
+    } else {
+        Some(unwrapped.to_string())
+    }
+}
+
+/// Peel transparent single-value wrappers off a return type so a chained call on
+/// the *value* types correctly: `Result<GraphDb>`/`Option<GraphDb>` →`GraphDb`,
+/// `Promise<Scalar>`/`Awaitable[Foo]`/`Optional[Foo]` → the inner. Only wrappers
+/// whose FIRST type argument is the produced value are peeled (never `Vec`/`Map`,
+/// whose element type is not what `.method()` is called on).
+fn unwrap_transparent(ty: &str) -> &str {
+    const WRAPPERS: &[&str] = &[
+        "Result",
+        "Option",
+        "Box",
+        "Arc",
+        "Rc",
+        "Promise",
+        "Optional",
+        "Awaitable",
+        "Future",
+    ];
+    let mut cur = ty.trim();
+    while let Some(open) = cur.find(['<', '[']) {
+        let name = cur[..open].trim();
+        if !WRAPPERS.contains(&name) {
+            break;
+        }
+        match first_generic_arg(&cur[open..]) {
+            Some(inner) => cur = inner.trim(),
+            None => break,
+        }
+    }
+    cur
+}
+
+/// Container type constructors whose value is a collection, not a single project
+/// type — a method call on the whole value is a collection method, not the
+/// element's. Covers Rust, TS/JS, and Python typing names.
+const CONTAINERS: &[&str] = &[
+    "Vec",
+    "VecDeque",
+    "Deque",
+    "Array",
+    "ReadonlyArray",
+    "HashMap",
+    "BTreeMap",
+    "IndexMap",
+    "HashSet",
+    "BTreeSet",
+    "IndexSet",
+    "FrozenSet",
+    "Set",
+    "Map",
+    "List",
+    "Dict",
+    "Tuple",
+    "Sequence",
+    "Iterator",
+    "Iterable",
+];
+
+/// Whether a return-type string is a collection — a postfix array (`T[]`,
+/// `readonly T[]`), a Rust slice (`[T]`), or a known container generic
+/// (`Vec<T>` / `Array<T>` / `List[T]` …). Such a value's `.method()` is a
+/// collection method, so it must not type a receiver (only its element type can,
+/// via the for-loop `Element` path).
+fn is_collection_type(ty: &str) -> bool {
+    let mut t = ty.trim();
+    t = t.strip_prefix("readonly ").unwrap_or(t).trim();
+    t = t.trim_start_matches('&').trim();
+    t = t.strip_prefix("mut ").unwrap_or(t).trim();
+    if t.ends_with("[]") || t.starts_with('[') {
+        return true;
+    }
+    if let Some(open) = t.find(['<', '[']) {
+        let name = t[..open]
+            .trim()
+            .rsplit([':', '.'])
+            .next()
+            .unwrap_or("")
+            .trim();
+        if CONTAINERS.contains(&name) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether a return-type string is a top-level union (`A | B`, TS) — no single
+/// type to resolve a method on, so it types nothing.
+fn is_union_type(ty: &str) -> bool {
+    let mut depth = 0i32;
+    for c in ty.chars() {
+        match c {
+            '<' | '[' | '(' => depth += 1,
+            '>' | ']' | ')' => depth -= 1,
+            '|' if depth == 0 => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// The element type NAME of a collection type: `Vec<Pkg>` / `&[Pkg]` /
+/// `VecDeque<Pkg>` / `HashSet<Pkg>` → `Pkg`, and a postfix array `Pkg[]` → `Pkg`.
+/// The first type argument of the outermost `<…>`/`[…]` (or the base of a postfix
+/// array), bare-named. `None` if there is no element to read.
+fn element_type(ty: &str) -> Option<String> {
+    let mut ty = ty.trim();
+    ty = ty.strip_prefix("readonly ").unwrap_or(ty).trim();
+    ty = ty.trim_start_matches('&').trim();
+    ty = ty.strip_prefix("mut ").unwrap_or(ty).trim();
+    // Postfix array `T[]` → `T`; else the first type argument of `Vec<T>`/`[T]`.
+    let elem = if let Some(base) = ty.strip_suffix("[]") {
+        base.trim()
+    } else {
+        let open = ty.find(['<', '['])?;
+        first_generic_arg(&ty[open..])?
+    };
+    // An element that is itself a collection or union types nothing (a method on
+    // a `Vec<Vec<T>>`/`T[][]` element is a collection method).
+    if is_collection_type(elem) || is_union_type(elem) {
+        return None;
+    }
+    bare_type_name(elem)
+}
+
+/// The first type argument of a `<A, B>` / `[A, B]` list (given the slice
+/// starting at the opening bracket): `<Vec<T>, E>` → `Vec<T>`.
+fn first_generic_arg(s: &str) -> Option<&str> {
+    let mut depth = 0i32;
+    let mut start = None;
+    for (i, c) in s.char_indices() {
+        match c {
+            '<' | '[' => {
+                depth += 1;
+                if depth == 1 {
+                    start = Some(i + c.len_utf8());
+                }
+            }
+            '>' | ']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(s[start?..i].trim());
+                }
+            }
+            ',' if depth == 1 => return Some(s[start?..i].trim()),
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Best-effort extraction of a bare type name from a Rust/TS type-annotation
 /// fragment: strip references, `mut`, whitespace, and any generic/tuple tail.
 /// Used by the parser's local type inference. Returns `None` for empty input.
@@ -694,13 +1071,20 @@ mod tests {
         NodeRecord::new(kind, name, qn, file, lang, 1, 3, 0, 0, 0)
     }
 
+    /// A node with a `signature` set (for return-type inference tests).
+    fn node_sig(kind: &str, name: &str, qn: &str, file: &str, lang: &str, sig: &str) -> NodeRecord {
+        let mut n = NodeRecord::new(kind, name, qn, file, lang, 1, 3, 0, 0, 0);
+        n.signature = Some(sig.to_string());
+        n
+    }
+
     fn method_call_site(from_id: &str, recv_type: &str, name: &str) -> RawSite {
         RawSite {
             from_id: from_id.to_string(),
             line: 2,
             col: 4,
             payload: SitePayload::MethodCall {
-                recv_type: Some(recv_type.to_string()),
+                recv: Some(RecvExpr::Type(recv_type.to_string())),
                 name: name.to_string(),
             },
         }
@@ -816,7 +1200,7 @@ mod tests {
             line: 2,
             col: 0,
             payload: SitePayload::MethodCall {
-                recv_type: None,
+                recv: None,
                 name: name.to_string(),
             },
         };
@@ -913,5 +1297,455 @@ mod tests {
             },
         };
         assert!(SymbolTable::build(&nodes2).resolve_all(&[site2]).is_empty());
+    }
+
+    // ---- receiver-type inference (return-type / chained / for-loop) ----------
+
+    #[test]
+    fn extract_return_type_and_element_parse_signatures() {
+        // Rust `->`, TS `):`, wrapper unwrap, Self passthrough, fn-typed param.
+        assert_eq!(
+            extract_return_type("(&self) -> Scalar").as_deref(),
+            Some("Scalar")
+        );
+        assert_eq!(
+            extract_return_type("(p: &Path) -> Result<GraphDb>").as_deref(),
+            Some("GraphDb")
+        );
+        assert_eq!(
+            extract_return_type("(): Promise<Foo>").as_deref(),
+            Some("Foo")
+        );
+        assert_eq!(
+            extract_return_type("(self) -> Optional[Bar]").as_deref(),
+            Some("Bar")
+        );
+        assert_eq!(
+            extract_return_type("(r: f64) -> Self").as_deref(),
+            Some("Self")
+        );
+        assert_eq!(extract_return_type("(a: i32)").as_deref(), None); // no return type
+                                                                      // A `->` inside a fn-typed parameter must not be read as the return type.
+        assert_eq!(extract_return_type("(f: fn() -> i32)").as_deref(), None);
+        // Element type of a collection return.
+        assert_eq!(
+            element_type("Vec<LocalPackage>").as_deref(),
+            Some("LocalPackage")
+        );
+        assert_eq!(element_type("&[Pkg]").as_deref(), Some("Pkg"));
+        assert_eq!(element_type("GraphDb"), None); // not a collection
+    }
+
+    /// `let db = open(); db.query()` — `db` is typed by `open`'s (wrapped) return
+    /// type, so `db.query()` resolves to `GraphDb::query`.
+    #[test]
+    fn return_type_of_local_resolves_method() {
+        let caller = node("function", "f", "f", "a.rs", "rust");
+        let cid = caller.id.clone();
+        let query = node("method", "query", "GraphDb::query", "a.rs", "rust");
+        let qid = query.id.clone();
+        let nodes = vec![
+            node("file", "a.rs", "a.rs", "a.rs", "rust"),
+            caller,
+            node_sig(
+                "function",
+                "open",
+                "open",
+                "a.rs",
+                "rust",
+                "(p: &Path) -> Result<GraphDb>",
+            ),
+            node("struct", "GraphDb", "GraphDb", "a.rs", "rust"),
+            query,
+        ];
+        let site = RawSite {
+            from_id: cid,
+            line: 2,
+            col: 0,
+            payload: SitePayload::MethodCall {
+                recv: Some(RecvExpr::Return(Box::new(CallRef::Bare {
+                    name: "open".into(),
+                }))),
+                name: "query".into(),
+            },
+        };
+        let edges = SymbolTable::build(&nodes).resolve_all(&[site]);
+        assert_eq!(edges.len(), 1, "db.query() should resolve: {edges:?}");
+        assert_eq!(edges[0].target, qid);
+    }
+
+    /// A chained call `build().resolve_all()` resolves the outer method through
+    /// the inner call's return type.
+    #[test]
+    fn chained_call_resolves_via_inner_return_type() {
+        let caller = node("function", "f", "f", "a.rs", "rust");
+        let cid = caller.id.clone();
+        let resolve_all = node(
+            "method",
+            "resolve_all",
+            "SymbolTable::resolve_all",
+            "a.rs",
+            "rust",
+        );
+        let rid = resolve_all.id.clone();
+        let nodes = vec![
+            node("file", "a.rs", "a.rs", "a.rs", "rust"),
+            caller,
+            node_sig(
+                "method",
+                "build",
+                "SymbolTable::build",
+                "a.rs",
+                "rust",
+                "(nodes: &[NodeRecord]) -> SymbolTable",
+            ),
+            node("struct", "SymbolTable", "SymbolTable", "a.rs", "rust"),
+            resolve_all,
+        ];
+        let site = RawSite {
+            from_id: cid,
+            line: 2,
+            col: 0,
+            payload: SitePayload::MethodCall {
+                recv: Some(RecvExpr::Return(Box::new(CallRef::Qualified {
+                    qualifier: "SymbolTable".into(),
+                    name: "build".into(),
+                }))),
+                name: "resolve_all".into(),
+            },
+        };
+        let edges = SymbolTable::build(&nodes).resolve_all(&[site]);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].target, rid);
+    }
+
+    /// `for pkg in list() { pkg.abs_path() }` — the loop variable's type is the
+    /// element of `list()`'s `Vec<LocalPackage>` return.
+    #[test]
+    fn for_loop_element_type_resolves_method() {
+        let caller = node("function", "run", "run", "a.rs", "rust");
+        let cid = caller.id.clone();
+        let abs = node(
+            "method",
+            "abs_path",
+            "LocalPackage::abs_path",
+            "a.rs",
+            "rust",
+        );
+        let aid = abs.id.clone();
+        let nodes = vec![
+            node("file", "a.rs", "a.rs", "a.rs", "rust"),
+            caller,
+            node_sig(
+                "function",
+                "list",
+                "list",
+                "a.rs",
+                "rust",
+                "() -> Vec<LocalPackage>",
+            ),
+            node("struct", "LocalPackage", "LocalPackage", "a.rs", "rust"),
+            abs,
+        ];
+        let site = RawSite {
+            from_id: cid,
+            line: 2,
+            col: 0,
+            payload: SitePayload::MethodCall {
+                recv: Some(RecvExpr::Element(Box::new(CallRef::Bare {
+                    name: "list".into(),
+                }))),
+                name: "abs_path".into(),
+            },
+        };
+        let edges = SymbolTable::build(&nodes).resolve_all(&[site]);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].target, aid);
+    }
+
+    /// Adversarial: an ambiguous callee (two `open`s with *different* return
+    /// types) must drop — the receiver type is not evidence-based, so no edge.
+    #[test]
+    fn ambiguous_callee_return_type_drops() {
+        let caller = node("function", "f", "f", "top.rs", "rust");
+        let cid = caller.id.clone();
+        let nodes = vec![
+            node("file", "top.rs", "top.rs", "top.rs", "rust"),
+            node("file", "a.rs", "a.rs", "a.rs", "rust"),
+            node("file", "b.rs", "b.rs", "b.rs", "rust"),
+            caller,
+            // Two cross-file `open`s → `resolve_name` can't disambiguate.
+            node_sig("function", "open", "open", "a.rs", "rust", "() -> GraphDb"),
+            node_sig("function", "open", "open", "b.rs", "rust", "() -> Widget"),
+            node("struct", "GraphDb", "GraphDb", "a.rs", "rust"),
+            node("method", "query", "GraphDb::query", "a.rs", "rust"),
+        ];
+        let site = RawSite {
+            from_id: cid,
+            line: 2,
+            col: 0,
+            payload: SitePayload::MethodCall {
+                recv: Some(RecvExpr::Return(Box::new(CallRef::Bare {
+                    name: "open".into(),
+                }))),
+                name: "query".into(),
+            },
+        };
+        assert!(
+            SymbolTable::build(&nodes).resolve_all(&[site]).is_empty(),
+            "ambiguous open() must not type db → no edge"
+        );
+    }
+
+    /// A `Type::new() -> Self` return resolves to the callee's enclosing type, and
+    /// a bare constructor call (Python `Agent(...)`) types the value as the class.
+    #[test]
+    fn self_return_and_constructor_type_the_receiver() {
+        // Self: `Point::origin() -> Self`; `p = Point::origin(); p.dist()`.
+        let caller = node("function", "f", "f", "a.rs", "rust");
+        let cid = caller.id.clone();
+        let dist = node("method", "dist", "Point::dist", "a.rs", "rust");
+        let did = dist.id.clone();
+        let nodes = vec![
+            node("file", "a.rs", "a.rs", "a.rs", "rust"),
+            caller,
+            node_sig(
+                "method",
+                "origin",
+                "Point::origin",
+                "a.rs",
+                "rust",
+                "() -> Self",
+            ),
+            node("struct", "Point", "Point", "a.rs", "rust"),
+            dist,
+        ];
+        let site = RawSite {
+            from_id: cid,
+            line: 2,
+            col: 0,
+            payload: SitePayload::MethodCall {
+                recv: Some(RecvExpr::Return(Box::new(CallRef::Qualified {
+                    qualifier: "Point".into(),
+                    name: "origin".into(),
+                }))),
+                name: "dist".into(),
+            },
+        };
+        let edges = SymbolTable::build(&nodes).resolve_all(&[site]);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].target, did);
+
+        // Constructor: Python `agent = Agent(); agent.ask()`.
+        let pf = node("function", "g", "g", "p.py", "python");
+        let pid = pf.id.clone();
+        let ask = node("method", "ask", "Agent::ask", "p.py", "python");
+        let ask_id = ask.id.clone();
+        let pnodes = vec![
+            node("file", "p.py", "p.py", "p.py", "python"),
+            pf,
+            node("class", "Agent", "Agent", "p.py", "python"),
+            ask,
+        ];
+        let psite = RawSite {
+            from_id: pid,
+            line: 2,
+            col: 0,
+            payload: SitePayload::MethodCall {
+                recv: Some(RecvExpr::Return(Box::new(CallRef::Bare {
+                    name: "Agent".into(),
+                }))),
+                name: "ask".into(),
+            },
+        };
+        let pedges = SymbolTable::build(&pnodes).resolve_all(&[psite]);
+        assert_eq!(pedges.len(), 1);
+        assert_eq!(pedges[0].target, ask_id);
+    }
+
+    #[test]
+    fn collection_and_union_type_detection() {
+        assert!(is_collection_type("Query[]"));
+        assert!(is_collection_type("readonly Query[]"));
+        assert!(is_collection_type("Query[][]"));
+        assert!(is_collection_type("&[Pkg]"));
+        assert!(is_collection_type("Vec<Pkg>"));
+        assert!(is_collection_type("Array<Query>"));
+        assert!(is_collection_type("List[Pkg]"));
+        assert!(!is_collection_type("GraphDb"));
+        assert!(!is_collection_type("Result")); // a bare wrapper name, not a collection
+        assert!(is_union_type("A | B"));
+        assert!(is_union_type("Foo<A | B> | Bar"));
+        assert!(!is_union_type("Foo<A | B>")); // the `|` is nested
+        assert!(!is_union_type("GraphDb"));
+        // Element extraction, incl. postfix arrays and nested-collection rejection.
+        assert_eq!(element_type("Query[]").as_deref(), Some("Query"));
+        assert_eq!(element_type("Vec<Pkg>").as_deref(), Some("Pkg"));
+        assert_eq!(element_type("&[Pkg]").as_deref(), Some("Pkg"));
+        assert_eq!(element_type("Vec<Vec<T>>"), None); // element is itself a collection
+        assert_eq!(element_type("T[][]"), None);
+    }
+
+    /// rev-44 BLOCKER: a `T[]`-returning call must NOT type the receiver as `T`
+    /// (`list = items(); list.find()` is `Array.prototype.find`, not `Query::find`).
+    /// The for-loop `Element` path over the same call still resolves.
+    #[test]
+    fn ts_array_return_does_not_fabricate_but_element_does() {
+        let caller = node("function", "f", "f", "a.ts", "typescript");
+        let cid = caller.id.clone();
+        let run = node("method", "run", "Query::run", "a.ts", "typescript");
+        let run_id = run.id.clone();
+        let base = vec![
+            node("file", "a.ts", "a.ts", "a.ts", "typescript"),
+            caller,
+            node_sig(
+                "function",
+                "items",
+                "items",
+                "a.ts",
+                "typescript",
+                "(): Query[]",
+            ),
+            node("class", "Query", "Query", "a.ts", "typescript"),
+            run,
+        ];
+        let mk = |recv: RecvExpr| RawSite {
+            from_id: cid.clone(),
+            line: 2,
+            col: 0,
+            payload: SitePayload::MethodCall {
+                recv: Some(recv),
+                name: "run".into(),
+            },
+        };
+        // `const list = items(); list.run()` — list is an Array, NOT a Query.
+        let ret_edges = SymbolTable::build(&base).resolve_all(&[mk(RecvExpr::Return(Box::new(
+            CallRef::Bare {
+                name: "items".into(),
+            },
+        )))]);
+        assert!(
+            ret_edges.is_empty(),
+            "T[] return must not type the receiver as T: {ret_edges:?}"
+        );
+        // `for x of items() { x.run() }` — x IS a Query.
+        let elem_edges = SymbolTable::build(&base).resolve_all(&[mk(RecvExpr::Element(Box::new(
+            CallRef::Bare {
+                name: "items".into(),
+            },
+        )))]);
+        assert_eq!(elem_edges.len(), 1, "element path should resolve");
+        assert_eq!(elem_edges[0].target, run_id);
+    }
+
+    /// rev-44 (1): a union return type `A | B` types nothing (no arbitrary pick).
+    #[test]
+    fn union_return_type_yields_no_receiver() {
+        let caller = node("function", "f", "f", "a.ts", "typescript");
+        let cid = caller.id.clone();
+        let nodes = vec![
+            node("file", "a.ts", "a.ts", "a.ts", "typescript"),
+            caller,
+            node_sig(
+                "function",
+                "pick",
+                "pick",
+                "a.ts",
+                "typescript",
+                "(): A | B",
+            ),
+            node("class", "A", "A", "a.ts", "typescript"),
+            node("method", "m", "A::m", "a.ts", "typescript"),
+        ];
+        let site = RawSite {
+            from_id: cid,
+            line: 2,
+            col: 0,
+            payload: SitePayload::MethodCall {
+                recv: Some(RecvExpr::Return(Box::new(CallRef::Bare {
+                    name: "pick".into(),
+                }))),
+                name: "m".into(),
+            },
+        };
+        assert!(SymbolTable::build(&nodes).resolve_all(&[site]).is_empty());
+    }
+
+    /// rev-44 (2): the qualified/chained callee path DROPS on same-language
+    /// ambiguity (two `T::make` with different return types) — the wrong-of-two
+    /// standard applies to every path, not just the bare-name one.
+    #[test]
+    fn ambiguous_qualified_callee_return_type_drops() {
+        let caller = node("function", "f", "f", "top.rs", "rust");
+        let cid = caller.id.clone();
+        let nodes = vec![
+            node("file", "top.rs", "top.rs", "top.rs", "rust"),
+            node("file", "a.rs", "a.rs", "a.rs", "rust"),
+            node("file", "b.rs", "b.rs", "b.rs", "rust"),
+            caller,
+            // Two `T::make`, different files, DIFFERENT return types.
+            node_sig("method", "make", "T::make", "a.rs", "rust", "() -> GraphDb"),
+            node_sig("method", "make", "T::make", "b.rs", "rust", "() -> Widget"),
+            node("struct", "GraphDb", "GraphDb", "a.rs", "rust"),
+            node("method", "query", "GraphDb::query", "a.rs", "rust"),
+        ];
+        let site = RawSite {
+            from_id: cid,
+            line: 2,
+            col: 0,
+            payload: SitePayload::MethodCall {
+                recv: Some(RecvExpr::Return(Box::new(CallRef::Qualified {
+                    qualifier: "T".into(),
+                    name: "make".into(),
+                }))),
+                name: "query".into(),
+            },
+        };
+        assert!(
+            SymbolTable::build(&nodes).resolve_all(&[site]).is_empty(),
+            "ambiguous T::make must drop, not tie-break"
+        );
+    }
+
+    /// rev-44 (3, defensive): a chain through a trait default method that returns
+    /// `Self` drops on a concrete impl type that has no own copy of the method,
+    /// so a refactor can't turn it into a fabrication. `w.make().other()` with
+    /// `w: Widget` and only `Tr::make` defined → `Widget::make` doesn't resolve.
+    #[test]
+    fn self_on_trait_default_method_chain_drops() {
+        let caller = node("function", "f", "f", "a.rs", "rust");
+        let cid = caller.id.clone();
+        let nodes = vec![
+            node("file", "a.rs", "a.rs", "a.rs", "rust"),
+            caller,
+            node("trait", "Tr", "Tr", "a.rs", "rust"),
+            node_sig(
+                "method",
+                "make",
+                "Tr::make",
+                "a.rs",
+                "rust",
+                "(&self) -> Self",
+            ),
+            node("method", "other", "Tr::other", "a.rs", "rust"),
+            node("struct", "Widget", "Widget", "a.rs", "rust"),
+        ];
+        // `w.make().other()` with `w: Widget` — no `Widget::make` node exists.
+        let site = RawSite {
+            from_id: cid,
+            line: 2,
+            col: 0,
+            payload: SitePayload::MethodCall {
+                recv: Some(RecvExpr::Return(Box::new(CallRef::Method {
+                    recv: RecvExpr::Type("Widget".into()),
+                    name: "make".into(),
+                }))),
+                name: "other".into(),
+            },
+        };
+        assert!(
+            SymbolTable::build(&nodes).resolve_all(&[site]).is_empty(),
+            "trait-default Self chain on a concrete type must drop"
+        );
     }
 }
