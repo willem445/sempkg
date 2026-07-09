@@ -5490,6 +5490,7 @@ dependencies = [
  "reqwest 0.13.4",
  "rusqlite",
  "sembundle",
+ "semgraph",
  "serde",
  "serde_json",
  "tar",

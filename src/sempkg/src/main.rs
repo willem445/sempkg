@@ -4,6 +4,7 @@ mod codegraph;
 mod embedding;
 mod error;
 mod github;
+mod graph;
 mod lance;
 #[cfg(any(feature = "reranker", feature = "embeddings"))]
 mod llama_runtime;
@@ -668,7 +669,7 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
                 println!("  Path:    {}", pkg.path);
                 println!("  Indexed: {}", pkg.is_indexed());
                 if pkg.is_indexed() {
-                    match codegraph::status(&pkg.abs_path()) {
+                    match graph::status_text(&pkg.abs_path()) {
                         Ok(s) => println!("\n{s}"),
                         Err(e) => println!("  codegraph status error: {e}"),
                     }
@@ -760,10 +761,7 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
             limit,
         } => {
             let path = resolve_codegraph_path(&package, workspace)?;
-            println!(
-                "{}",
-                codegraph::query(&path, &query, kind.as_deref(), limit)?
-            );
+            println!("{}", graph::query(&path, &query, kind.as_deref(), limit)?);
             Ok(())
         }
 
@@ -773,7 +771,7 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
             limit,
         } => {
             let path = resolve_codegraph_path(&package, workspace)?;
-            println!("{}", codegraph::callers(&path, &symbol, limit)?);
+            println!("{}", graph::callers(&path, &symbol, limit)?);
             Ok(())
         }
 
@@ -783,13 +781,16 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
             limit,
         } => {
             let path = resolve_codegraph_path(&package, workspace)?;
-            println!("{}", codegraph::callees(&path, &symbol, limit)?);
+            println!("{}", graph::callees(&path, &symbol, limit)?);
             Ok(())
         }
 
         Commands::Context { package, task } => {
             let path = resolve_codegraph_path(&package, workspace)?;
-            println!("{}", codegraph::context(&path, &task)?);
+            // Default node budget for the CLI surface (the MCP tool passes its
+            // own reranker-derived budget).
+            const CLI_CONTEXT_MAX_NODES: usize = 20;
+            println!("{}", graph::context(&path, &task, CLI_CONTEXT_MAX_NODES)?);
             Ok(())
         }
 
@@ -799,7 +800,7 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
             depth,
         } => {
             let path = resolve_codegraph_path(&package, workspace)?;
-            println!("{}", codegraph::impact(&path, &symbol, depth)?);
+            println!("{}", graph::impact(&path, &symbol, depth)?);
             Ok(())
         }
 
@@ -809,7 +810,7 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
             limit,
         } => {
             let path = resolve_codegraph_path(&package, workspace)?;
-            println!("{}", codegraph::files(&path, filter.as_deref(), limit)?);
+            println!("{}", graph::files(&path, filter.as_deref(), limit)?);
             Ok(())
         }
 
@@ -933,7 +934,7 @@ fn run_query(
     let mut code_candidates: Vec<reranker::RerankCandidate> = Vec::new();
     if !docs_only {
         match resolve_codegraph_path(package, workspace) {
-            Ok(path) => match codegraph::query(&path, query, kind, fetch_k) {
+            Ok(path) => match graph::query(&path, query, kind, fetch_k) {
                 Ok(raw) => code_candidates.extend(reranker::codegraph_json_to_candidates(&raw)),
                 Err(e) => eprintln!("Warning: symbol search failed: {e}"),
             },
@@ -1507,7 +1508,7 @@ fn run_pkg(cmd: PkgCommands) -> Result<()> {
             let pkg = reg
                 .get(&name)
                 .with_context(|| format!("Package '{name}' not found."))?;
-            println!("{}", codegraph::status(&pkg.abs_path())?);
+            println!("{}", graph::status_text(&pkg.abs_path())?);
             Ok(())
         }
 
