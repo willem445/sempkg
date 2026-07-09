@@ -41,6 +41,20 @@ pub enum Language {
     Go,
     /// Java (`.java`) — tier-2.
     Java,
+    // Tier-3 languages (issue #78 Phase 2c part 3) — handled by the shared
+    // config-driven extractor in [`crate::tier3`], not the tier-1 `parse` path.
+    /// Ruby (`.rb`).
+    Ruby,
+    /// PHP (`.php`).
+    Php,
+    /// Kotlin (`.kt`, `.kts`).
+    Kotlin,
+    /// Swift (`.swift`).
+    Swift,
+    /// Scala (`.scala`, `.sc`).
+    Scala,
+    /// C# (`.cs`).
+    CSharp,
 }
 
 impl Language {
@@ -56,6 +70,12 @@ impl Language {
             "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx" => Some(Language::Cpp),
             "go" => Some(Language::Go),
             "java" => Some(Language::Java),
+            "rb" => Some(Language::Ruby),
+            "php" => Some(Language::Php),
+            "kt" | "kts" => Some(Language::Kotlin),
+            "swift" => Some(Language::Swift),
+            "scala" | "sc" => Some(Language::Scala),
+            "cs" => Some(Language::CSharp),
             _ => None,
         }
     }
@@ -79,7 +99,28 @@ impl Language {
             Language::Cpp => "cpp",
             Language::Go => "go",
             Language::Java => "java",
+            Language::Ruby => "ruby",
+            Language::Php => "php",
+            Language::Kotlin => "kotlin",
+            Language::Swift => "swift",
+            Language::Scala => "scala",
+            Language::CSharp => "csharp",
         }
+    }
+
+    /// Whether this language is a tier-3 pack handled by [`crate::tier3`]'s
+    /// shared config-driven extractor rather than the tier-1 [`crate::parse`]
+    /// path.
+    pub fn is_tier3(self) -> bool {
+        matches!(
+            self,
+            Language::Ruby
+                | Language::Php
+                | Language::Kotlin
+                | Language::Swift
+                | Language::Scala
+                | Language::CSharp
+        )
     }
 }
 
