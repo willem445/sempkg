@@ -15,8 +15,14 @@
 //!   constructions, so those two emit none (asserted, not merely absent).
 //! - **`references`** — EXACT for C/C++/Go; for Java, EXACT modulo one documented
 //!   CodeGraph type-name→constructor misresolution (we resolve to the type).
-//! - **`extends`** — we never emit this kind; C++'s golden has one *spurious*
-//!   `extends` edge (a CodeGraph 0.9.7 parse bug) which we deliberately omit.
+//! - **`extends` / `implements`** (issue #78 edge alignment) — EXACT per language:
+//!   C++ single + multiple inheritance (`base_class_clause` → `extends`, no
+//!   `implements`; the one golden `Point extends Scalar` is a CodeGraph
+//!   return-type-misread FABRICATION we drop, whitelisted); Go struct/interface
+//!   embedding (`extends`); Java `superclass`/`interfaces`/`extends_interfaces`
+//!   (`extends`/`implements`). C has none. CodeGraph's synthesized interface→impl
+//!   `calls` (NULL column, `synthesizedBy=interface-impl`) are excluded from the
+//!   graded `calls` multiset, matching tier-3 and ADR-005.
 //! - **docstrings** — where CodeGraph 0.9.7 is buggy (C++ `///` → stray `/`,
 //!   comment bleed) or incomplete (Go type-decl docstrings left NULL), we emit
 //!   clean/complete docstrings. These are the same class of *known-better*
@@ -72,12 +78,21 @@ type EdgeKey = (String, String, i64, i64);
 
 fn edge_keys(db: &Path, kind: &str) -> BTreeSet<EdgeKey> {
     let conn = rusqlite::Connection::open(db).unwrap();
+    // `calls` excludes CodeGraph's synthesized interface→impl edges (Phase 5.5
+    // heuristic, `synthesizedBy=interface-impl`), which carry a NULL call-site
+    // column — a name-based implementation bridge, not a real call site. Matching
+    // tier-3's grading and ADR-005; the native indexer does not fabricate them.
+    let extra = if kind == "calls" {
+        " AND e.line IS NOT NULL AND e.col IS NOT NULL"
+    } else {
+        ""
+    };
     let mut stmt = conn
-        .prepare(
+        .prepare(&format!(
             "SELECT s.qualified_name, t.qualified_name, COALESCE(e.line,-1), COALESCE(e.col,-1) \
              FROM edges e JOIN nodes s ON s.id=e.source JOIN nodes t ON t.id=e.target \
-             WHERE e.kind = ?1",
-        )
+             WHERE e.kind = ?1{extra}"
+        ))
         .unwrap();
     stmt.query_map([kind], |r| {
         Ok((
@@ -122,7 +137,9 @@ fn assert_set_eq(what: &str, ours: &BTreeSet<EdgeKey>, expected: &BTreeSet<EdgeK
 }
 
 /// Nodes, `contains`, `calls`, `imports`, and `instantiates` are reproduced
-/// exactly for every tier-2 language.
+/// exactly for every tier-2 language. The inheritance/type-reference families
+/// (`extends`/`implements`/`references`) are graded per-language below, since
+/// each carries its own small, documented whitelist.
 fn assert_core_exact(lang: &str, db: &Path) {
     let g = golden(lang);
     assert_eq!(
@@ -137,10 +154,44 @@ fn assert_core_exact(lang: &str, db: &Path) {
             &edge_keys(&g, kind),
         );
     }
-    // We never emit an `extends` edge (CodeGraph's is spurious; see cpp test).
+}
+
+/// Assert our edges of `kind` equal the golden's, after removing the whitelisted
+/// `missing` (golden-only, e.g. a CodeGraph fabrication) and `spurious`
+/// (ours-only) keys from the respective sides. An empty whitelist means exact.
+fn assert_edges_wl(
+    lang: &str,
+    kind: &str,
+    db: &Path,
+    missing_wl: &[EdgeKey],
+    spurious_wl: &[EdgeKey],
+) {
+    let mut golden = edge_keys(&golden(lang), kind);
+    for m in missing_wl {
+        assert!(
+            golden.remove(m),
+            "{lang} {kind}: whitelisted missing edge {m:?} not in golden (stale whitelist)"
+        );
+    }
+    let mut ours = edge_keys(db, kind);
+    for s in spurious_wl {
+        assert!(
+            ours.remove(s),
+            "{lang} {kind}: whitelisted spurious edge {s:?} not emitted (stale whitelist)"
+        );
+    }
+    assert_set_eq(&format!("{lang} {kind} (whitelisted)"), &ours, &golden);
+}
+
+/// Assert we emit no edges of `kind` and the golden has none either.
+fn assert_kind_empty(lang: &str, kind: &str, db: &Path) {
     assert!(
-        edge_keys(db, "extends").is_empty(),
-        "{lang}: we must not emit `extends` edges"
+        edge_keys(db, kind).is_empty(),
+        "{lang}: expected no `{kind}` edges from semgraph"
+    );
+    assert!(
+        edge_keys(&golden(lang), kind).is_empty(),
+        "{lang}: golden unexpectedly has `{kind}` edges"
     );
 }
 
@@ -150,12 +201,10 @@ fn assert_core_exact(lang: &str, db: &Path) {
 fn c_parity() {
     let (_d, db) = build("c");
     assert_core_exact("c", &db);
-    // C emits no references, and every construct matches byte-for-byte.
-    assert!(edge_keys(&db, "references").is_empty());
-    assert_eq!(
-        edge_keys(&db, "references"),
-        edge_keys(&golden("c"), "references")
-    );
+    // C has no inheritance and 0.9.7 emits no C type references — neither do we.
+    assert_kind_empty("c", "references", &db);
+    assert_kind_empty("c", "extends", &db);
+    assert_kind_empty("c", "implements", &db);
     // Typedef → type_alias with NULL signature; function signatures are NULL.
     assert_eq!(attr(&db, "Scalar", "geometry.h", "signature"), None);
     assert_eq!(attr(&db, "hypot_scalar", "geometry.c", "signature"), None);
@@ -177,20 +226,20 @@ fn c_parity() {
 fn cpp_parity() {
     let (_d, db) = build("cpp");
     assert_core_exact("cpp", &db);
-    // C++ emits no references.
-    assert!(edge_keys(&db, "references").is_empty());
-    assert!(edge_keys(&db, "references") == edge_keys(&golden("cpp"), "references"));
+    // C++ has no `interface` kind, so 0.9.7 records no `implements`; and it emits
+    // no type references (param/return user types).
+    assert_kind_empty("cpp", "implements", &db);
+    assert_kind_empty("cpp", "references", &db);
 
-    // WHITELIST 1 — spurious `extends`: CodeGraph 0.9.7 misparses the in-class
-    // method's return type (`Scalar distanceTo(...) const;`) as a base class,
-    // emitting `class Point extends Scalar`. We emit no such edge.
-    let golden_extends = edge_keys(&golden("cpp"), "extends");
-    assert_eq!(
-        golden_extends.len(),
-        1,
-        "golden cpp has the one spurious extends"
-    );
-    assert!(edge_keys(&db, "extends").is_empty());
+    // `extends`: the three genuine bases in `shapes.hpp` (single inheritance
+    // `Disc : Solid`, and multiple inheritance `Prism : Solid, Drawable`) are
+    // reproduced exactly. The ONE golden edge we deliberately drop is a CodeGraph
+    // 0.9.7 FABRICATION — it misparses `geometry.hpp`'s in-class method return
+    // type (`Scalar distanceTo(...) const;`) as a base class, emitting a spurious
+    // `class Point extends Scalar`. We never emit that (it is not in a
+    // `base_class_clause`); whitelisted as missing.
+    let cpp_spurious_extends = ("Point".to_string(), "Scalar".to_string(), 23, 4);
+    assert_edges_wl("cpp", "extends", &db, &[cpp_spurious_extends], &[]);
 
     // WHITELIST 2 — docstrings: 0.9.7 keeps a stray leading `/` on `///` doc
     // comments and bleeds a trailing `// namespace geo` into `main`. We emit
@@ -249,6 +298,11 @@ fn go_parity() {
         &edge_keys(&db, "references"),
         &edge_keys(&golden("go"), "references"),
     );
+    // `extends`: Go struct/interface embedding (`embed.go`: `Disc` embeds `Base`,
+    // `ReadWriter` embeds `Reader`) → two `extends` edges, reproduced exactly. Go
+    // has no explicit conformance, so no `implements`.
+    assert_edges_wl("go", "extends", &db, &[], &[]);
+    assert_kind_empty("go", "implements", &db);
     // 0.9.7 does not model Go composite literals (`Point{…}` / `&Point{…}`) as
     // constructions, so neither golden nor we emit any `instantiates` for Go.
     assert!(edge_keys(&golden("go"), "instantiates").is_empty());
@@ -340,6 +394,14 @@ fn java_parity() {
     let mut o_norm = o_refs.clone();
     o_norm.remove(&quirk_ours);
     assert_set_eq("java references (minus quirk)", &o_norm, &g_norm);
+
+    // `extends` (a class's `superclass`: `Dog extends Animal`) and `implements`
+    // (its `interfaces`: `Dog implements Measurable`, cross-file) are reproduced
+    // exactly. CodeGraph's synthesized interface→impl `calls`
+    // (`Measurable::area → Dog::area`, `Animal::weight → Dog::weight`, NULL
+    // column) are excluded from the graded `calls` multiset by `edge_keys`.
+    assert_edges_wl("java", "extends", &db, &[], &[]);
+    assert_edges_wl("java", "implements", &db, &[], &[]);
 
     // Package → `namespace` node; `::`-qualified names; field & method signatures.
     assert_eq!(
