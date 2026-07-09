@@ -64,6 +64,19 @@ The same comparison runs automatically in CI as
 asserts the fixture clears the thresholds (in fact 100% post-P2b) and that every
 non-matching diff is accounted for by the whitelist.
 
+`parity_offline.rs` also runs the harness over **every committed language
+fixture** — the tier-1 tree plus each tier-2 (`graph-src-tier2/<lang>`) and
+tier-3 (`graph-src-tier3/<lang>`) fixture against its own golden — asserting each
+clears ≥95% nodes / ≥90% calls. A parity regression in *any* language fails CI
+offline, not just tier-1 (issue #78 edge alignment; this generalizes the gate
+that was previously hardcoded to the tier-1 fixture). Exhaustive per-edge-kind
+grading — `calls`/`imports`/`instantiates` **and** the inheritance/type-reference
+families `extends`/`implements`/`references` — is enforced bidirectionally in
+`tier2_parity.rs` / `tier3_parity.rs`. CodeGraph's synthesized interface→impl
+edges (`metadata.synthesizedBy = "interface-impl"`, NULL call-site column) are
+excluded from the harness on both sides — they are a name-based bridge, not a
+real call site (ADR-005).
+
 ### Live / dev mode (shell out to codegraph@0.9.7)
 
 With `@colbymchenry/codegraph@0.9.7` installed
@@ -203,9 +216,13 @@ parity acceptance as follows:
    clears `--min-nodes 95 --min-calls 90` on its fixture (the offline test
    enforces this) and reports healthy numbers on real-world trees. Report the
    real-world numbers in the pack's PR.
-6. The offline test (`parity_offline.rs`) automatically covers every language in
-   the shared fixture, so no per-language test wiring is required — just keep the
-   fixture and golden DB in sync.
+6. The offline test (`parity_offline.rs`) enumerates every committed fixture —
+   the tier-1 tree and each `graph-src-tier2/<lang>` / `graph-src-tier3/<lang>`
+   dir — and gates each on the thresholds through the harness. A tier-1/2/3
+   language is covered automatically as soon as its fixture + golden are present
+   in `all_fixtures()`; keep that list and the goldens in sync. Per-edge-kind
+   exactness (including `extends`/`implements`/`references`) is asserted in
+   `tier2_parity.rs` / `tier3_parity.rs`.
 
 ## Interpreting real-world numbers
 
