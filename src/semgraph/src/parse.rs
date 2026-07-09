@@ -63,6 +63,13 @@ pub fn extract(
     mtime_millis: i64,
     now_millis: i64,
 ) -> FileExtract {
+    // Tier-3 languages (Ruby/PHP/Kotlin/Swift/Scala/C#) use the shared
+    // config-driven recursive-descent extractor; only the tier-1 languages flow
+    // through the query-plus-`match` path below.
+    if language.is_tier3() {
+        return crate::tier3::extract(src, stored_path, language, mtime_millis, now_millis);
+    }
+
     let db_lang = language.db_name();
     let (ts_language, query) = compiled(language);
 
@@ -438,7 +445,12 @@ fn call_payload(
             _ => None,
         },
         Language::Java => None, // handled above
-
+        Language::Ruby
+        | Language::Php
+        | Language::Kotlin
+        | Language::Swift
+        | Language::Scala
+        | Language::CSharp => unreachable!("tier-3 handled by tier3::extract"),
         Language::Rust => match func.kind() {
             "identifier" => Some(SitePayload::CallOrCtor {
                 name: node_text(func, src).to_string(),
@@ -670,6 +682,12 @@ fn infer_param(
     locals: &mut HashMap<String, String>,
 ) {
     match lang {
+        Language::Ruby
+        | Language::Php
+        | Language::Kotlin
+        | Language::Swift
+        | Language::Scala
+        | Language::CSharp => unreachable!("tier-3 handled by tier3::extract"),
         Language::Rust => {
             if p.kind() == "self_parameter" {
                 if let Some(t) = encl_type {
@@ -737,6 +755,12 @@ fn infer_param(
 /// / `const v = new T(...)` assignments, recording `var → Type`.
 fn walk_assignments(node: Node, src: &str, lang: Language, locals: &mut HashMap<String, String>) {
     match lang {
+        Language::Ruby
+        | Language::Php
+        | Language::Kotlin
+        | Language::Swift
+        | Language::Scala
+        | Language::CSharp => unreachable!("tier-3 handled by tier3::extract"),
         Language::Rust => {
             if node.kind() == "let_declaration" {
                 if let (Some(pat), Some(val)) = (
@@ -852,6 +876,12 @@ fn collect_type_refs(
     // which never references a Go alias like `Scalar`.
     let mut strict = false;
     match lang {
+        Language::Ruby
+        | Language::Php
+        | Language::Kotlin
+        | Language::Swift
+        | Language::Scala
+        | Language::CSharp => unreachable!("tier-3 handled by tier3::extract"),
         Language::Rust | Language::TypeScript | Language::Tsx | Language::JavaScript => {
             if node.kind() == "public_field_definition" {
                 // TS class field: the `: T` annotation.
@@ -1154,6 +1184,12 @@ fn has_method_container(node: Node, lang: Language) -> bool {
 
 fn is_method_container(kind: &str, lang: Language) -> bool {
     match lang {
+        Language::Ruby
+        | Language::Php
+        | Language::Kotlin
+        | Language::Swift
+        | Language::Scala
+        | Language::CSharp => unreachable!("tier-3 handled by tier3::extract"),
         Language::Rust => matches!(kind, "impl_item" | "trait_item"),
         Language::Python => kind == "class_definition",
         Language::TypeScript | Language::Tsx | Language::JavaScript => {
@@ -1245,6 +1281,12 @@ fn java_package(node: Node, src: &str) -> Option<String> {
 
 fn qual_container_name(node: Node, src: &str, lang: Language) -> Option<String> {
     match lang {
+        Language::Ruby
+        | Language::Php
+        | Language::Kotlin
+        | Language::Swift
+        | Language::Scala
+        | Language::CSharp => unreachable!("tier-3 handled by tier3::extract"),
         Language::Rust => match node.kind() {
             "impl_item" => {
                 let t = node.child_by_field_name("type")?;
@@ -1321,6 +1363,12 @@ fn nearest_emitted_ancestor(node: Node, ts_to_id: &HashMap<usize, String>) -> Op
 /// for TS). Returns `None` for imports CodeGraph elides (`from __future__`).
 fn import_name(node: Node, src: &str, lang: Language) -> Option<String> {
     match lang {
+        Language::Ruby
+        | Language::Php
+        | Language::Kotlin
+        | Language::Swift
+        | Language::Scala
+        | Language::CSharp => unreachable!("tier-3 handled by tier3::extract"),
         Language::Rust => {
             // `use geometry::{...};` → `geometry` (first path segment).
             let text = node_text(node, src);
@@ -1435,6 +1483,12 @@ fn signature_for(node: Node, kind: &str, src: &str, lang: Language) -> Option<St
             "variable" => variable_signature(node, src),
             _ => None,
         },
+        Language::Ruby
+        | Language::Php
+        | Language::Kotlin
+        | Language::Swift
+        | Language::Scala
+        | Language::CSharp => unreachable!("tier-3 handled by tier3::extract"),
     }
 }
 
@@ -1520,6 +1574,12 @@ fn docstring_for(node: Node, kind: &str, src: &str, lang: Language) -> Option<St
         return None;
     }
     match lang {
+        Language::Ruby
+        | Language::Php
+        | Language::Kotlin
+        | Language::Swift
+        | Language::Scala
+        | Language::CSharp => unreachable!("tier-3 handled by tier3::extract"),
         Language::Python => python_docstring(node, src),
         Language::Rust
         | Language::TypeScript
@@ -1601,6 +1661,12 @@ fn strip_comment_marker(line: &str, lang: Language) -> Option<String> {
 fn apply_flags(rec: &mut NodeRecord, node: Node, src: &str, lang: Language, kind: &str) {
     let header = node_text(node, src).lines().next().unwrap_or("");
     match lang {
+        Language::Ruby
+        | Language::Php
+        | Language::Kotlin
+        | Language::Swift
+        | Language::Scala
+        | Language::CSharp => unreachable!("tier-3 handled by tier3::extract"),
         Language::Rust => {
             if matches!(kind, "function" | "method" | "struct" | "enum")
                 && has_child_kind(node, "visibility_modifier")
@@ -1775,6 +1841,12 @@ fn type_parameters(node: Node, src: &str) -> Option<String> {
 
 fn ts_language(lang: Language) -> tree_sitter::Language {
     match lang {
+        Language::Ruby
+        | Language::Php
+        | Language::Kotlin
+        | Language::Swift
+        | Language::Scala
+        | Language::CSharp => unreachable!("tier-3 handled by tier3::extract"),
         Language::Rust => tree_sitter::Language::new(tree_sitter_rust::LANGUAGE),
         Language::Python => tree_sitter::Language::new(tree_sitter_python::LANGUAGE),
         Language::TypeScript => {
@@ -1808,6 +1880,12 @@ const JAVA_REFS_QUERY: &str = include_str!("queries/java.refs.scm");
 
 fn query_source(lang: Language) -> &'static str {
     match lang {
+        Language::Ruby
+        | Language::Php
+        | Language::Kotlin
+        | Language::Swift
+        | Language::Scala
+        | Language::CSharp => unreachable!("tier-3 handled by tier3::extract"),
         Language::Rust => RUST_QUERY,
         Language::Python => PYTHON_QUERY,
         Language::TypeScript | Language::Tsx | Language::JavaScript => TYPESCRIPT_QUERY,
@@ -1820,6 +1898,12 @@ fn query_source(lang: Language) -> &'static str {
 
 fn refs_query_source(lang: Language) -> &'static str {
     match lang {
+        Language::Ruby
+        | Language::Php
+        | Language::Kotlin
+        | Language::Swift
+        | Language::Scala
+        | Language::CSharp => unreachable!("tier-3 handled by tier3::extract"),
         Language::Rust => RUST_REFS_QUERY,
         Language::Python => PYTHON_REFS_QUERY,
         Language::TypeScript | Language::Tsx | Language::JavaScript => TYPESCRIPT_REFS_QUERY,
@@ -1845,6 +1929,12 @@ fn compiled(lang: Language) -> &'static (tree_sitter::Language, Query) {
         }};
     }
     match lang {
+        Language::Ruby
+        | Language::Php
+        | Language::Kotlin
+        | Language::Swift
+        | Language::Scala
+        | Language::CSharp => unreachable!("tier-3 handled by tier3::extract"),
         Language::Rust => cache!(RUST),
         Language::Python => cache!(PYTHON),
         Language::TypeScript => cache!(TS),
@@ -1872,6 +1962,12 @@ fn compiled_refs(lang: Language) -> &'static (tree_sitter::Language, Query) {
         }};
     }
     match lang {
+        Language::Ruby
+        | Language::Php
+        | Language::Kotlin
+        | Language::Swift
+        | Language::Scala
+        | Language::CSharp => unreachable!("tier-3 handled by tier3::extract"),
         Language::Rust => cache!(RUST_REFS),
         Language::Python => cache!(PYTHON_REFS),
         Language::TypeScript => cache!(TS_REFS),

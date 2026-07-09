@@ -85,6 +85,7 @@ pub mod model;
 pub mod parity;
 pub mod parse;
 pub(crate) mod resolve;
+pub(crate) mod tier3;
 pub mod writer;
 
 pub use index::{
