@@ -63,7 +63,11 @@ pub fn extract(
         .set_language(ts_language)
         .expect("grammar/tree-sitter ABI compatible");
 
-    let line_count = src.lines().count().max(1) as u32;
+    // File span end. CodeGraph counts lines as `content.split('\n').length`,
+    // which includes the phantom empty segment after a trailing newline — so a
+    // file whose bytes end in `\n` reports one more line than `str::lines()`
+    // yields. Match that to keep file-node `end_line` byte-parity.
+    let line_count = src.split('\n').count().max(1) as u32;
     let basename = Path::new(stored_path)
         .file_name()
         .and_then(|s| s.to_str())
@@ -152,10 +156,8 @@ pub fn extract(
             now_millis,
         );
         apply_flags(&mut rec, node, src, language, &kind);
-        rec.signature = first_line(node, src);
-        if language == Language::Python {
-            rec.docstring = python_docstring(node, src);
-        }
+        rec.signature = signature_for(node, &kind, src, language);
+        rec.docstring = docstring_for(node, &kind, src, language);
 
         let idx = nodes.len();
         ts_to_id.insert(node.id(), rec.id.clone());
@@ -225,6 +227,53 @@ fn file_record(
         indexed_at: now_millis,
         node_count,
         errors,
+    }
+}
+
+/// A [`FileExtract`] for a file that could not be read as UTF-8 (or at all):
+/// a single `file` node plus a `files` row whose `errors` column is populated,
+/// so the file is *recorded* rather than silently dropped — matching CodeGraph,
+/// which writes an errored `files` row instead of omitting the file.
+pub fn error_extract(
+    stored_path: &str,
+    bytes: &[u8],
+    language: Language,
+    mtime_millis: i64,
+    now_millis: i64,
+    message: &str,
+) -> FileExtract {
+    let db_lang = language.db_name();
+    let line_count = String::from_utf8_lossy(bytes).split('\n').count().max(1) as u32;
+    let basename = Path::new(stored_path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(stored_path);
+    let file_node = NodeRecord::new(
+        "file",
+        basename,
+        stored_path,
+        stored_path,
+        db_lang,
+        1,
+        line_count,
+        0,
+        0,
+        now_millis,
+    );
+    let file_record = FileRecord {
+        path: stored_path.to_string(),
+        content_hash: content_hash(bytes),
+        language: db_lang.to_string(),
+        size: bytes.len() as u64,
+        modified_at: mtime_millis,
+        indexed_at: now_millis,
+        node_count: 1,
+        errors: serde_json::to_string(&[message]).ok(),
+    };
+    FileExtract {
+        file_record,
+        nodes: vec![file_node],
+        edges: Vec::new(),
     }
 }
 
@@ -417,17 +466,139 @@ fn import_name(node: Node, src: &str, lang: Language) -> Option<String> {
     }
 }
 
-// ---- flags / signature / docstring ---------------------------------------
+// ---- signature -----------------------------------------------------------
 
-fn first_line(node: Node, src: &str) -> Option<String> {
-    let text = node_text(node, src);
-    let line = text.lines().next().unwrap_or("").trim();
-    if line.is_empty() {
-        None
-    } else {
-        Some(line.to_string())
+/// The `signature` column, matching CodeGraph's convention per kind:
+/// - callable (`function`/`method`) → the parameter list through the return
+///   type, no `def`/`fn`/`async`/name/generics, internal newlines preserved;
+/// - `import` → the full import statement text;
+/// - `variable` → the assignment tail (`= float`);
+/// - types/members (`class`/`struct`/`enum`/`type_alias`/`enum_member`) → NULL.
+fn signature_for(node: Node, kind: &str, src: &str, _lang: Language) -> Option<String> {
+    match kind {
+        "function" | "method" => callable_signature(node, src),
+        "import" => {
+            let s = node_text(node, src).trim();
+            (!s.is_empty()).then(|| s.to_string())
+        }
+        "variable" => variable_signature(node, src),
+        _ => None,
     }
 }
+
+/// `(params) -> ret` slice from the parameter list's `(` through the end of the
+/// return type (or the params if there is none). Returns `None` when the node
+/// has no parameter list (e.g. a TS class field), matching CodeGraph's NULL.
+fn callable_signature(node: Node, src: &str) -> Option<String> {
+    let params = node.child_by_field_name("parameters")?;
+    let end = node
+        .child_by_field_name("return_type")
+        .map(|r| r.end_byte())
+        .unwrap_or_else(|| params.end_byte());
+    let sig = src.get(params.start_byte()..end)?.trim();
+    // Normalize CRLF → LF so a multi-line signature is deterministic regardless
+    // of the checkout's line endings (and matches the golden fixture's `\n`).
+    (!sig.is_empty()).then(|| sig.replace("\r\n", "\n"))
+}
+
+/// The assignment tail of a top-level variable (`Scalar = float` → `= float`).
+fn variable_signature(node: Node, src: &str) -> Option<String> {
+    let anchor = node
+        .child_by_field_name("left")
+        .or_else(|| node.child_by_field_name("name"))?;
+    let sig = src.get(anchor.end_byte()..node.end_byte())?.trim();
+    (!sig.is_empty()).then(|| sig.to_string())
+}
+
+// ---- docstring -----------------------------------------------------------
+
+/// The `docstring` column.
+///
+/// Python uses the body's leading string literal (see [`python_docstring`]);
+/// Rust and TS/JS use the definition's immediately-preceding doc-comment block.
+///
+/// This intentionally produces *cleaner and more complete* docstrings than
+/// CodeGraph 0.9.7, which leaves Python docstrings NULL, keeps a stray leading
+/// `/` on Rust `///` comments, can bleed a module `//!` header into the first
+/// definition, and only captures a TS leading comment when it is the
+/// definition's direct previous sibling (missing `export`-wrapped declarations).
+/// We capture doc comments cleanly and consistently instead. The P2c parity
+/// harness must whitelist this the same way it whitelists [`apply_flags`]'s
+/// correct `is_async` (see #78).
+fn docstring_for(node: Node, kind: &str, src: &str, lang: Language) -> Option<String> {
+    if matches!(kind, "import" | "enum_member" | "file") {
+        return None;
+    }
+    match lang {
+        Language::Python => python_docstring(node, src),
+        Language::Rust | Language::TypeScript | Language::Tsx | Language::JavaScript => {
+            leading_comment_docstring(node, src, lang)
+        }
+    }
+}
+
+/// Collect the contiguous comment lines immediately above `node` (stopping at
+/// the first blank line or code), strip their markers, and join them. This is
+/// the clean, correct doc-comment rule — no blank-line skipping, no module-doc
+/// bleed.
+fn leading_comment_docstring(node: Node, src: &str, lang: Language) -> Option<String> {
+    let start = node.start_byte();
+    let before = &src[..start];
+    // Lines strictly above the definition, nearest-first.
+    let mut lines: Vec<&str> = before.split('\n').collect();
+    // The last element is the (partial) line the definition starts on; drop it.
+    lines.pop();
+
+    let mut collected: Vec<String> = Vec::new();
+    for raw in lines.iter().rev() {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            break; // blank line ends the block
+        }
+        match strip_comment_marker(trimmed, lang) {
+            Some(text) => collected.push(text),
+            None => break, // hit code
+        }
+    }
+    if collected.is_empty() {
+        return None;
+    }
+    collected.reverse();
+    let joined = collected.join("\n").trim().to_string();
+    (!joined.is_empty()).then_some(joined)
+}
+
+/// Strip a single doc/line-comment marker from `line`, returning the remaining
+/// text, or `None` if the line is not a comment. `//!` inner-doc lines are
+/// treated as file-level and excluded (return `None`) so they never attach to a
+/// following item.
+fn strip_comment_marker(line: &str, lang: Language) -> Option<String> {
+    // Block-comment fragments (`/** ... */`, `* ...`, `*/`) — shared by all.
+    if let Some(rest) = line.strip_prefix("/**") {
+        return Some(rest.trim_end_matches("*/").trim().to_string());
+    }
+    if line == "*/" {
+        return Some(String::new());
+    }
+    if let Some(rest) = line.strip_prefix('*') {
+        // A `* text` JSDoc continuation (but not a `*/`-only line, handled above).
+        return Some(rest.trim_end_matches("*/").trim().to_string());
+    }
+    match lang {
+        Language::Rust => {
+            if line.starts_with("//!") {
+                return None; // inner/file doc — not this item's docstring
+            }
+            if let Some(rest) = line.strip_prefix("///") {
+                return Some(rest.trim().to_string());
+            }
+            None
+        }
+        _ => line.strip_prefix("//").map(|rest| rest.trim().to_string()),
+    }
+}
+
+// ---- flags ---------------------------------------------------------------
 
 fn apply_flags(rec: &mut NodeRecord, node: Node, src: &str, lang: Language, kind: &str) {
     let header = node_text(node, src).lines().next().unwrap_or("");
@@ -438,6 +609,10 @@ fn apply_flags(rec: &mut NodeRecord, node: Node, src: &str, lang: Language, kind
             {
                 rec.visibility = Some("public".to_string());
             }
+            // NOTE: we set is_async correctly for every language. CodeGraph
+            // 0.9.7 only flags TS async functions (Rust/Python async defs are
+            // recorded as is_async=0). This is a deliberate improvement; the
+            // P2c parity harness must whitelist is_async as known-better.
             rec.is_async = header_has_word(header, "async");
         }
         Language::Python => {
@@ -771,13 +946,81 @@ import { hypot } from "./geometry";
 
     #[test]
     fn file_node_always_present_and_spans_file() {
+        // 3 content lines + a trailing newline. CodeGraph counts lines as
+        // `split('\n').length`, so the phantom trailing segment makes end_line 4.
         let ex = extract("line1\nline2\nline3\n", "empty.py", Language::Python, 0, 0);
         let file = ex.nodes.iter().find(|n| n.kind == "file").unwrap();
         assert_eq!(file.name, "empty.py");
         assert_eq!(file.qualified_name, "empty.py");
         assert_eq!(file.start_line, 1);
-        assert_eq!(file.end_line, 3);
+        assert_eq!(file.end_line, 4);
+        // No trailing newline → no phantom line.
+        let ex2 = extract("a\nb", "x.py", Language::Python, 0, 0);
+        let f2 = ex2.nodes.iter().find(|n| n.kind == "file").unwrap();
+        assert_eq!(f2.end_line, 2);
         // node_count on the files row includes the file node itself.
         assert_eq!(ex.file_record.node_count, ex.nodes.len() as u64);
+    }
+
+    #[test]
+    fn signatures_match_codegraph_convention() {
+        // Rust: params through return type, no `fn name`.
+        let rs = extract_nodes("pub fn f(a: i32) -> i32 { a }\n", "a.rs", Language::Rust);
+        assert_eq!(
+            find(&rs, "f").unwrap().signature.as_deref(),
+            Some("(a: i32) -> i32")
+        );
+        // Type has NULL signature.
+        let st = extract_nodes("pub struct S { x: i32 }\n", "a.rs", Language::Rust);
+        assert_eq!(find(&st, "S").unwrap().signature, None);
+        // Python: return annotation kept, no `def name`.
+        let py = extract_nodes(
+            "def g(a: int) -> int:\n    return a\n",
+            "a.py",
+            Language::Python,
+        );
+        assert_eq!(
+            find(&py, "g").unwrap().signature.as_deref(),
+            Some("(a: int) -> int")
+        );
+        // Variable: assignment tail.
+        let v = extract_nodes("Scalar = float\n", "a.py", Language::Python);
+        assert_eq!(
+            find(&v, "Scalar").unwrap().signature.as_deref(),
+            Some("= float")
+        );
+        // Import: full statement.
+        let im = extract_nodes("import asyncio\n", "a.py", Language::Python);
+        assert_eq!(
+            find(&im, "asyncio").unwrap().signature.as_deref(),
+            Some("import asyncio")
+        );
+    }
+
+    #[test]
+    fn rust_and_ts_doc_comments_are_captured_cleanly() {
+        // Rust `///` — no stray leading slash, no module-`//!` bleed.
+        let rs = extract_nodes(
+            "//! module doc\n\n/// The answer.\npub fn answer() -> i32 { 42 }\n",
+            "a.rs",
+            Language::Rust,
+        );
+        assert_eq!(
+            find(&rs, "answer").unwrap().docstring.as_deref(),
+            Some("The answer.")
+        );
+        // TS `//` line comment directly above a method.
+        let ts = extract_nodes(
+            "class C {\n  // does a thing\n  m(): void {}\n}\n",
+            "a.ts",
+            Language::TypeScript,
+        );
+        assert_eq!(
+            find(&ts, "C::m").unwrap().docstring.as_deref(),
+            Some("does a thing")
+        );
+        // A blank line between comment and def breaks the block.
+        let rs2 = extract_nodes("/// far away\n\npub fn g() {}\n", "a.rs", Language::Rust);
+        assert_eq!(find(&rs2, "g").unwrap().docstring, None);
     }
 }

@@ -39,7 +39,7 @@ use rayon::prelude::*;
 use walkdir::{DirEntry, WalkDir};
 
 use crate::model::Language;
-use crate::parse::{extract, FileExtract};
+use crate::parse::{error_extract, extract, FileExtract};
 use crate::writer::GraphWriter;
 use crate::{Error, Result};
 
@@ -128,12 +128,30 @@ pub fn index_roots(
         }
     }
 
-    // Parse in parallel; skip files that can't be read as UTF-8 (binaries, etc.).
+    // Parse in parallel. A file that can't be read as UTF-8 (or at all) is not
+    // dropped: it gets a `files` row with `errors` populated (see #78 review F6).
     let extracts: Vec<FileExtract> = work
         .par_iter()
-        .filter_map(|(path, stored, lang, mtime)| {
-            let src = std::fs::read_to_string(path).ok()?;
-            Some(extract(&src, stored, *lang, *mtime, now))
+        .map(|(path, stored, lang, mtime)| match std::fs::read(path) {
+            Ok(bytes) => match std::str::from_utf8(&bytes) {
+                Ok(src) => extract(src, stored, *lang, *mtime, now),
+                Err(_) => error_extract(
+                    stored,
+                    &bytes,
+                    *lang,
+                    *mtime,
+                    now,
+                    "file is not valid UTF-8",
+                ),
+            },
+            Err(e) => error_extract(
+                stored,
+                &[],
+                *lang,
+                *mtime,
+                now,
+                &format!("cannot read file: {e}"),
+            ),
         })
         .collect();
 

@@ -46,6 +46,20 @@ pipeline (a later cutover task):
   `contains` edges only. Call/reference/import **edge resolution is Phase 2b**;
   the per-file symbol output (qualified names + ids) is the symbol table a
   pass-2 resolver will consume.
+- **Signatures** match CodeGraph byte-for-byte: the parameter list through the
+  return type (no `def`/`fn`/name/generics, multi-line preserved), the full
+  statement for imports, the assignment tail for variables, and NULL for
+  types/members.
+- **Deliberate improvements over 0.9.7** (the P2c parity harness must whitelist
+  these — they are *known-better*, not regressions): `is_async` is set correctly
+  for every language (0.9.7 flags only TS); docstrings are captured for Rust
+  `///` and TS/JS comments (0.9.7 leaves Python NULL, keeps a stray leading `/`
+  on Rust doc comments, bleeds a module `//!` header into the first definition,
+  and misses `export`-wrapped TS declarations). We produce clean, complete
+  docstrings instead. Both are documented in code (`parse.rs`) and pinned in
+  tests.
+- **Errored files** (non-UTF-8 / unreadable) are recorded with a `files` row
+  whose `errors` column is populated, rather than silently dropped.
 - **Performance:** files are parsed in parallel with rayon; a single-writer
   transaction batches all inserts. Indexing this repo's `src/` tree (78 files,
   ~1.8k symbols) takes ~0.27 s.

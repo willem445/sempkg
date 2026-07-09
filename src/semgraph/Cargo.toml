@@ -14,13 +14,13 @@ thiserror  = { workspace = true }
 serde_json = { workspace = true }
 sha2       = { workspace = true }
 hex        = { workspace = true }
-rayon      = "1"
+rayon      = { workspace = true }
 walkdir    = { workspace = true }
-streaming-iterator     = "0.1"
-tree-sitter            = "0.25"
-tree-sitter-rust       = "0.24"
-tree-sitter-python     = "0.25"
-tree-sitter-typescript = "0.23"
+streaming-iterator     = { workspace = true }
+tree-sitter            = { workspace = true }
+tree-sitter-rust       = { workspace = true }
+tree-sitter-python     = { workspace = true }
+tree-sitter-typescript = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

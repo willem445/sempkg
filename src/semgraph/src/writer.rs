@@ -263,7 +263,7 @@ fn write_schema_versions(conn: &Connection) -> Result<()> {
     )?;
     conn.execute(
         "INSERT INTO schema_versions (version, applied_at, description) VALUES (4, ?1, ?2)",
-        rusqlite::params![now, "sempkg-native schema v4"],
+        rusqlite::params![now, "Initial schema includes all migrations"],
     )?;
     Ok(())
 }
