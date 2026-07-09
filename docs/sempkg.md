@@ -31,8 +31,9 @@ optional local LLM reranker for high-quality hybrid queries.
 
 | Requirement | Notes |
 |-------------|-------|
-| [CodeGraph](https://github.com/colbymchenry/codegraph) | Must be on `PATH`. Install with `npm install -g @colbymchenry/codegraph`. |
 | Rust toolchain | Required only when building from source. |
+
+Indexing and querying are fully native — no CodeGraph/Node install is required.
 
 ---
 

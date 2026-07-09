@@ -1,79 +1,73 @@
-/// Codegraph CLI wrapper — scoped to a specific package/bundle directory.
+/// Native graph indexing + direct SQLite reads for a package/bundle's
+/// schema-v4 `codegraph.db`.
 ///
-/// All queries are strictly scoped: passing a package directory means the
-/// operation runs only against that package's index, never cross-package.
+/// Indexing is done in-process by the native [`semgraph`] indexer — there is no
+/// external CodeGraph/Node dependency. All operations are strictly scoped to a
+/// package directory: indexing writes only `<project>/.codegraph/codegraph.db`,
+/// and every query runs against that one database, never cross-package.
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use anyhow::{Context, Result};
 use rusqlite::OptionalExtension;
 
-use crate::error::SempkgError;
-
-/// Resolved codegraph executable path.
-fn codegraph_exe() -> Result<String> {
-    which::which("codegraph")
-        .or_else(|_| which::which("codegraph.cmd"))
-        .map(|p| p.to_string_lossy().to_string())
-        .map_err(|_| SempkgError::CodegraphNotFound.into())
-}
-
-fn run(args: &[&str], cwd: Option<&Path>) -> Result<String> {
-    let exe = codegraph_exe()?;
-    let mut cmd = Command::new(&exe);
-    cmd.args(args);
-    if let Some(dir) = cwd {
-        cmd.current_dir(dir);
-    }
-
-    let out = cmd
-        .output()
-        .with_context(|| format!("Failed to run codegraph with args: {args:?}"))?;
-
-    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-
-    if !out.status.success() {
-        return Err(
-            SempkgError::CodegraphError(if !stderr.is_empty() { stderr } else { stdout }).into(),
-        );
-    }
-
-    Ok(if !stdout.is_empty() { stdout } else { stderr })
-}
-
 // ---------------------------------------------------------------------------
-// Index management
+// Index management (native semgraph indexer)
 // ---------------------------------------------------------------------------
 
-/// Run `codegraph init --index <path>` to initialise and index a project.
+/// Format an [`semgraph::IndexStats`] as the one-line summary printed after
+/// indexing / reindexing a package.
+fn format_stats(stats: &semgraph::IndexStats) -> String {
+    format!(
+        "Indexed {} files, {} nodes, {} edges.",
+        stats.file_count, stats.node_count, stats.edge_count
+    )
+}
+
+/// Ensure the `.codegraph/` parent directory of `db` exists.
+fn ensure_db_dir(db: &Path) -> Result<()> {
+    if let Some(parent) = db.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating index directory {}", parent.display()))?;
+    }
+    Ok(())
+}
+
+/// Index a project from scratch into `<path>/.codegraph/codegraph.db` using the
+/// native semgraph indexer. Overwrites any existing index for the project.
 pub fn init_and_index(path: &Path) -> Result<String> {
-    run(&["init", "--index", &path.to_string_lossy()], None).context("codegraph init failed")
+    let db = db_path(path);
+    ensure_db_dir(&db)?;
+    let stats = semgraph::index_roots(
+        &[path.to_path_buf()],
+        &db,
+        &semgraph::IndexOptions::default(),
+    )
+    .with_context(|| format!("indexing {}", path.display()))?;
+    Ok(format_stats(&stats))
 }
 
-/// Run `codegraph sync <path>` to incrementally update an existing index.
+/// Incrementally update an existing index, re-parsing only changed/added/deleted
+/// files. Falls back to a full index when no database exists yet.
 pub fn sync(path: &Path) -> Result<String> {
-    run(&["sync", &path.to_string_lossy()], None).context("codegraph sync failed")
+    let db = db_path(path);
+    ensure_db_dir(&db)?;
+    let stats = semgraph::sync(
+        &[path.to_path_buf()],
+        &db,
+        &semgraph::IndexOptions::default(),
+    )
+    .with_context(|| format!("syncing {}", path.display()))?;
+    Ok(format_stats(&stats))
 }
 
-/// Query the installed codegraph version string.
+/// The `codegraph_version` string recorded in bundles built by the native
+/// indexer: `"sempkg-native/<semgraph crate version>"`.
 ///
-/// Returns `"unknown"` on failure so callers never need to abort.
+/// The manifest field is free-form (`docs/sembundle-spec.md` §4.2); nothing
+/// validates its format, and the Phase-1 reader serves native-built and
+/// CodeGraph-0.9.7-built graphs interchangeably.
 pub fn version() -> String {
-    let exe = match codegraph_exe() {
-        Ok(e) => e,
-        Err(_) => return "unknown".to_owned(),
-    };
-    std::process::Command::new(&exe)
-        .arg("--version")
-        .output()
-        .ok()
-        .and_then(|o| {
-            let s = String::from_utf8_lossy(&o.stdout);
-            // typical output: "codegraph 0.9.7" — grab the last whitespace-separated token
-            s.split_whitespace().last().map(str::to_owned)
-        })
-        .unwrap_or_else(|| "unknown".to_owned())
+    format!("sempkg-native/{}", semgraph::VERSION)
 }
 
 // ---------------------------------------------------------------------------

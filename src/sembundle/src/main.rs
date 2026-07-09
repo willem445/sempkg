@@ -123,9 +123,10 @@ enum Commands {
         #[arg(long)]
         commit_hash: String,
 
-        /// Version of CodeGraph used to produce the index
+        /// Free-form indexer-version string recorded in the manifest.
+        /// Defaults to the native indexer tag ("sempkg-native/<version>").
         #[arg(long)]
-        codegraph_version: String,
+        codegraph_version: Option<String>,
 
         /// Git tag associated with this release (optional)
         #[arg(long)]
@@ -139,8 +140,8 @@ enum Commands {
         #[arg(long, short = 'o')]
         output: Option<PathBuf>,
 
-        // --- CodeGraph inputs ---
-        /// Source directory to index with `codegraph init --index`.
+        // --- Source inputs ---
+        /// Source directory to index with the native semgraph indexer.
         /// Repeat the flag to index multiple directories. At least one required.
         #[arg(long = "source-dir", short = 's', required = true)]
         source_dirs: Vec<PathBuf>,
@@ -263,7 +264,7 @@ fn main() {
             commit_hash,
             tag,
             language,
-            codegraph_version,
+            codegraph_version: codegraph_version.unwrap_or_else(build::native_codegraph_version),
             output_path: output,
             source_dirs,
             docs_dirs,

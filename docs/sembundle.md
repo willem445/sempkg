@@ -28,7 +28,7 @@ tool.
 A `.sembundle` file is a portable semantic artifact for one package version.
 It includes:
 
-- CodeGraph outputs (`graph/`, `embeddings/`, `config.json`)
+- graph outputs (`graph/`, `embeddings/`, `config.json`) produced by the native `semgraph` indexer (schema-v4 `codegraph.db`)
 - bundle metadata (`manifest.json`, `metadata.json`)
 - optional docs index (`lance/`)
 - optional source-code index (`code/`, when built with `--include-source`)
@@ -42,13 +42,11 @@ For full archive/spec details, see [sembundle-spec.md](sembundle-spec.md).
 | Requirement | Why |
 |-------------|-----|
 | Rust toolchain | Needed to install/build `sembundle` from source |
-| CodeGraph on `PATH` | Required for `sembundle build` indexing pipeline |
 
-Install CodeGraph:
-
-```powershell
-npm install -g @colbymchenry/codegraph
-```
+`sembundle build` indexes source with the **native `semgraph` indexer** (built
+into the binary). There is **no external CodeGraph/Node dependency** — nothing to
+`npm install`, and no separate tool on `PATH`. Bundles built by older releases
+with CodeGraph 0.9.7 remain readable (schema v4 is backward-compatible).
 
 ---
 
@@ -92,11 +90,15 @@ sembundle build `
   --version 1.2.0 `
   --source-repo https://github.com/my-org/my-sdk `
   --commit-hash a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0 `
-  --codegraph-version 0.3.1 `
   --source-dir .\src `
+  --source-dir .\vendor `
   --docs-dir .\docs `
   --docs-glob "**/*.md"
 ```
+
+Multiple `--source-dir` roots are all indexed into **one** graph (they no longer
+overwrite each other — issue #79). No `--codegraph-version` is needed: the native
+indexer stamps `sempkg-native/<version>` into the manifest.
 
 Output (default): `./my-sdk-1.2.0.sembundle`
 
@@ -173,12 +175,13 @@ Optional:
 
 ## `sembundle build`
 
-Run indexing + packaging in one command.
+Run indexing (native `semgraph`) + packaging in one command. No external
+CodeGraph/Node install is required.
 
 Usage:
 
 ```text
-sembundle build --name <name> --version <version> --source-repo <url> --commit-hash <sha> --codegraph-version <ver> --source-dir <dir> [--source-dir <dir> ...] [options]
+sembundle build --name <name> --version <version> --source-repo <url> --commit-hash <sha> --source-dir <dir> [--source-dir <dir> ...] [options]
 ```
 
 Required:
@@ -187,11 +190,11 @@ Required:
 - `--version, -r`
 - `--source-repo`
 - `--commit-hash`
-- `--codegraph-version`
-- `--source-dir, -s` (repeatable; at least one)
+- `--source-dir, -s` (repeatable; at least one — all roots land in one graph)
 
 Optional:
 
+- `--codegraph-version` (free-form manifest string; defaults to `sempkg-native/<version>`)
 - `--tag`
 - `--language` (default: `unknown`)
 - `--output, -o`
@@ -199,6 +202,7 @@ Optional:
 - `--docs-glob`
 - `--include-source` (embed `code/` source-code index extension)
 - `--source-glob` (restrict files included by source-code index)
+- `--exclude-dir, -x` (repeatable; skip directories during indexing)
 
 ## `sembundle key-gen`
 
