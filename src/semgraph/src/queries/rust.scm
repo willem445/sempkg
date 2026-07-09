@@ -9,6 +9,7 @@
 ; tree-sitter tag queries (https://github.com/colbymchenry/codegraph). See NOTICE.
 
 (function_item) @def.function
+(trait_item) @def.trait
 (struct_item) @def.struct
 (enum_item) @def.enum
 (enum_variant) @def.enum_member

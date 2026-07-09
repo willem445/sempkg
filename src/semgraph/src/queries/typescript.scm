@@ -13,6 +13,7 @@
 (generator_function_declaration) @def.function
 (class_declaration) @def.class
 (abstract_class_declaration) @def.class
+(interface_declaration) @def.interface
 (method_definition) @def.method
 (public_field_definition) @def.method
 (enum_declaration) @def.enum

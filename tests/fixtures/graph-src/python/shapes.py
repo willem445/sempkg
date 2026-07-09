@@ -34,3 +34,17 @@ class Circle:
 def circle_area(radius: Scalar) -> Scalar:
     """Module-level function used by ``Circle.area``."""
     return 3.14159 * radius * radius
+
+
+class Shape:
+    """A base class."""
+
+    def measure(self) -> Scalar:
+        return 0.0
+
+
+class Square(Shape):
+    """A subclass — ``class Square(Shape)`` is an ``extends`` edge (Square -> Shape)."""
+
+    def measure(self) -> Scalar:
+        return 1.0

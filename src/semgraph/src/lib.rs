@@ -768,8 +768,8 @@ mod tests {
             GraphStatus {
                 schema_version: 4,
                 file_count: 7,
-                node_count: 55,
-                edge_count: 116,
+                node_count: 67,
+                edge_count: 135,
             }
         );
     }
@@ -790,7 +790,7 @@ mod tests {
         assert_eq!(unresolved, 0, "unresolved_refs is expected to be empty");
         assert_eq!(metadata, 0, "project_metadata is expected to be empty");
         // status() derives counts without project_metadata, so it still works.
-        assert_eq!(db.status().unwrap().node_count, 55);
+        assert_eq!(db.status().unwrap().node_count, 67);
     }
 
     #[test]
@@ -1006,7 +1006,7 @@ mod tests {
         std::fs::copy(fixture_path(), &path).unwrap();
         {
             let db = GraphDb::open(&path).unwrap();
-            assert_eq!(db.status().unwrap().node_count, 55);
+            assert_eq!(db.status().unwrap().node_count, 67);
             let _ = db.query("Circle", None, 5).unwrap();
         }
         let wal = PathBuf::from(format!("{}-wal", path.display()));

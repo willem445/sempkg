@@ -87,6 +87,22 @@ impl Language {
             .and_then(Language::from_extension)
     }
 
+    /// Whether this is a **tier-1** language (Rust / Python / TypeScript / TSX /
+    /// JavaScript). Tier-1 has hardened, CodeGraph-verified conventions that
+    /// diverge from the tier-2/3 packs — notably that imports are named by their
+    /// unqualified module root, whereas CodeGraph package-qualifies e.g. Java
+    /// imports (`fixture::java.util.List`). Gate tier-1-only behaviour on this.
+    pub fn is_tier1(self) -> bool {
+        matches!(
+            self,
+            Language::Rust
+                | Language::Python
+                | Language::TypeScript
+                | Language::Tsx
+                | Language::JavaScript
+        )
+    }
+
     /// The string stored in `nodes.language` / `files.language`. Matches
     /// CodeGraph: `.ts`/`.tsx` → `"typescript"`, `.js`/`.jsx` → `"javascript"`.
     pub fn db_name(self) -> &'static str {
@@ -172,7 +188,7 @@ impl NodeRecord {
         let kind = kind.into();
         let qualified_name = qualified_name.into();
         let file_path = file_path.into();
-        let id = node_id(&kind, &qualified_name, &file_path);
+        let id = node_id(&kind, &qualified_name, &file_path, start_line, start_column);
         NodeRecord {
             id,
             kind,
@@ -245,8 +261,26 @@ pub struct FileRecord {
 /// Compute a node id `"<kind>:<hash>"`.
 ///
 /// `file` nodes use the literal path (`"file:<file_path>"`); all others hash
-/// `qualified_name \0 file_path` with SHA-256 and take the first 16 bytes.
-pub fn node_id(kind: &str, qualified_name: &str, file_path: &str) -> String {
+/// `qualified_name \0 file_path \0 start_line \0 start_column` with SHA-256 and
+/// take the first 16 bytes.
+///
+/// The start position is folded in so that two *distinct definitions* sharing
+/// the same `(kind, qualified_name, file_path)` — e.g. a `#[cfg(...)]`-gated pair
+/// of same-named functions, several `impl` blocks each defining a same-named
+/// method, or repeated `use crate::…;` statements that all name-resolve to the
+/// same import root — get **distinct** ids and are all persisted, instead of
+/// collapsing under the writer's `INSERT OR IGNORE`. CodeGraph 0.9.7 emits one
+/// node per physical definition, so matching that is what lifts import/method
+/// node recall on real trees (issue #78 tier-1 hardening; supersedes ADR-004's
+/// deferred "id-collision dedup" note). Nothing depends on the hash *content* —
+/// only on id equality within one database — so folding position in is safe.
+pub fn node_id(
+    kind: &str,
+    qualified_name: &str,
+    file_path: &str,
+    start_line: u32,
+    start_column: u32,
+) -> String {
     if kind == "file" {
         return format!("file:{file_path}");
     }
@@ -254,6 +288,10 @@ pub fn node_id(kind: &str, qualified_name: &str, file_path: &str) -> String {
     hasher.update(qualified_name.as_bytes());
     hasher.update([0u8]);
     hasher.update(file_path.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(start_line.to_le_bytes());
+    hasher.update([0u8]);
+    hasher.update(start_column.to_le_bytes());
     let digest = hasher.finalize();
     format!("{kind}:{}", hex::encode(&digest[..16]))
 }
@@ -278,14 +316,14 @@ mod tests {
     #[test]
     fn file_node_id_is_literal_path() {
         assert_eq!(
-            node_id("file", "python/main.py", "python/main.py"),
+            node_id("file", "python/main.py", "python/main.py", 1, 0),
             "file:python/main.py"
         );
     }
 
     #[test]
     fn non_file_node_id_is_kind_prefixed_32_hex() {
-        let id = node_id("function", "circle_area", "python/shapes.py");
+        let id = node_id("function", "circle_area", "python/shapes.py", 3, 0);
         let (kind, hash) = id.split_once(':').unwrap();
         assert_eq!(kind, "function");
         assert_eq!(hash.len(), 32);
@@ -293,21 +331,28 @@ mod tests {
     }
 
     #[test]
-    fn node_id_distinguishes_by_file_and_kind() {
+    fn node_id_distinguishes_by_file_kind_and_position() {
         // Same qualified name, different files → different ids.
         assert_ne!(
-            node_id("function", "hypot", "rust/geometry.rs"),
-            node_id("function", "hypot", "typescript/geometry.ts"),
+            node_id("function", "hypot", "rust/geometry.rs", 1, 0),
+            node_id("function", "hypot", "typescript/geometry.ts", 1, 0),
         );
         // Same qualified name + file, different kind → different ids.
         assert_ne!(
-            node_id("class", "Point", "geometry.ts"),
-            node_id("method", "Point", "geometry.ts"),
+            node_id("class", "Point", "geometry.ts", 1, 0),
+            node_id("method", "Point", "geometry.ts", 1, 0),
+        );
+        // Same (kind, qn, file) but a different start position → different ids,
+        // so distinct definitions that collide on name (cfg-gated pairs, several
+        // impl blocks defining a same-named method) are all persisted.
+        assert_ne!(
+            node_id("method", "Embedder::dim", "embedding.rs", 524, 4),
+            node_id("method", "Embedder::dim", "embedding.rs", 551, 4),
         );
         // Deterministic.
         assert_eq!(
-            node_id("function", "hypot", "rust/geometry.rs"),
-            node_id("function", "hypot", "rust/geometry.rs"),
+            node_id("function", "hypot", "rust/geometry.rs", 10, 0),
+            node_id("function", "hypot", "rust/geometry.rs", 10, 0),
         );
     }
 

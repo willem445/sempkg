@@ -525,12 +525,21 @@ impl<'a> Extractor<'a> {
                 let mut c = body.walk();
                 body.named_children(&mut c).collect()
             };
-            for child in children {
-                if member_types.contains(&child.kind()) {
-                    self.extract_enum_members(child);
-                } else {
-                    self.visit(child);
+            // Recurse into non-member children (e.g. a nested enum/type) through
+            // the same depth guard `descend` uses, so an enum-in-enum chain is
+            // bounded by MAX_DEPTH instead of bypassing the cap.
+            if self.depth >= MAX_DEPTH {
+                self.max_depth_hit = true;
+            } else {
+                self.depth += 1;
+                for child in children {
+                    if member_types.contains(&child.kind()) {
+                        self.extract_enum_members(child);
+                    } else {
+                        self.visit(child);
+                    }
                 }
+                self.depth -= 1;
             }
             self.pop_scope();
         }
@@ -1222,5 +1231,35 @@ mod tests {
         // stopped rather than running away.
         let modules = ex.nodes.iter().filter(|nn| nn.kind == "module").count();
         assert!(modules > 0 && modules < n, "modules emitted: {modules}");
+    }
+
+    /// An enum-in-enum chain must be bounded by the same depth cap. `extract_enum`
+    /// recurses into a nested enum through `visit`; without routing that through
+    /// the depth guard it would bypass `MAX_DEPTH` and could overflow. A Swift
+    /// `enum E0 { enum E1 { … } }` chain of Swift `class_declaration`s exercises
+    /// exactly that path.
+    #[test]
+    fn deeply_nested_enum_chain_is_bounded() {
+        let n = MAX_DEPTH * 4;
+        let mut src = String::with_capacity(n * 12);
+        for i in 0..n {
+            src.push_str(&format!("enum E{i} {{\n"));
+        }
+        src.push_str("case leaf\n");
+        for _ in 0..n {
+            src.push_str("}\n");
+        }
+        let ex = extract(&src, "deep.swift", Language::Swift, 0, 0);
+        // Did not overflow; the file is still recorded and the cap surfaced.
+        assert!(ex.nodes.iter().any(|nn| nn.kind == "file"));
+        let errors = ex.file_record.errors.unwrap_or_default();
+        assert!(
+            errors.contains("max nesting depth"),
+            "expected a depth-cap error, got {errors:?}"
+        );
+        // Only the enums within the cap were emitted — the chain stopped rather
+        // than running away past MAX_DEPTH.
+        let enums = ex.nodes.iter().filter(|nn| nn.kind == "enum").count();
+        assert!(enums > 0 && enums < n, "enums emitted: {enums}");
     }
 }

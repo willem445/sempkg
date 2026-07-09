@@ -22,8 +22,11 @@ This ADR records the Phase 2b decisions: how references resolve into
 from-scratch index.
 
 The compatibility contract remains `tests/fixtures/codegraph-v4.db` (CodeGraph
-0.9.7 over `tests/fixtures/graph-src`): **116 edges** = 51 `contains` + 15
-`calls` + 41 `references` + 5 `imports` + 4 `instantiates`.
+0.9.7 over `tests/fixtures/graph-src`). Phase 2b delivered **116 edges** = 51
+`contains` + 15 `calls` + 41 `references` + 5 `imports` + 4 `instantiates`; the
+tier-1 hardening addendum extended the fixture with trait/interface + inheritance
+constructs, bringing it to **135 edges** (adding 3 `extends` + 2 `implements`,
+plus the `contains`/`references` of the new definitions).
 
 ## Decision
 
@@ -167,3 +170,62 @@ is what makes "sync equals from-scratch" checkable.
 - Cutover of `sembundle`/`sempkg` from the CodeGraph CLI to
   `semgraph::index_roots`/`sync` remains a separate task (no sempkg/sembundle
   behavior changes in this PR).
+
+## Addendum — Tier-1 hardening (issue #78, real-repo parity)
+
+Phase 2c's parity harness, run in live mode against this repo's `src/`, surfaced
+the genuine gaps between semgraph and CodeGraph 0.9.7 on real code. Closing them
+to clear the ≥95% node / ≥90% `calls` acceptance thresholds required the
+following, all additive to the model above:
+
+- **Inheritance edges.** semgraph now extracts `trait`/`interface` **nodes**
+  (Rust `trait_item`, TS `interface_declaration`) and the `extends`/`implements`
+  **edges** CodeGraph records: Rust supertrait bounds and `impl Trait for Type`,
+  Python `class C(Base)`, TS `class … extends/implements`. Endpoints resolve
+  through the same language-scoped name resolver. We deliberately do **not** emit
+  TS `interface X extends Y` edges — CodeGraph 0.9.7's clause walker misses
+  `extends_type_clause`, so emitting them would be a divergence, not parity.
+
+- **Position-folded node ids (supersedes the "id-collision dedup" note above).**
+  Non-`file` node ids now hash `(qualified_name, file_path, start_line,
+  start_column)` instead of `(qualified_name, file_path)`. CodeGraph emits *one
+  node per physical definition*; two definitions that collide on
+  `(kind, qn, file)` — a `#[cfg]`-gated pair, several `impl` blocks each defining
+  a same-named method, or repeated `use crate::…;` roots — are therefore all
+  persisted rather than collapsed by the writer's `INSERT OR IGNORE`. This is the
+  id-scheme tightening ADR-004 previously deferred, and it is what lifts real-repo
+  `import`/`method` node recall to ~100%. `sync`-equals-from-scratch still holds
+  (both use the same scheme).
+
+- **Import extraction fidelity.** Imports are named by their module *root* and
+  never qualified by an enclosing scope (`use std::…;` inside `mod tests` is
+  `std`, not `tests::std`); `pub use` roots correctly (not `pub`); wildcard
+  (`use x::*;`) and aliased top-level (`use x as y;`) forms and function-body-local
+  imports are skipped — each matching CodeGraph 0.9.7 empirically.
+
+- **Higher `calls` recall without sacrificing precision.** Two precision-safe
+  additions: qualified calls may target an `enum_member` (tuple-variant
+  constructors, `LanceError::MissingFile(p)`), and `self.field.method()`
+  receivers are typed from the enclosing type's declared struct/class fields so
+  `self.graph.callees()` resolves through `graph: GraphDb`. Crucially, a method
+  call whose receiver type could **not** be inferred is **dropped**, never
+  resolved by method name alone: a bare name (`.as_str()`, `.get()`, `.contains()`)
+  routinely collides with a std/library method, so name-based resolution would
+  fabricate an edge to a same-named project symbol. This is the deliberate
+  precision-over-recall stance — semgraph emits **zero** fabricated calls.
+
+- **CodeGraph `calls` fabrications are whitelisted, not imitated.** Because
+  semgraph declines name-only method resolution, it does not reproduce the large
+  fabricated component of CodeGraph 0.9.7's `calls`: cross-language resolutions (a
+  Rust `stmt.execute()` pointed at a Python method) and external-library
+  over-resolutions (every `.contains()`/`.ok()`/`.as_str()`/`.context()` resolved
+  by bare name to the sole local `contains`/`ok`/… — often an associated
+  constructor the code only ever calls in qualified form). The parity harness
+  credits these as known-better via a `cross_language` edge rule plus **verified**
+  external-library target entries, each with a count (`docs/parity-harness.md`).
+  These are demonstrable fabrications, never genuine recall gaps. On this repo's
+  `src/`, after this whitelisting the honest same-language `calls` recall is in the
+  low-to-mid 80s%; the residual gap is CodeGraph resolving method calls on
+  un-inferrable receivers (field-of-external-type, chained, return-typed) that
+  semgraph precisely declines — the intended tradeoff, **not** whitelisted, so the
+  number stays honest rather than inflated to the ≥90 bar.
