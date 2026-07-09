@@ -48,6 +48,68 @@ type StrHook = for<'a> fn(Node<'a>, &str) -> Option<String>;
 type BoolHook = for<'a> fn(Node<'a>, &str) -> bool;
 /// An import-extraction hook: returns `(module_name, signature)`.
 type ImportHook = for<'a> fn(Node<'a>, &str) -> Option<(String, String)>;
+/// Collect inheritance relationships from a class-like definition node.
+type InheritHook = for<'a> fn(Node<'a>, &str) -> Vec<InheritSite>;
+/// Collect type-reference sites from a function/method signature.
+type TypeRefHook = for<'a> fn(Node<'a>, &str) -> Vec<TypeRefSite>;
+
+/// How a collected inheritance relationship maps to an edge kind.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum InheritEdge {
+    /// Syntactically a superclass/base (Ruby `< B`, Kotlin `: B()`, PHP
+    /// `extends`, Scala `extends`, a Java superclass) → `extends`.
+    Extends,
+    /// Syntactically a conformance (PHP `implements`/`use`, Kotlin bare `: I`) →
+    /// `implements`.
+    Implements,
+    /// Decide by the *resolved* target's kind (Swift/C#, whose single base list
+    /// has no syntactic marker): a target `interface` → `implements`, else
+    /// `extends`. See [`SitePayload::InheritAuto`].
+    Auto,
+}
+
+/// One inheritance relationship of a class-like definition: a parent type name
+/// referenced at `(line, col)`, mapping to `edge`.
+pub(crate) struct InheritSite {
+    pub parent: String,
+    pub line: u32,
+    pub col: u32,
+    pub edge: InheritEdge,
+}
+
+impl InheritSite {
+    /// Build a site whose parent name and `(line, col)` come from `at` (the type
+    /// identifier node), mapping to `edge`.
+    pub(crate) fn at(name: &str, at: Node, edge: InheritEdge) -> InheritSite {
+        let p = at.start_position();
+        InheritSite {
+            parent: name.to_string(),
+            line: p.row as u32 + 1,
+            col: p.column as u32,
+            edge,
+        }
+    }
+}
+
+/// One type-reference site: a type name referenced at `(line, col)` in a
+/// definition's signature → a `references` edge.
+pub(crate) struct TypeRefSite {
+    pub name: String,
+    pub line: u32,
+    pub col: u32,
+}
+
+impl TypeRefSite {
+    /// Build a site whose name and `(line, col)` come from the type node `at`.
+    pub(crate) fn at(name: &str, at: Node) -> TypeRefSite {
+        let p = at.start_position();
+        TypeRefSite {
+            name: name.to_string(),
+            line: p.row as u32 + 1,
+            col: p.column as u32,
+        }
+    }
+}
 
 /// Per-language configuration consumed by the shared [`Extractor`] walker.
 ///
@@ -121,6 +183,13 @@ pub(crate) struct LangSpec {
     /// Ruby-style bare method calls: a statement-level `identifier` that is a
     /// call with neither parentheses nor receiver. Returns the callee name.
     pub bare_call: Option<StrHook>,
+    /// Collect `extends`/`implements` inheritance relationships from a class-like
+    /// definition node (heritage clause / base list / embedding). `None` = the
+    /// language records no inheritance edges.
+    pub inheritance: Option<InheritHook>,
+    /// Collect `references` (type-reference) sites from a function/method
+    /// signature. `None` = the language records no type references.
+    pub type_refs: Option<TypeRefHook>,
 }
 
 /// The recursive-descent extractor state for one file.
@@ -243,6 +312,49 @@ impl<'a> Extractor<'a> {
 
     pub fn add_site(&mut self, site: RawSite) {
         self.sites.push(site);
+    }
+
+    /// Collect `extends`/`implements` sites for a class-like definition whose
+    /// node id is `from_id`, via the language's [`LangSpec::inheritance`] hook.
+    fn collect_inheritance(&mut self, node: Node<'a>, from_id: &str) {
+        let Some(hook) = self.spec.inheritance else {
+            return;
+        };
+        for s in hook(node, self.src) {
+            let payload = match s.edge {
+                InheritEdge::Auto => SitePayload::InheritAuto { parent: s.parent },
+                InheritEdge::Extends => SitePayload::Inherit {
+                    parent: s.parent,
+                    edge_kind: "extends",
+                },
+                InheritEdge::Implements => SitePayload::Inherit {
+                    parent: s.parent,
+                    edge_kind: "implements",
+                },
+            };
+            self.add_site(RawSite {
+                from_id: from_id.to_string(),
+                line: s.line,
+                col: s.col,
+                payload,
+            });
+        }
+    }
+
+    /// Collect `references` (type-reference) sites for a callable whose node id
+    /// is `from_id`, via the language's [`LangSpec::type_refs`] hook.
+    fn collect_type_refs(&mut self, node: Node<'a>, from_id: &str) {
+        let Some(hook) = self.spec.type_refs else {
+            return;
+        };
+        for s in hook(node, self.src) {
+            self.add_site(RawSite {
+                from_id: from_id.to_string(),
+                line: s.line,
+                col: s.col,
+                payload: SitePayload::TypeRef { name: s.name },
+            });
+        }
     }
 
     /// The most recent node record (the one just created), for setting columns.
@@ -414,6 +526,7 @@ impl<'a> Extractor<'a> {
         let (doc, sig, vis, is_async, is_static) = self.callable_props(node);
         if let Some(id) = self.create_node("function", &name, node, None) {
             self.apply_callable(doc, sig, vis, is_async, is_static);
+            self.collect_type_refs(node, &id);
             self.push_scope(id, "function", &name);
             if let Some(body) = self.body_of(node) {
                 self.descend_body(body);
@@ -437,6 +550,7 @@ impl<'a> Extractor<'a> {
         let qn_override = receiver.as_ref().map(|r| format!("{r}::{name}"));
         if let Some(id) = self.create_node("method", &name, node, qn_override) {
             self.apply_callable(doc, sig, vis, is_async, is_static);
+            self.collect_type_refs(node, &id);
             // Extension method: also contained by its owning type, if present.
             if let Some(r) = &receiver {
                 if !self.inside_class_like() {
@@ -471,6 +585,7 @@ impl<'a> Extractor<'a> {
                 rec.docstring = doc;
                 rec.visibility = vis;
             }
+            self.collect_inheritance(node, &id);
             self.push_scope(id, kind, &name);
             let body = self.body_of(node).unwrap_or(node);
             self.descend(body);
@@ -496,6 +611,7 @@ impl<'a> Extractor<'a> {
                 rec.docstring = doc;
                 rec.visibility = vis;
             }
+            self.collect_inheritance(node, &id);
             self.push_scope(id, "struct", &name);
             self.descend(body);
             self.pop_scope();

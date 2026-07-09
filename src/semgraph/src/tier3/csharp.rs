@@ -56,7 +56,64 @@ pub(super) fn spec() -> LangSpec {
         extract_field: None,
         call_payload,
         bare_call: None,
+        inheritance: Some(inheritance),
+        type_refs: Some(type_refs),
     }
+}
+
+/// C# inheritance from the `base_list` (`class C : Base, IShape`). C# has no
+/// syntactic base-vs-interface marker, so each entry is [`InheritEdge::Auto`]:
+/// the resolver classifies an `interface` target as `implements`, a class base
+/// as `extends`.
+fn inheritance(node: Node, src: &str) -> Vec<super::InheritSite> {
+    use super::{named_children_of, InheritEdge, InheritSite};
+    let Some(bl) = named_children_of(node)
+        .into_iter()
+        .find(|c| c.kind() == "base_list")
+    else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for n in named_children_of(bl) {
+        if matches!(n.kind(), "identifier" | "qualified_name" | "generic_name") {
+            out.push(InheritSite::at(base_name(n, src), n, InheritEdge::Auto));
+        }
+    }
+    out
+}
+
+/// C# type references: CodeGraph 0.9.7 records a method's return type AND each
+/// parameter type (user types only; a `predefined_type` like `double`/`void` is
+/// not a graph node and produces no edge). The resolver drops those that do not
+/// resolve to a type node.
+fn type_refs(node: Node, src: &str) -> Vec<super::TypeRefSite> {
+    use super::{named_children_of, TypeRefSite};
+    let mut out = Vec::new();
+    let mut push = |n: Node| {
+        if matches!(n.kind(), "identifier" | "qualified_name" | "generic_name") {
+            out.push(TypeRefSite::at(base_name(n, src), n));
+        }
+    };
+    if let Some(r) = node.child_by_field_name("returns") {
+        push(r);
+    }
+    if let Some(pl) = node.child_by_field_name("parameters") {
+        for p in named_children_of(pl) {
+            if p.kind() == "parameter" {
+                if let Some(t) = p.child_by_field_name("type") {
+                    push(t);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The last dotted segment of a C# type name, with any generic `<…>` stripped.
+fn base_name<'a>(node: Node, src: &'a str) -> &'a str {
+    let t = text(node, src);
+    let t = t.rsplit('.').next().unwrap_or(t);
+    t.split('<').next().unwrap_or(t)
 }
 
 fn text<'a>(node: Node, src: &'a str) -> &'a str {

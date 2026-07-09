@@ -3,11 +3,20 @@
 //! (`tests/fixtures/codegraph-v4.db`), applying the committed whitelist.
 //!
 //! This is the **CI-runnable, offline** acceptance gate: it needs no Node /
-//! CodeGraph install, only the two committed fixtures. It asserts the fixture
+//! CodeGraph install, only the committed fixtures. It asserts the tier-1 fixture
 //! clears the issue's Phase 2 thresholds (≥95% nodes, ≥90% calls) — in fact
 //! 100% post-P2b — and that the only non-matching diffs are the ones the
 //! whitelist accounts for (the `is_async`/docstring improvements and the
 //! CodeGraph return-type duplicate references).
+//!
+//! It also runs the **same harness over every committed language fixture**
+//! (tier-1 `graph-src`, tier-2 `graph-src-tier2/<lang>`, tier-3
+//! `graph-src-tier3/<lang>`), so a parity regression in ANY language — not just
+//! tier-1 — fails CI offline (issue #78 edge alignment; generalizes the gate
+//! that #88 left hardcoded to the tier-1 fixture). Exhaustive per-edge-kind
+//! grading (including `extends`/`implements`/`references`) lives in
+//! `tier2_parity.rs` / `tier3_parity.rs`; this file is the harness threshold
+//! gate.
 //!
 //! Contributors: see `docs/parity-harness.md` for how to run the harness in
 //! **live** mode (shelling out to a local codegraph@0.9.7) and how to add a
@@ -21,6 +30,32 @@ use semgraph::{index_roots, IndexOptions};
 fn fixtures() -> PathBuf {
     // CARGO_MANIFEST_DIR = <repo>/src/semgraph
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures")
+}
+
+/// Every committed `(label, fixture source dir, golden db)` the offline gate
+/// covers: the tier-1 multi-language tree, then each tier-2 and tier-3 language.
+fn all_fixtures() -> Vec<(String, PathBuf, PathBuf)> {
+    let fx = fixtures();
+    let mut out = vec![(
+        "tier1".to_string(),
+        fx.join("graph-src"),
+        fx.join("codegraph-v4.db"),
+    )];
+    for lang in ["c", "cpp", "go", "java"] {
+        out.push((
+            format!("tier2/{lang}"),
+            fx.join("graph-src-tier2").join(lang),
+            fx.join(format!("codegraph-v4-{lang}.db")),
+        ));
+    }
+    for lang in ["ruby", "php", "kotlin", "swift", "scala", "csharp"] {
+        out.push((
+            format!("tier3/{lang}"),
+            fx.join("graph-src-tier3").join(lang),
+            fx.join("graph-src-tier3").join(format!("{lang}.db")),
+        ));
+    }
+    out
 }
 
 fn require(path: &Path) -> PathBuf {
@@ -186,4 +221,47 @@ fn without_whitelist_the_known_better_deltas_still_do_not_break_node_or_calls_re
         .unwrap();
     assert_eq!(refs.missing, 5);
     assert_eq!(refs.whitelisted_missing, 0);
+}
+
+/// Every committed language fixture (tier-1/2/3), diffed through the parity
+/// harness against its golden with the committed whitelist, clears the issue's
+/// acceptance thresholds (≥95% nodes, ≥90% calls). This is the generalized
+/// offline gate: a regression in ANY language fails CI without a Node/CodeGraph
+/// install. (Per-edge-kind exactness is enforced in tier2_parity/tier3_parity.)
+#[test]
+fn every_language_fixture_clears_thresholds() {
+    let whitelist =
+        Whitelist::load(&require(&fixtures().join("parity-whitelist.json"))).expect("whitelist");
+    let mut checked = 0;
+    for (label, src, golden_db) in all_fixtures() {
+        let src = require(&src);
+        let golden_db = require(&golden_db);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = tmp.path().join("semgraph.db");
+        index_roots(&[src], &db, &IndexOptions::default())
+            .unwrap_or_else(|e| panic!("{label}: semgraph index failed: {e}"));
+
+        let ours = extract_parity(&db).expect("read semgraph db");
+        let golden = extract_parity(&golden_db).expect("read golden db");
+        let report = compare(&ours, &golden, &whitelist, &CompareOptions::default());
+
+        assert!(
+            report.node_match_pct() >= 95.0,
+            "{label}: node parity {:.2}% < 95% (missing: {:?})",
+            report.node_match_pct(),
+            report
+                .missing_nodes
+                .iter()
+                .filter(|d| !d.whitelisted)
+                .map(|d| &d.description)
+                .collect::<Vec<_>>()
+        );
+        // `calls` may be N/A (None) when the golden has no calls edges; that is a
+        // vacuous pass, not a failure.
+        if let Some(calls) = report.calls_match_pct() {
+            assert!(calls >= 90.0, "{label}: calls parity {calls:.2}% < 90%");
+        }
+        checked += 1;
+    }
+    assert_eq!(checked, 11, "expected all 11 language fixtures gated");
 }

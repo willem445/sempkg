@@ -61,7 +61,54 @@ pub(super) fn spec() -> LangSpec {
         extract_field: None,
         call_payload,
         bare_call: None,
+        inheritance: Some(inheritance),
+        type_refs: None,
     }
+}
+
+/// Kotlin inheritance from the `delegation_specifiers`: a `constructor_invocation`
+/// delegate (`: Base(args)`, with a `()` call) is the superclass → `extends`; a
+/// bare `user_type` delegate (`: Shape`) is an interface conformance →
+/// `implements`. This is exactly how CodeGraph 0.9.7 distinguishes them
+/// syntactically. No Kotlin type references.
+fn inheritance(node: Node, src: &str) -> Vec<super::InheritSite> {
+    use super::{named_children_of, InheritEdge, InheritSite};
+    let mut out = Vec::new();
+    let Some(ds) = named_children_of(node)
+        .into_iter()
+        .find(|c| c.kind() == "delegation_specifiers")
+    else {
+        return out;
+    };
+    for spec in named_children_of(ds) {
+        if spec.kind() != "delegation_specifier" {
+            continue;
+        }
+        let Some(child) = spec.named_child(0) else {
+            continue;
+        };
+        let (edge, user_type) = match child.kind() {
+            "constructor_invocation" => (InheritEdge::Extends, child.named_child(0)),
+            "user_type" => (InheritEdge::Implements, Some(child)),
+            _ => continue,
+        };
+        if let Some(ut) = user_type {
+            if let Some(id) = user_type_ident(ut) {
+                out.push(InheritSite::at(text(id, src), id, edge));
+            }
+        }
+    }
+    out
+}
+
+/// The leaf identifier of a Kotlin `user_type` (`Base` from `Base` / `pkg.Base`).
+fn user_type_ident(ut: Node) -> Option<Node> {
+    named_children_of(ut).into_iter().rev().find(|n| {
+        matches!(
+            n.kind(),
+            "identifier" | "type_identifier" | "simple_identifier"
+        )
+    })
 }
 
 fn text<'a>(node: Node, src: &'a str) -> &'a str {

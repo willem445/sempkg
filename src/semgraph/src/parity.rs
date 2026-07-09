@@ -158,10 +158,18 @@ pub fn extract_parity(db_path: &Path) -> Result<Graph> {
         .filter_map(std::result::Result::ok)
         .collect();
 
+    // Exclude CodeGraph's synthesized interface→impl edges (Phase-5.5 heuristic,
+    // `metadata.synthesizedBy = "interface-impl"`, NULL call-site column) from
+    // both sides. They are a name-based implementation bridge, not a real call
+    // site; the native indexer never fabricates them, and grading them would
+    // penalise a language purely for the heuristic (ADR-005). Applied on both
+    // graphs, so it is symmetric. The tier-1 golden contains none, so this is a
+    // no-op there.
     let mut estmt = conn.prepare(
         "SELECT s.qualified_name, t.qualified_name, e.kind, COALESCE(s.language,''), \
                 s.kind, s.file_path, t.kind, t.file_path, COALESCE(t.language,'') \
-         FROM edges e JOIN nodes s ON s.id = e.source JOIN nodes t ON t.id = e.target",
+         FROM edges e JOIN nodes s ON s.id = e.source JOIN nodes t ON t.id = e.target \
+         WHERE e.metadata IS NULL OR e.metadata NOT LIKE '%synthesizedBy%'",
     )?;
     let edges = estmt
         .query_map([], |r| {

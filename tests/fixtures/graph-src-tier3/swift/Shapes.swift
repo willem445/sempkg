@@ -22,7 +22,11 @@ struct Point {
     }
 }
 
-class Circle: Shape {
+class Base {
+    var tag: Scalar = 0
+}
+
+class Circle: Base, Shape {
     var radius: Scalar
 
     init(radius: Scalar) {

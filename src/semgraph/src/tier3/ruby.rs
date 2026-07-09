@@ -56,7 +56,29 @@ pub(super) fn spec() -> LangSpec {
         extract_field: None,
         call_payload,
         bare_call: Some(bare_call),
+        inheritance: Some(inheritance),
+        type_refs: None,
     }
+}
+
+/// `class C < Base` → `extends`. Ruby `include Module` mixins are `call` nodes in
+/// the body and produce no edge (CodeGraph 0.9.7 records none); only the
+/// superclass is an inheritance edge.
+fn inheritance(node: Node, src: &str) -> Vec<super::InheritSite> {
+    let Some(sc) = node.child_by_field_name("superclass") else {
+        return Vec::new();
+    };
+    // `superclass` wraps the base `constant` (possibly a `scope_resolution`).
+    let Some(base) = sc.named_child(0) else {
+        return Vec::new();
+    };
+    let name = &src[base.start_byte()..base.end_byte()];
+    let name = name.rsplit("::").next().unwrap_or(name);
+    vec![super::InheritSite::at(
+        name,
+        base,
+        super::InheritEdge::Extends,
+    )]
 }
 
 /// `module Foo ... end` — a scope container. Create a `module` node, then visit

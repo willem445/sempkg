@@ -92,6 +92,13 @@ pub(crate) enum SitePayload {
         parent: String,
         edge_kind: &'static str,
     },
+    /// An inheritance relationship whose kind (`extends` vs `implements`) is
+    /// decided by the *resolved target's* kind, not by syntax — used by Swift and
+    /// C#, where a single `: A, B, C` base list has no syntactic marker
+    /// distinguishing a superclass from a conformed interface. Matches CodeGraph
+    /// 0.9.7: a target `interface` (Swift protocol / C# interface) → `implements`,
+    /// anything else (a class/struct base) → `extends`. `parent` is the type name.
+    InheritAuto { parent: String },
 }
 
 /// A resolved target plus how it was found (for the edge's `metadata`).
@@ -119,6 +126,10 @@ const STRICT_TYPE_KINDS: &[&str] = &["struct", "enum", "class", "interface"];
 const EXTENDS_KINDS: &[&str] = &["class", "struct", "interface", "trait", "enum"];
 /// Node kinds an `implements` edge may target (a trait / interface).
 const IMPLEMENTS_KINDS: &[&str] = &["trait", "interface", "class"];
+/// Node kinds an [`SitePayload::InheritAuto`] site may target — the union of the
+/// extends/implements target kinds. The resolved node's own kind then decides
+/// whether the edge is `extends` or `implements`.
+const INHERIT_ANY_KINDS: &[&str] = &["class", "struct", "interface", "trait", "enum"];
 
 /// A global index over every definition node, used to resolve reference sites.
 ///
@@ -315,6 +326,16 @@ impl<'a> SymbolTable<'a> {
                     EXTENDS_KINDS
                 };
                 let r = self.resolve_name(from_file, parent, kinds)?;
+                Some(self.edge(site, edge_kind, &r))
+            }
+            SitePayload::InheritAuto { parent } => {
+                let r = self.resolve_name(from_file, parent, INHERIT_ANY_KINDS)?;
+                // CodeGraph classifies a conformed interface/protocol as
+                // `implements` and a class/struct base as `extends`.
+                let edge_kind = match r.node.kind.as_str() {
+                    "interface" | "trait" => "implements",
+                    _ => "extends",
+                };
                 Some(self.edge(site, edge_kind, &r))
             }
         }

@@ -7,6 +7,20 @@ def circle_area(radius)
 end
 
 module Geometry
+  # A base class.
+  class Base
+    def kind
+      :shape
+    end
+  end
+
+  # A subclass — Ruby `<` superclass → an `extends` edge (Circle extends Base).
+  class Circle < Base
+    def area
+      3.14
+    end
+  end
+
   # A class with methods.
   class Point
     # Constructor.

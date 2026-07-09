@@ -7,10 +7,16 @@
 //!
 //! - **nodes** — the `(kind, qualified_name, file_path)` keyset, ≥95% of golden
 //!   (we hold 100% on the fixtures).
-//! - **`calls` / `instantiates` / `imports` edges** — each graded as a
-//!   bidirectional `(source_qn, target_qn, line, col)` multiset (no missing, no
-//!   spurious), ≥90% of golden (100% on the fixtures), minus a small, documented
-//!   per-language whitelist (see `docs/arch/adr/adr-005-tier3-language-packs.md`).
+//! - **`calls` / `instantiates` / `imports` / `extends` / `implements` /
+//!   `references` edges** — each graded as a bidirectional `(source_qn,
+//!   target_qn, line, col)` multiset (no missing, no spurious), ≥90% of golden
+//!   (100% on the fixtures), minus a small, documented per-language whitelist
+//!   (see `docs/arch/adr/adr-005-tier3-language-packs.md`). The inheritance and
+//!   type-reference families (issue #78 edge alignment) are now graded alongside
+//!   the others: Ruby/PHP/Kotlin/Swift/Scala/C# each exercise every inheritance
+//!   kind CodeGraph 0.9.7 supports for it (`extends` for all; `implements` for
+//!   PHP/Kotlin/Swift/C#; Scala emits only `extends` and drops `with` mixins;
+//!   Swift/C# type `references`).
 //!
 //! Whitelisted deltas, all disclosed in ADR-005:
 //! - **Synthesized interface→impl `calls`** (Kotlin/Scala/C#): CodeGraph's
@@ -20,10 +26,9 @@
 //!   class node; we point the `imports` edge at our own `import` node. One
 //!   whitelisted missing+spurious pair (Kotlin only).
 //!
-//! Not graded here (ungraded edge families, per ADR-005): `implements`/`extends`
-//! and `references`. Scala emits **no** `instantiates` (0.9.7 has no Scala
-//! instantiation handling); the fixture's `new Circle` is present to prove we
-//! likewise emit none — graded as an exact empty multiset.
+//! Scala emits **no** `instantiates` (0.9.7 has no Scala instantiation handling);
+//! the fixture's `new Circle` is present to prove we likewise emit none — graded
+//! as an exact empty multiset.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -48,6 +53,12 @@ struct Case {
     calls: Wl,
     instantiates: Wl,
     imports: Wl,
+    /// Inheritance/type-reference families (issue #78 edge alignment), graded
+    /// bidirectionally like the others. Empty whitelist for every current fixture
+    /// (each reproduces its golden exactly).
+    extends: Wl,
+    implements: Wl,
+    references: Wl,
     /// Golden node keys `(kind, qualified_name)` we deliberately do not
     /// reproduce. Empty for every current fixture.
     node_whitelist: &'static [(&'static str, &'static str)],
@@ -60,6 +71,9 @@ fn cases() -> Vec<Case> {
             calls: EMPTY,
             instantiates: EMPTY,
             imports: EMPTY,
+            extends: EMPTY,
+            implements: EMPTY,
+            references: EMPTY,
             node_whitelist: &[],
         },
         Case {
@@ -67,6 +81,9 @@ fn cases() -> Vec<Case> {
             calls: EMPTY,
             instantiates: EMPTY,
             imports: EMPTY,
+            extends: EMPTY,
+            implements: EMPTY,
+            references: EMPTY,
             node_whitelist: &[],
         },
         Case {
@@ -83,6 +100,9 @@ fn cases() -> Vec<Case> {
                     3,
                 )],
             },
+            extends: EMPTY,
+            implements: EMPTY,
+            references: EMPTY,
             node_whitelist: &[],
         },
         Case {
@@ -90,6 +110,9 @@ fn cases() -> Vec<Case> {
             calls: EMPTY,
             instantiates: EMPTY,
             imports: EMPTY,
+            extends: EMPTY,
+            implements: EMPTY,
+            references: EMPTY,
             node_whitelist: &[],
         },
         Case {
@@ -97,6 +120,9 @@ fn cases() -> Vec<Case> {
             calls: EMPTY,
             instantiates: EMPTY,
             imports: EMPTY,
+            extends: EMPTY,
+            implements: EMPTY,
+            references: EMPTY,
             node_whitelist: &[],
         },
         Case {
@@ -104,6 +130,9 @@ fn cases() -> Vec<Case> {
             calls: EMPTY,
             instantiates: EMPTY,
             imports: EMPTY,
+            extends: EMPTY,
+            implements: EMPTY,
+            references: EMPTY,
             node_whitelist: &[],
         },
     ]
@@ -296,6 +325,31 @@ fn tier3_parity_meets_acceptance() {
             &our_db,
             &golden,
             &case.imports,
+            &mut failures,
+        );
+        // Inheritance + type-reference families (issue #78 edge alignment).
+        grade_edges(
+            case.lang,
+            "extends",
+            &our_db,
+            &golden,
+            &case.extends,
+            &mut failures,
+        );
+        grade_edges(
+            case.lang,
+            "implements",
+            &our_db,
+            &golden,
+            &case.implements,
+            &mut failures,
+        );
+        grade_edges(
+            case.lang,
+            "references",
+            &our_db,
+            &golden,
+            &case.references,
             &mut failures,
         );
     }

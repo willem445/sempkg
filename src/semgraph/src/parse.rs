@@ -462,8 +462,8 @@ fn collect_inheritance_sites(
                     }
                 }
             }
-            // TS/JS classes: class_heritage → extends_clause / implements_clause.
-            // (CodeGraph records inheritance for classes only.)
+            // CodeGraph records TS/JS inheritance for classes only, via
+            // class_heritage → extends_clause / implements_clause.
             Language::TypeScript | Language::Tsx | Language::JavaScript if rec.kind == "class" => {
                 if let Some(heritage) = child_of_kind(*node, "class_heritage") {
                     let mut c = heritage.walk();
@@ -479,9 +479,86 @@ fn collect_inheritance_sites(
                     }
                 }
             }
-            // Non-inheriting definitions, and the tier-2 (C/C++/Go/Java) and
-            // tier-3 packs (which emit no inheritance from this pass — tier-3 has
-            // its own extractor), add nothing here.
+            // C++: every base in a `base_class_clause` → `extends` (CodeGraph
+            // uses `extends` for all C++ bases; C++ has no `interface` kind, so
+            // no `implements`). CodeGraph *also* fabricates a spurious
+            // `class -> <method-return-type>` extends by misreading an in-class
+            // method's return type as a base — we never emit that (it lives in
+            // the class body, not the base clause), and it is whitelisted.
+            Language::Cpp if matches!(rec.kind.as_str(), "class" | "struct") => {
+                if let Some(bc) = child_of_kind(*node, "base_class_clause") {
+                    for id in heritage_type_idents(bc, src) {
+                        push_inherit(
+                            sites,
+                            &from_id,
+                            id,
+                            "extends",
+                            node_text(id, src).to_string(),
+                        );
+                    }
+                }
+            }
+            // Go: struct/interface embedding → `extends` (an embedded field/type
+            // with no field name, or an embedded interface `type_elem`). Go has no
+            // explicit `implements`.
+            Language::Go => {
+                if let Some(ty) = node.child_by_field_name("type") {
+                    for id in go_embedded_type_idents(ty) {
+                        push_inherit(
+                            sites,
+                            &from_id,
+                            id,
+                            "extends",
+                            node_text(id, src).to_string(),
+                        );
+                    }
+                }
+            }
+            // Java: a class's `superclass` (extends Base) → `extends`, its
+            // `interfaces` (implements I, …) → `implements`; an interface's
+            // `extends_interfaces` (extends I, …) → `extends`.
+            Language::Java => match rec.kind.as_str() {
+                "class" => {
+                    if let Some(sc) = node.child_by_field_name("superclass") {
+                        for id in heritage_type_idents(sc, src) {
+                            push_inherit(
+                                sites,
+                                &from_id,
+                                id,
+                                "extends",
+                                node_text(id, src).to_string(),
+                            );
+                        }
+                    }
+                    if let Some(ifs) = node.child_by_field_name("interfaces") {
+                        for id in heritage_type_idents(ifs, src) {
+                            push_inherit(
+                                sites,
+                                &from_id,
+                                id,
+                                "implements",
+                                node_text(id, src).to_string(),
+                            );
+                        }
+                    }
+                }
+                "interface" => {
+                    if let Some(ext) = child_of_kind(*node, "extends_interfaces") {
+                        for id in heritage_type_idents(ext, src) {
+                            push_inherit(
+                                sites,
+                                &from_id,
+                                id,
+                                "extends",
+                                node_text(id, src).to_string(),
+                            );
+                        }
+                    }
+                }
+                _ => {}
+            },
+            // Non-class TS/JS, plain C (no inheritance), and tier-3 (handled by
+            // tier3::extract) reach here.
             _ => {}
         }
     }
@@ -557,6 +634,91 @@ fn heritage_clause_types<'a>(clause: Node<'a>, src: &str) -> Vec<(String, Node<'
         }
     }
     out
+}
+
+/// Every base-type `type_identifier` under a heritage / base-class clause, in
+/// document order, skipping generic `type_arguments` subtrees (so `Foo<Bar>`
+/// contributes only `Foo`, and `implements Shape, Named` yields both). Used for
+/// C++ `base_class_clause` and Java `superclass`/`interfaces`/`extends_interfaces`,
+/// whose listed types surface as `type_identifier` nodes (a namespace-qualified
+/// C++ base like `geo::Base` still ends in a `type_identifier` `Base`, matching
+/// CodeGraph's namespace-stripped resolution).
+fn heritage_type_idents<'a>(clause: Node<'a>, _src: &str) -> Vec<Node<'a>> {
+    let mut out = Vec::new();
+    let mut stack = vec![clause];
+    while let Some(n) = stack.pop() {
+        // Generic arguments are not base types.
+        if n.kind() == "type_arguments" {
+            continue;
+        }
+        if n.kind() == "type_identifier" {
+            out.push(n);
+            continue;
+        }
+        let mut c = n.walk();
+        for ch in n.children(&mut c) {
+            stack.push(ch);
+        }
+    }
+    out.sort_by_key(|n| (n.start_byte(), n.end_byte()));
+    out
+}
+
+/// The embedded-type `type_identifier`s of a Go `struct_type` / `interface_type`
+/// (the language's "inheritance"): a struct `field_declaration` with a `type`
+/// but no `name` field is an embedded field; an interface `type_elem` is an
+/// embedded interface. A pointer/qualified/generic embed (`*Base`, `pkg.Base`)
+/// still bottoms out at the base `type_identifier`. Named struct fields and
+/// interface method elements are skipped.
+fn go_embedded_type_idents<'a>(ty: Node<'a>) -> Vec<Node<'a>> {
+    let mut out = Vec::new();
+    match ty.kind() {
+        "struct_type" => {
+            if let Some(fdl) = child_of_kind(ty, "field_declaration_list") {
+                let mut c = fdl.walk();
+                for fd in fdl.named_children(&mut c) {
+                    if fd.kind() != "field_declaration" || fd.child_by_field_name("name").is_some()
+                    {
+                        continue;
+                    }
+                    if let Some(t) = fd.child_by_field_name("type") {
+                        if let Some(id) = go_base_type_id(t) {
+                            out.push(id);
+                        }
+                    }
+                }
+            }
+        }
+        "interface_type" => {
+            let mut c = ty.walk();
+            for el in ty.named_children(&mut c) {
+                if el.kind() == "type_elem" {
+                    if let Some(id) = go_base_type_id(el) {
+                        out.push(id);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+/// The base `type_identifier` of a Go embedded type expression (unwrapping a
+/// `pointer_type`/`qualified_type`/`generic_type`/`type_elem` wrapper).
+fn go_base_type_id(node: Node) -> Option<Node> {
+    if node.kind() == "type_identifier" {
+        return Some(node);
+    }
+    let mut c = node.walk();
+    // Prefer a direct `type_identifier`; else recurse into the first child.
+    for ch in node.named_children(&mut c) {
+        if ch.kind() == "type_identifier" {
+            return Some(ch);
+        }
+    }
+    let first = node.named_child(0)?;
+    go_base_type_id(first)
 }
 
 /// The leftmost identifier text of a type expression (`Base` from `Base`,
@@ -2699,6 +2861,68 @@ import { hypot } from "./geometry";
             find(&nodes, "fixture::C::C").unwrap().signature.as_deref(),
             Some("(double a)")
         );
+    }
+
+    // ---- tier-2 inheritance (edge alignment, issue #78) ---------------------
+
+    #[test]
+    fn cpp_base_class_clause_is_extends_no_spurious() {
+        // Single + multiple inheritance → `extends` for every base (C++ has no
+        // `implements`). `double` returns avoid CodeGraph's return-type-misread,
+        // so we emit exactly the genuine bases.
+        let src = "\
+class Solid { public: double d; };
+class Drawable { public: virtual double area() const = 0; };
+class Disc : public Solid { public: double r; };
+class Prism : public Solid, public Drawable { public: double area() const; };
+";
+        let ex = extract(src, "a.cpp", Language::Cpp, 0, 0);
+        let edges = inheritance_edges(&ex);
+        assert!(edges.contains(&("extends".into(), "Disc".into(), "Solid".into())));
+        assert!(edges.contains(&("extends".into(), "Prism".into(), "Solid".into())));
+        assert!(edges.contains(&("extends".into(), "Prism".into(), "Drawable".into())));
+        assert_eq!(
+            edges.len(),
+            3,
+            "no implements, no spurious extends: {edges:?}"
+        );
+    }
+
+    #[test]
+    fn go_struct_and_interface_embedding_is_extends() {
+        let src = "package p
+type Base struct { X int }
+type Disc struct { Base; R int }
+type Reader interface { Read() int }
+type RW interface { Reader; Write(v int) int }
+";
+        let ex = extract(src, "a.go", Language::Go, 0, 0);
+        let edges = inheritance_edges(&ex);
+        // Embedded (unnamed) fields/types → extends; the named field `R` does not.
+        assert!(edges.contains(&("extends".into(), "Disc".into(), "Base".into())));
+        assert!(edges.contains(&("extends".into(), "RW".into(), "Reader".into())));
+        assert_eq!(edges.len(), 2, "only embeds, not named fields: {edges:?}");
+    }
+
+    #[test]
+    fn java_class_extends_implements_and_interface_extends() {
+        let src = "package p;
+interface Shape { double area(); }
+interface Named extends Shape { String name(); }
+abstract class Base { double t; }
+class Circle extends Base implements Shape, Named {
+    public double area() { return 0.0; }
+    public String name() { return \"c\"; }
+}
+";
+        let ex = extract(src, "A.java", Language::Java, 0, 0);
+        let edges = inheritance_edges(&ex);
+        assert!(edges.contains(&("extends".into(), "p::Circle".into(), "p::Base".into())));
+        assert!(edges.contains(&("implements".into(), "p::Circle".into(), "p::Shape".into())));
+        assert!(edges.contains(&("implements".into(), "p::Circle".into(), "p::Named".into())));
+        // A Java interface's `extends` targets an interface (unlike TS, which
+        // CodeGraph misses) and is recorded as `extends`.
+        assert!(edges.contains(&("extends".into(), "p::Named".into(), "p::Shape".into())));
     }
 
     // ---- tier-1 hardening: trait/interface nodes + inheritance edges --------
