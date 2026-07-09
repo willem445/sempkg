@@ -1670,7 +1670,7 @@ fn add_from_github(
     let cg_version = codegraph::version();
 
     eprintln!(
-        "[sempkg] Building bundle for {}@{} (language: {language}, codegraph: {cg_version}) ...",
+        "[sempkg] Building bundle for {}@{} (language: {language}, indexer: {cg_version}) ...",
         resolved.package_name, resolved.version
     );
 
@@ -2323,7 +2323,7 @@ fn add_from_local(
     let cg_version = codegraph::version();
 
     eprintln!(
-        "[sempkg] Building bundle for {}@{} (language: {language}, codegraph: {cg_version}) ...",
+        "[sempkg] Building bundle for {}@{} (language: {language}, indexer: {cg_version}) ...",
         package_name, version
     );
 

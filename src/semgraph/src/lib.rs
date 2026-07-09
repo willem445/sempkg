@@ -103,6 +103,10 @@ pub use writer::GraphWriter;
 /// error rather than being silently mis-read.
 pub const SUPPORTED_SCHEMA_VERSION: i64 = 4;
 
+/// The `semgraph` crate version, used to stamp `manifest.codegraph_version`
+/// as `"sempkg-native/<VERSION>"` on bundles built by the native indexer.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// Errors returned by the graph reader.
 #[derive(Debug, Error)]
 pub enum Error {

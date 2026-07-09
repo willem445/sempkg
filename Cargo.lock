@@ -5451,6 +5451,7 @@ dependencies = [
  "rand 0.8.6",
  "reqwest 0.13.4",
  "rusqlite",
+ "semgraph",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -5459,7 +5460,6 @@ dependencies = [
  "thiserror",
  "tokio",
  "walkdir",
- "which",
  "zeroize",
 ]
 
