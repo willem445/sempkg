@@ -300,7 +300,9 @@ fn contains_edges_and_file_nodes_are_emitted() {
         })
         .unwrap();
     assert_eq!(file_nodes, 7);
-    // Only `contains` edges in Phase 2a (resolution is Phase 2b).
+    // Phase 2b resolves references, so calls/references/imports/instantiates are
+    // now present alongside the structural `contains` edges. (Exact per-kind
+    // parity vs the golden fixture is asserted in tests/resolve_parity.rs.)
     let non_contains: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM edges WHERE kind != 'contains'",
@@ -308,7 +310,18 @@ fn contains_edges_and_file_nodes_are_emitted() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(non_contains, 0);
+    assert!(
+        non_contains > 0,
+        "Phase 2b must resolve non-contains edges, got {non_contains}"
+    );
+    for kind in ["calls", "references", "imports", "instantiates"] {
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM edges WHERE kind = ?1", [kind], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert!(n > 0, "expected at least one {kind} edge, got {n}");
+    }
     let contains: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM edges WHERE kind='contains'",

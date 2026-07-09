@@ -23,7 +23,7 @@
 //! method is contained by both its file and its type — matching CodeGraph.
 //!
 //! The query capture conventions are adapted from CodeGraph's MIT-licensed
-//! tree-sitter tag queries (https://github.com/colbymchenry/codegraph); see the
+//! tree-sitter tag queries (<https://github.com/colbymchenry/codegraph>); see the
 //! repository `NOTICE`.
 
 use std::collections::{HashMap, HashSet};
@@ -34,13 +34,21 @@ use streaming_iterator::StreamingIterator;
 use tree_sitter::{Node, Parser, Query, QueryCursor};
 
 use crate::model::{content_hash, EdgeRecord, FileRecord, Language, NodeRecord};
+use crate::resolve::{bare_type_name, RawSite, SitePayload};
 
 /// The nodes + edges extracted from one source file, plus its `files` row.
+///
+/// `sites` are the unresolved call/reference/import/instantiation occurrences
+/// (Phase 2b); they carry call-site coordinates and whatever local context the
+/// parser could infer, and are resolved to `calls`/`references`/`imports`/
+/// `instantiates` edges by the resolver (`crate::resolve`) once every file is
+/// parsed. `edges` here holds only the intra-file structural `contains` edges.
 #[derive(Debug, Clone)]
 pub struct FileExtract {
     pub file_record: FileRecord,
     pub nodes: Vec<NodeRecord>,
     pub edges: Vec<EdgeRecord>,
+    pub(crate) sites: Vec<RawSite>,
 }
 
 /// Extract definitions from `src`.
@@ -106,6 +114,7 @@ pub fn extract(
                 ),
                 nodes,
                 edges,
+                sites: Vec::new(),
             };
         }
     };
@@ -187,6 +196,12 @@ pub fn extract(
         }
     }
 
+    // 4. Reference sites (Phase 2b): call/method/ctor sites via the refs query,
+    //    type-reference sites walked over each definition's signature, and
+    //    import sites reusing the emitted `import` nodes. These are resolved to
+    //    edges after all files are parsed (see `crate::resolve`).
+    let sites = collect_sites(root, src, language, &file_id, &ts_to_id, &emitted, &nodes);
+
     let errors = if root.has_error() {
         Some("[\"syntax errors present\"]".to_string())
     } else {
@@ -206,6 +221,498 @@ pub fn extract(
         file_record,
         nodes,
         edges,
+        sites,
+    }
+}
+
+// ---- reference-site collection (Phase 2b) --------------------------------
+
+/// Collect every reference site in one file: call/method/constructor sites (via
+/// the language's refs query), type-reference sites (walked over each
+/// definition's signature), and import sites (from the emitted `import` nodes).
+fn collect_sites(
+    root: Node,
+    src: &str,
+    lang: Language,
+    file_id: &str,
+    ts_to_id: &HashMap<usize, String>,
+    emitted: &[(Node, usize)],
+    nodes: &[NodeRecord],
+) -> Vec<RawSite> {
+    let mut sites = Vec::new();
+
+    // Map each emitted function/method definition's record id → its tree node,
+    // so a call site can look up the locals of its enclosing callable.
+    let mut def_node_by_id: HashMap<String, Node> = HashMap::new();
+    for (node, idx) in emitted {
+        if matches!(nodes[*idx].kind.as_str(), "function" | "method") {
+            def_node_by_id.insert(nodes[*idx].id.clone(), *node);
+        }
+    }
+    // record id → enclosing type name (for `self`/`this` receivers).
+    let encl_type_by_id: HashMap<String, String> = emitted
+        .iter()
+        .filter_map(|(_, idx)| {
+            let n = &nodes[*idx];
+            if n.kind == "method" {
+                n.qualified_name
+                    .rsplit_once("::")
+                    .map(|(ty, _)| (n.id.clone(), ty.to_string()))
+            } else {
+                None
+            }
+        })
+        .collect();
+    // Cache of locals maps, computed lazily per enclosing callable.
+    let mut locals_cache: HashMap<String, HashMap<String, String>> = HashMap::new();
+
+    // 4a. Call / method / constructor sites via the refs query.
+    let (_ts_lang, refs_query) = compiled_refs(lang);
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(refs_query, root, src.as_bytes());
+    let mut raw_calls: Vec<(Node, &str)> = Vec::new();
+    while let Some(m) = matches.next() {
+        for cap in m.captures {
+            let cap_name = refs_query.capture_names()[cap.index as usize];
+            raw_calls.push((cap.node, cap_name));
+        }
+    }
+    // Deterministic order: document order by start byte.
+    raw_calls.sort_by_key(|(n, _)| (n.start_byte(), n.end_byte()));
+
+    for (call, cap) in &raw_calls {
+        let call = *call;
+        let from_id =
+            nearest_emitted_ancestor(call, ts_to_id).unwrap_or_else(|| file_id.to_string());
+        let start = call.start_position();
+        let line = start.row as u32 + 1;
+        let col = start.column as u32;
+
+        let payload = if *cap == "new" {
+            new_payload(call, src, lang)
+        } else {
+            call_payload(
+                call,
+                src,
+                lang,
+                &from_id,
+                &def_node_by_id,
+                &encl_type_by_id,
+                &mut locals_cache,
+            )
+        };
+        if let Some(payload) = payload {
+            sites.push(RawSite {
+                from_id,
+                line,
+                col,
+                payload,
+            });
+        }
+    }
+
+    // 4b. Type-reference sites over each definition's signature (Rust + TS/JS
+    //     only — CodeGraph emits no Python type references, so neither do we).
+    if lang != Language::Python {
+        for (node, idx) in emitted {
+            if !matches!(nodes[*idx].kind.as_str(), "function" | "method") {
+                continue;
+            }
+            let from_id = &nodes[*idx].id;
+            collect_type_refs(*node, src, lang, from_id, &mut sites);
+        }
+    }
+
+    // 4c. Import sites: file → import-node edges. A plain Python `import X`
+    //     (module alias, not a `from` import) gets no edge, matching CodeGraph.
+    for (node, idx) in emitted {
+        if nodes[*idx].kind != "import" {
+            continue;
+        }
+        if lang == Language::Python && node.kind() == "import_statement" {
+            continue;
+        }
+        let rec = &nodes[*idx];
+        sites.push(RawSite {
+            from_id: file_id.to_string(),
+            line: rec.start_line,
+            col: rec.start_column,
+            payload: SitePayload::Import {
+                target_id: rec.id.clone(),
+                module: rec.name.clone(),
+            },
+        });
+    }
+
+    sites
+}
+
+/// Derive a call/method/constructor payload from a captured call node.
+fn call_payload(
+    call: Node,
+    src: &str,
+    lang: Language,
+    from_id: &str,
+    def_node_by_id: &HashMap<String, Node>,
+    encl_type_by_id: &HashMap<String, String>,
+    locals_cache: &mut HashMap<String, HashMap<String, String>>,
+) -> Option<SitePayload> {
+    let func = call.child_by_field_name("function")?;
+    match lang {
+        Language::Rust => match func.kind() {
+            "identifier" => Some(SitePayload::CallOrCtor {
+                name: node_text(func, src).to_string(),
+            }),
+            "scoped_identifier" => {
+                let name = field_text(func, "name", src)?;
+                let path = func.child_by_field_name("path")?;
+                let qualifier = last_path_segment(node_text(path, src));
+                Some(SitePayload::QualifiedCall { qualifier, name })
+            }
+            "field_expression" => {
+                let name = field_text(func, "field", src)?;
+                let recv = func.child_by_field_name("value")?;
+                let recv_type = receiver_type(
+                    recv,
+                    src,
+                    from_id,
+                    def_node_by_id,
+                    encl_type_by_id,
+                    locals_cache,
+                    lang,
+                );
+                Some(SitePayload::MethodCall { recv_type, name })
+            }
+            _ => None,
+        },
+        Language::Python => match func.kind() {
+            "identifier" => Some(SitePayload::CallOrCtor {
+                name: node_text(func, src).to_string(),
+            }),
+            "attribute" => {
+                let name = field_text(func, "attribute", src)?;
+                let recv = func.child_by_field_name("object")?;
+                let recv_type = receiver_type(
+                    recv,
+                    src,
+                    from_id,
+                    def_node_by_id,
+                    encl_type_by_id,
+                    locals_cache,
+                    lang,
+                );
+                Some(SitePayload::MethodCall { recv_type, name })
+            }
+            _ => None,
+        },
+        Language::TypeScript | Language::Tsx | Language::JavaScript => match func.kind() {
+            "identifier" => Some(SitePayload::CallOrCtor {
+                name: node_text(func, src).to_string(),
+            }),
+            "member_expression" => {
+                let name = field_text(func, "property", src)?;
+                let recv = func.child_by_field_name("object")?;
+                let recv_type = receiver_type(
+                    recv,
+                    src,
+                    from_id,
+                    def_node_by_id,
+                    encl_type_by_id,
+                    locals_cache,
+                    lang,
+                );
+                Some(SitePayload::MethodCall { recv_type, name })
+            }
+            _ => None,
+        },
+    }
+}
+
+/// Derive the class name a `new X(...)` expression constructs (TS/JS).
+fn new_payload(new_expr: Node, src: &str, _lang: Language) -> Option<SitePayload> {
+    let ctor = new_expr.child_by_field_name("constructor")?;
+    if ctor.kind() == "identifier" {
+        Some(SitePayload::New {
+            name: node_text(ctor, src).to_string(),
+        })
+    } else {
+        None
+    }
+}
+
+/// Infer a receiver expression's type name: `self`/`this` → the enclosing type;
+/// a bare identifier → its locally inferred type; anything else → `None`.
+fn receiver_type(
+    recv: Node,
+    src: &str,
+    from_id: &str,
+    def_node_by_id: &HashMap<String, Node>,
+    encl_type_by_id: &HashMap<String, String>,
+    locals_cache: &mut HashMap<String, HashMap<String, String>>,
+    lang: Language,
+) -> Option<String> {
+    if matches!(recv.kind(), "self" | "this") {
+        return encl_type_by_id.get(from_id).cloned();
+    }
+    if recv.kind() != "identifier" {
+        return None;
+    }
+    let name = node_text(recv, src);
+    if matches!(name, "self" | "this") {
+        return encl_type_by_id.get(from_id).cloned();
+    }
+    if !locals_cache.contains_key(from_id) {
+        let locals = def_node_by_id
+            .get(from_id)
+            .map(|n| {
+                infer_locals(
+                    *n,
+                    src,
+                    lang,
+                    encl_type_by_id.get(from_id).map(|s| s.as_str()),
+                )
+            })
+            .unwrap_or_default();
+        locals_cache.insert(from_id.to_string(), locals);
+    }
+    locals_cache.get(from_id)?.get(name).cloned()
+}
+
+/// The last `::`-segment of a Rust path (`geometry::Point` → `Point`).
+fn last_path_segment(path: &str) -> String {
+    path.rsplit("::").next().unwrap_or(path).trim().to_string()
+}
+
+/// Build a `variable name → type name` map for one callable body: parameter
+/// type annotations plus locals assigned from a constructor/associated call.
+/// Deliberately shallow (precision over recall): an un-inferrable receiver
+/// yields no entry and the method call is later dropped rather than guessed.
+fn infer_locals(
+    func: Node,
+    src: &str,
+    lang: Language,
+    encl_type: Option<&str>,
+) -> HashMap<String, String> {
+    let mut locals = HashMap::new();
+    if let Some(t) = encl_type {
+        locals.insert("self".to_string(), t.to_string());
+        locals.insert("this".to_string(), t.to_string());
+    }
+
+    // Parameters with type annotations.
+    if let Some(params) = func.child_by_field_name("parameters") {
+        let mut c = params.walk();
+        for p in params.named_children(&mut c) {
+            infer_param(p, src, lang, encl_type, &mut locals);
+        }
+    }
+
+    // Locals assigned from a constructor / associated call in the body.
+    if let Some(body) = func.child_by_field_name("body") {
+        walk_assignments(body, src, lang, &mut locals);
+    }
+    locals
+}
+
+fn infer_param(
+    p: Node,
+    src: &str,
+    lang: Language,
+    encl_type: Option<&str>,
+    locals: &mut HashMap<String, String>,
+) {
+    match lang {
+        Language::Rust => {
+            if p.kind() == "self_parameter" {
+                if let Some(t) = encl_type {
+                    locals.insert("self".to_string(), t.to_string());
+                }
+            } else if p.kind() == "parameter" {
+                if let (Some(pat), Some(ty)) = (
+                    p.child_by_field_name("pattern"),
+                    p.child_by_field_name("type"),
+                ) {
+                    if pat.kind() == "identifier" {
+                        if let Some(t) = bare_type_name(node_text(ty, src)) {
+                            locals.insert(node_text(pat, src).to_string(), t);
+                        }
+                    }
+                }
+            }
+        }
+        Language::Python => {
+            if p.kind() == "typed_parameter" {
+                let mut c = p.walk();
+                let name = p.named_children(&mut c).find(|n| n.kind() == "identifier");
+                if let (Some(name), Some(ty)) = (name, p.child_by_field_name("type")) {
+                    if let Some(t) = bare_type_name(node_text(ty, src)) {
+                        locals.insert(node_text(name, src).to_string(), t);
+                    }
+                }
+            }
+        }
+        Language::TypeScript | Language::Tsx | Language::JavaScript => {
+            if matches!(p.kind(), "required_parameter" | "optional_parameter") {
+                if let (Some(pat), Some(ann)) = (
+                    p.child_by_field_name("pattern"),
+                    p.child_by_field_name("type"),
+                ) {
+                    if pat.kind() == "identifier" {
+                        // `type` is a `type_annotation` (`: T`); read its inner type.
+                        let inner = ann.named_child(0).unwrap_or(ann);
+                        if let Some(t) = bare_type_name(node_text(inner, src)) {
+                            locals.insert(node_text(pat, src).to_string(), t);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Recursively scan a callable body for `var = Ctor(...)` / `let v = Type::f(..)`
+/// / `const v = new T(...)` assignments, recording `var → Type`.
+fn walk_assignments(node: Node, src: &str, lang: Language, locals: &mut HashMap<String, String>) {
+    match lang {
+        Language::Rust => {
+            if node.kind() == "let_declaration" {
+                if let (Some(pat), Some(val)) = (
+                    node.child_by_field_name("pattern"),
+                    node.child_by_field_name("value"),
+                ) {
+                    if pat.kind() == "identifier" {
+                        if let Some(t) = rust_ctor_type(val, src) {
+                            locals.insert(node_text(pat, src).to_string(), t);
+                        }
+                    }
+                }
+            }
+        }
+        Language::Python => {
+            if node.kind() == "assignment" {
+                if let (Some(left), Some(right)) = (
+                    node.child_by_field_name("left"),
+                    node.child_by_field_name("right"),
+                ) {
+                    if left.kind() == "identifier" && right.kind() == "call" {
+                        if let Some(func) = right.child_by_field_name("function") {
+                            if func.kind() == "identifier" {
+                                locals.insert(
+                                    node_text(left, src).to_string(),
+                                    node_text(func, src).to_string(),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Language::TypeScript | Language::Tsx | Language::JavaScript => {
+            if node.kind() == "variable_declarator" {
+                if let (Some(name), Some(val)) = (
+                    node.child_by_field_name("name"),
+                    node.child_by_field_name("value"),
+                ) {
+                    if name.kind() == "identifier" && val.kind() == "new_expression" {
+                        if let Some(ctor) = val.child_by_field_name("constructor") {
+                            if ctor.kind() == "identifier" {
+                                locals.insert(
+                                    node_text(name, src).to_string(),
+                                    node_text(ctor, src).to_string(),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut c = node.walk();
+    for child in node.children(&mut c) {
+        walk_assignments(child, src, lang, locals);
+    }
+}
+
+/// The constructed type of a Rust initializer: `Type::assoc(...)` → `Type`,
+/// `Type { .. }` → `Type`.
+fn rust_ctor_type(val: Node, src: &str) -> Option<String> {
+    match val.kind() {
+        "call_expression" => {
+            let func = val.child_by_field_name("function")?;
+            if func.kind() == "scoped_identifier" {
+                let path = func.child_by_field_name("path")?;
+                return Some(last_path_segment(node_text(path, src)));
+            }
+            None
+        }
+        "struct_expression" => {
+            let name = val.child_by_field_name("name")?;
+            Some(last_path_segment(node_text(name, src)))
+        }
+        _ => None,
+    }
+}
+
+/// Emit a `TypeRef` site for every type identifier appearing in a definition's
+/// signature (parameters + return type) or field annotation, in document order.
+fn collect_type_refs(
+    node: Node,
+    src: &str,
+    lang: Language,
+    from_id: &str,
+    sites: &mut Vec<RawSite>,
+) {
+    // The subtree(s) that constitute the "signature" for this definition kind.
+    let mut regions: Vec<Node> = Vec::new();
+    match lang {
+        Language::Rust | Language::TypeScript | Language::Tsx | Language::JavaScript => {
+            if node.kind() == "public_field_definition" {
+                // TS class field: the `: T` annotation.
+                if let Some(t) = node.child_by_field_name("type") {
+                    regions.push(t);
+                }
+            } else {
+                if let Some(p) = node.child_by_field_name("parameters") {
+                    regions.push(p);
+                }
+                if let Some(r) = node.child_by_field_name("return_type") {
+                    regions.push(r);
+                }
+            }
+        }
+        Language::Python => {}
+    }
+    for region in regions {
+        collect_type_identifiers(region, src, from_id, sites);
+    }
+}
+
+/// Recursively collect `type_identifier` nodes under `region`, one `TypeRef`
+/// site each, at the identifier's own position.
+fn collect_type_identifiers(region: Node, src: &str, from_id: &str, sites: &mut Vec<RawSite>) {
+    let mut stack = vec![region];
+    let mut found: Vec<Node> = Vec::new();
+    while let Some(n) = stack.pop() {
+        if n.kind() == "type_identifier" {
+            found.push(n);
+        }
+        let mut c = n.walk();
+        for child in n.children(&mut c) {
+            stack.push(child);
+        }
+    }
+    // Document order (the stack walk is not ordered).
+    found.sort_by_key(|n| (n.start_byte(), n.end_byte()));
+    for id in found {
+        let start = id.start_position();
+        sites.push(RawSite {
+            from_id: from_id.to_string(),
+            line: start.row as u32 + 1,
+            col: start.column as u32,
+            payload: SitePayload::TypeRef {
+                name: node_text(id, src).to_string(),
+            },
+        });
     }
 }
 
@@ -274,6 +781,7 @@ pub fn error_extract(
         file_record,
         nodes: vec![file_node],
         edges: Vec::new(),
+        sites: Vec::new(),
     }
 }
 
@@ -754,11 +1262,23 @@ const RUST_QUERY: &str = include_str!("queries/rust.scm");
 const PYTHON_QUERY: &str = include_str!("queries/python.scm");
 const TYPESCRIPT_QUERY: &str = include_str!("queries/typescript.scm");
 
+const RUST_REFS_QUERY: &str = include_str!("queries/rust.refs.scm");
+const PYTHON_REFS_QUERY: &str = include_str!("queries/python.refs.scm");
+const TYPESCRIPT_REFS_QUERY: &str = include_str!("queries/typescript.refs.scm");
+
 fn query_source(lang: Language) -> &'static str {
     match lang {
         Language::Rust => RUST_QUERY,
         Language::Python => PYTHON_QUERY,
         Language::TypeScript | Language::Tsx | Language::JavaScript => TYPESCRIPT_QUERY,
+    }
+}
+
+fn refs_query_source(lang: Language) -> &'static str {
+    match lang {
+        Language::Rust => RUST_REFS_QUERY,
+        Language::Python => PYTHON_REFS_QUERY,
+        Language::TypeScript | Language::Tsx | Language::JavaScript => TYPESCRIPT_REFS_QUERY,
     }
 }
 
@@ -782,6 +1302,29 @@ fn compiled(lang: Language) -> &'static (tree_sitter::Language, Query) {
         Language::TypeScript => cache!(TS),
         Language::Tsx => cache!(TSX),
         Language::JavaScript => cache!(JS),
+    }
+}
+
+/// Compile (and cache) the grammar + **reference-site** query for a language.
+/// Same caching contract as [`compiled`]: the pair is `Sync` and shared across
+/// rayon workers.
+fn compiled_refs(lang: Language) -> &'static (tree_sitter::Language, Query) {
+    macro_rules! cache {
+        ($cell:ident) => {{
+            static $cell: OnceLock<(tree_sitter::Language, Query)> = OnceLock::new();
+            $cell.get_or_init(|| {
+                let l = ts_language(lang);
+                let q = Query::new(&l, refs_query_source(lang)).expect("refs query compiles");
+                (l, q)
+            })
+        }};
+    }
+    match lang {
+        Language::Rust => cache!(RUST_REFS),
+        Language::Python => cache!(PYTHON_REFS),
+        Language::TypeScript => cache!(TS_REFS),
+        Language::Tsx => cache!(TSX_REFS),
+        Language::JavaScript => cache!(JS_REFS),
     }
 }
 

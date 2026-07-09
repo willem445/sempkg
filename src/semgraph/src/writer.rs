@@ -163,6 +163,55 @@ impl GraphWriter {
         Ok(GraphWriter { conn })
     }
 
+    /// Wrap an already-open connection to a schema-v4 database for incremental
+    /// writes (Phase 2b `sync`). Unlike [`GraphWriter::create`] this does **not**
+    /// install the schema — the database already exists. The caller is
+    /// responsible for enabling `foreign_keys` if cascade deletes are needed.
+    pub(crate) fn from_connection(conn: Connection) -> GraphWriter {
+        GraphWriter { conn }
+    }
+
+    /// Read every node back as a [`NodeRecord`], preserving stored ids. Used by
+    /// `sync` to rebuild the resolver's symbol table over the current graph
+    /// after incremental node inserts/deletes.
+    pub(crate) fn all_nodes(&self) -> Result<Vec<NodeRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, kind, name, qualified_name, file_path, language, \
+                    start_line, end_line, start_column, end_column, \
+                    docstring, signature, visibility, \
+                    is_exported, is_async, is_static, is_abstract, \
+                    decorators, type_parameters, updated_at FROM nodes",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(NodeRecord {
+                    id: r.get(0)?,
+                    kind: r.get(1)?,
+                    name: r.get(2)?,
+                    qualified_name: r.get(3)?,
+                    file_path: r.get(4)?,
+                    language: r.get(5)?,
+                    start_line: r.get::<_, i64>(6)? as u32,
+                    end_line: r.get::<_, i64>(7)? as u32,
+                    start_column: r.get::<_, i64>(8)? as u32,
+                    end_column: r.get::<_, i64>(9)? as u32,
+                    docstring: r.get(10)?,
+                    signature: r.get(11)?,
+                    visibility: r.get(12)?,
+                    is_exported: r.get::<_, i64>(13)? != 0,
+                    is_async: r.get::<_, i64>(14)? != 0,
+                    is_static: r.get::<_, i64>(15)? != 0,
+                    is_abstract: r.get::<_, i64>(16)? != 0,
+                    decorators: r.get(17)?,
+                    type_parameters: r.get(18)?,
+                    updated_at: r.get(19)?,
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
     /// Insert all `nodes`, `edges`, and `files` in a single transaction. The
     /// FTS index is populated by the `nodes_ai` trigger as nodes are inserted.
     pub fn write(

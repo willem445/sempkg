@@ -13,19 +13,32 @@
 //! [`GraphDb::callers`]/[`GraphDb::callees`], [`GraphDb::impact`],
 //! [`GraphDb::context`], [`GraphDb::status`], [`GraphDb::file_paths`].
 //!
-//! ## Writer / indexer ([`index_roots`], [`GraphWriter`], [`extract`])
+//! ## Writer / indexer ([`index_roots`], [`sync`], [`GraphWriter`], [`extract`])
 //!
 //! [`index_roots`] is the entry point: it walks one or more source roots, parses
 //! every supported file **in parallel** (rayon) with tree-sitter, extracts
-//! definition nodes and structural `contains` edges (see [`parse`]), and writes
-//! one schema-v4 database through a single-writer [`GraphWriter`] in one
-//! transaction. The result is byte-compatible with a CodeGraph-built DB — the
-//! reader above opens it unchanged.
+//! definition nodes and structural `contains` edges (see [`parse`]), then
+//! **resolves** every call/reference/import/instantiation site against a global
+//! symbol table (see `resolve`, Phase 2b) into `calls`/`references`/`imports`/
+//! `instantiates` edges, and writes one schema-v4 database through a
+//! single-writer [`GraphWriter`] in one transaction. The result is
+//! byte-compatible with a CodeGraph-built DB — the reader above opens it
+//! unchanged.
 //!
-//! Only *definitions* and `contains` edges are produced in Phase 2a;
-//! call/reference/import **edge resolution is Phase 2b** and is deliberately not
-//! built here. The per-file symbol output ([`FileExtract`] with qualified names
-//! and stable [`node_id`]s) is exactly what a pass-2 resolver will consume.
+//! Resolution is two-pass and deterministic: pass 1 extracts definitions plus
+//! per-file reference *sites* ([`FileExtract`] with qualified names and stable
+//! [`node_id`]s); pass 2 resolves each site by name/qualified-name against the
+//! symbol table with scope-precedence heuristics (same-file > import-target >
+//! unique-global), preferring precision over recall for `calls` edges. See the
+//! `resolve` module docs.
+//!
+//! ## Incremental sync ([`sync`])
+//!
+//! [`sync`] brings an existing database up to date with the source tree,
+//! re-parsing only files whose `files.content_hash` changed (plus added/deleted
+//! files) and re-resolving the edges the delta invalidates — the reverse
+//! dependency blast radius. The result is canonically equal to a fresh
+//! [`index_roots`]. See the [`index`] module docs for the invalidation rule.
 //!
 //! ### Multi-root indexing and file-path representation (issue #79)
 //!
@@ -70,9 +83,12 @@ use thiserror::Error;
 pub mod index;
 pub mod model;
 pub mod parse;
+pub(crate) mod resolve;
 pub mod writer;
 
-pub use index::{index_roots, namespaces_for_roots, resolve_stored_path, IndexOptions, IndexStats};
+pub use index::{
+    index_roots, namespaces_for_roots, resolve_stored_path, sync, IndexOptions, IndexStats,
+};
 pub use model::{content_hash, node_id, EdgeRecord, FileRecord, Language, NodeRecord};
 pub use parse::{extract, FileExtract};
 pub use writer::GraphWriter;
