@@ -12,6 +12,13 @@ Scalar total_distance(const Point *pts, int n) {
     return total;
 }
 
+/// Heap construction (instantiation), a namespace-qualified call, a member call.
+Scalar make_and_measure() {
+    Point *p = new Point(3.0, 4.0);
+    Scalar h = geo::hypot_scalar(p->x, p->y);
+    return h + p->distanceTo(*p);
+}
+
 } // namespace geo
 
 int main() {

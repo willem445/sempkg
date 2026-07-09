@@ -389,7 +389,14 @@ fn call_payload(
 ) -> Option<SitePayload> {
     // Java call sites are `method_invocation` nodes (no `function` field).
     if lang == Language::Java {
-        return java_call_payload(call, src);
+        return java_call_payload(
+            call,
+            src,
+            from_id,
+            def_node_by_id,
+            encl_type_by_id,
+            locals_cache,
+        );
     }
     let func = call.child_by_field_name("function")?;
     match lang {
@@ -501,39 +508,79 @@ fn call_payload(
     }
 }
 
-/// Derive the class name a `new X(...)` expression constructs (TS/JS).
-fn new_payload(new_expr: Node, src: &str, _lang: Language) -> Option<SitePayload> {
-    let ctor = new_expr.child_by_field_name("constructor")?;
-    if ctor.kind() == "identifier" {
-        Some(SitePayload::New {
-            name: node_text(ctor, src).to_string(),
-        })
-    } else {
-        None
+/// Derive the class name a construction expression builds — a `new X(...)`
+/// (TS/JS `new_expression`, Java `object_creation_expression`, C++
+/// `new_expression`). Resolves to an `instantiates` edge to the class node.
+fn new_payload(new_expr: Node, src: &str, lang: Language) -> Option<SitePayload> {
+    match lang {
+        Language::TypeScript | Language::Tsx | Language::JavaScript => {
+            let ctor = new_expr.child_by_field_name("constructor")?;
+            (ctor.kind() == "identifier").then(|| SitePayload::New {
+                name: node_text(ctor, src).to_string(),
+            })
+        }
+        // Java `new Point(...)` and C++ `new geo::Point(...)` name the class in a
+        // `type:` field; a namespaced C++ type keeps only its last segment.
+        Language::Java | Language::Cpp => {
+            let ty = new_expr.child_by_field_name("type")?;
+            let name = last_scope_segment(node_text(ty, src));
+            (!name.is_empty()).then_some(SitePayload::New { name })
+        }
+        _ => None,
     }
 }
 
-/// Derive a Java `method_invocation` payload. A `Class.method(...)` call (object
-/// is a class-name identifier) resolves against the method's package-qualified
-/// name; an unqualified `method(...)` resolves by name; any other receiver (a
-/// variable, array, or chained call) is dropped — CodeGraph 0.9.7 does not
-/// name-resolve Java instance calls.
-fn java_call_payload(call: Node, src: &str) -> Option<SitePayload> {
+/// Derive a Java `method_invocation` payload:
+/// - unqualified `method(...)` → resolve by name (`CallOrCtor`);
+/// - `Class.method(...)` (receiver is a class-name identifier) → a qualified call
+///   against `package::Class::method`;
+/// - `recv.method(...)` where the receiver's type is locally inferable (a typed
+///   parameter/local, or `this`) → a qualified call against that type's method;
+/// - any other receiver (array element, chained call) → dropped.
+fn java_call_payload(
+    call: Node,
+    src: &str,
+    from_id: &str,
+    def_node_by_id: &HashMap<String, Node>,
+    encl_type_by_id: &HashMap<String, String>,
+    locals_cache: &mut HashMap<String, HashMap<String, String>>,
+) -> Option<SitePayload> {
     let name = field_text(call, "name", src)?;
-    match call.child_by_field_name("object") {
-        None => Some(SitePayload::CallOrCtor { name }),
-        Some(obj) => {
-            if obj.kind() == "identifier" && starts_uppercase(node_text(obj, src)) {
-                let cls = node_text(obj, src);
-                let qualifier = match java_package(call, src) {
-                    Some(pkg) => format!("{pkg}::{cls}"),
-                    None => cls.to_string(),
-                };
-                Some(SitePayload::QualifiedCall { qualifier, name })
-            } else {
-                None
-            }
-        }
+    let Some(obj) = call.child_by_field_name("object") else {
+        return Some(SitePayload::CallOrCtor { name });
+    };
+    let pkg = java_package(call, src);
+    // A typed local/parameter receiver (or `this`) resolves via its type.
+    if let Some(ty) = receiver_type(
+        obj,
+        src,
+        from_id,
+        def_node_by_id,
+        encl_type_by_id,
+        locals_cache,
+        Language::Java,
+    ) {
+        return Some(SitePayload::QualifiedCall {
+            qualifier: qualify_java_type(&ty, pkg.as_deref()),
+            name,
+        });
+    }
+    // A bare class-name identifier is a static `Class.method(...)` call.
+    if obj.kind() == "identifier" && starts_uppercase(node_text(obj, src)) {
+        return Some(SitePayload::QualifiedCall {
+            qualifier: qualify_java_type(node_text(obj, src), pkg.as_deref()),
+            name,
+        });
+    }
+    None
+}
+
+/// Package-qualify a Java simple type name (`Point` → `fixture::Point`); an
+/// already-qualified type (`fixture::Point`, e.g. from `this`) is left as-is.
+fn qualify_java_type(ty: &str, pkg: Option<&str>) -> String {
+    match pkg {
+        Some(p) if !ty.contains("::") => format!("{p}::{ty}"),
+        _ => ty.to_string(),
     }
 }
 
@@ -668,9 +715,21 @@ fn infer_param(
                 }
             }
         }
-        // Tier-2 languages resolve method calls by name (C++/Go) or explicit
-        // class qualifier (Java), so per-parameter local type inference is unused.
-        Language::C | Language::Cpp | Language::Go | Language::Java => {}
+        Language::Java => {
+            // `Point a` → a : Point.
+            if p.kind() == "formal_parameter" {
+                if let (Some(ty), Some(nm)) =
+                    (p.child_by_field_name("type"), p.child_by_field_name("name"))
+                {
+                    if let Some(t) = bare_type_name(node_text(ty, src)) {
+                        locals.insert(node_text(nm, src).to_string(), t);
+                    }
+                }
+            }
+        }
+        // C++/Go resolve method calls by name, so per-parameter local type
+        // inference is unused for them.
+        Language::C | Language::Cpp | Language::Go => {}
     }
 }
 
@@ -730,8 +789,26 @@ fn walk_assignments(node: Node, src: &str, lang: Language, locals: &mut HashMap<
                 }
             }
         }
-        // Tier-2 languages do not use body-assignment local inference.
-        Language::C | Language::Cpp | Language::Go | Language::Java => {}
+        Language::Java => {
+            // `Point origin = …;` → origin : Point (the declared type, not the
+            // initializer — Java locals are explicitly typed).
+            if node.kind() == "local_variable_declaration" {
+                if let Some(ty) = node.child_by_field_name("type") {
+                    if let Some(t) = bare_type_name(node_text(ty, src)) {
+                        let mut c = node.walk();
+                        for d in node.named_children(&mut c) {
+                            if d.kind() == "variable_declarator" {
+                                if let Some(nm) = d.child_by_field_name("name") {
+                                    locals.insert(node_text(nm, src).to_string(), t.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // C/C++/Go do not use body-assignment local inference.
+        Language::C | Language::Cpp | Language::Go => {}
     }
     let mut c = node.walk();
     for child in node.children(&mut c) {

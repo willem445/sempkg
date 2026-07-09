@@ -8,7 +8,11 @@
 //!   metric; we hold 100% on the fixtures).
 //! - **`calls`** `(source_qn, target_qn, line, col)` — EXACT (the ≥90% metric;
 //!   we hold 100%).
-//! - **`contains` / `imports` / `instantiates`** — EXACT.
+//! - **`contains` / `imports` / `instantiates`** — EXACT. Construction sites are
+//!   genuinely exercised: Java `new Point(...)` (→ 2 `instantiates` to the class)
+//!   and C++ `new Point(...)` (→ 1 `instantiates` to the class). C has no
+//!   construction syntax and 0.9.7 does not model Go composite literals as
+//!   constructions, so those two emit none (asserted, not merely absent).
 //! - **`references`** — EXACT for C/C++/Go; for Java, EXACT modulo one documented
 //!   CodeGraph type-name→constructor misresolution (we resolve to the type).
 //! - **`extends`** — we never emit this kind; C++'s golden has one *spurious*
@@ -160,6 +164,11 @@ fn c_parity() {
         attr(&db, "Scalar", "geometry.h", "docstring").as_deref(),
         Some("A type alias over a primitive (typedef).")
     );
+    // Three cross-file/intra-file `calls` (par with the other languages); C has
+    // no construction syntax, so 0.9.7 (and we) emit no `instantiates`.
+    assert_eq!(edge_keys(&db, "calls").len(), 3);
+    assert!(edge_keys(&golden("c"), "instantiates").is_empty());
+    assert!(edge_keys(&db, "instantiates").is_empty());
 }
 
 // ---- C++ ------------------------------------------------------------------
@@ -205,6 +214,27 @@ fn cpp_parity() {
         attr(&db, "Point::distanceTo", "geometry.cpp", "signature"),
         None
     );
+
+    // `new Point(...)` → exactly one `instantiates` edge to the class (matched
+    // exactly by `assert_core_exact`); the constructor's out-of-line definition
+    // is in another file, so 0.9.7 resolves the construction to the class node.
+    let insts = edge_keys(&db, "instantiates");
+    assert_eq!(insts.len(), 1);
+    let (src, tgt, ..) = insts.iter().next().unwrap();
+    assert_eq!((src.as_str(), tgt.as_str()), ("make_and_measure", "Point"));
+
+    // Three `calls`: two name-based member calls (`pts[i-1].distanceTo`,
+    // `p->distanceTo`) and one free call (`hypot_scalar`). The namespace-qualified
+    // `geo::hypot_scalar(...)` in `make_and_measure` is DROPPED — 0.9.7 strips
+    // namespaces so `geo::hypot_scalar` matches no symbol; we match by dropping it
+    // (exercises the qualified-call parse path). Net: 3, same as the golden.
+    assert_eq!(edge_keys(&db, "calls").len(), 3);
+    assert!(
+        !edge_keys(&db, "calls")
+            .iter()
+            .any(|(s, t, ..)| s == "make_and_measure" && t == "hypot_scalar"),
+        "namespace-qualified geo::hypot_scalar call must be dropped, matching 0.9.7"
+    );
 }
 
 // ---- Go -------------------------------------------------------------------
@@ -219,6 +249,10 @@ fn go_parity() {
         &edge_keys(&db, "references"),
         &edge_keys(&golden("go"), "references"),
     );
+    // 0.9.7 does not model Go composite literals (`Point{…}` / `&Point{…}`) as
+    // constructions, so neither golden nor we emit any `instantiates` for Go.
+    assert!(edge_keys(&golden("go"), "instantiates").is_empty());
+    assert!(edge_keys(&db, "instantiates").is_empty());
 
     // Signatures: params-through-result, receiver excluded; assignment tails.
     assert_eq!(
@@ -339,4 +373,30 @@ fn java_parity() {
         flag(&db, "fixture::Geometry::UNIT", "Geometry.java", "is_static"),
         1
     );
+
+    // Call diversity (all three resolution paths, matched exactly by
+    // `assert_core_exact`): a qualified static call, an unqualified same-class
+    // call, and a typed-receiver instance call.
+    let calls = edge_keys(&db, "calls");
+    assert_eq!(calls.len(), 3);
+    let has = |s: &str, t: &str| calls.iter().any(|(cs, ct, ..)| cs == s && ct == t);
+    assert!(
+        has("fixture::Point::distanceTo", "fixture::Geometry::hypot"),
+        "qualified static call Geometry.hypot(...)"
+    );
+    assert!(
+        has("fixture::Report::originGap", "fixture::Report::gap"),
+        "unqualified same-class call gap(...)"
+    );
+    assert!(
+        has("fixture::Report::gap", "fixture::Point::distanceTo"),
+        "typed-receiver instance call a.distanceTo(...) (a : Point)"
+    );
+
+    // `new Point(...)` ×2 → two `instantiates` edges to the class node.
+    let insts = edge_keys(&db, "instantiates");
+    assert_eq!(insts.len(), 2);
+    assert!(insts
+        .iter()
+        .all(|(s, t, ..)| s == "fixture::Report::originGap" && t == "fixture::Point"));
 }
