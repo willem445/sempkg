@@ -306,7 +306,7 @@ mod tests {
         let (_d, p) = fixture_project();
         let s = status_text(&p).unwrap();
         assert!(s.contains("7 files"), "{s}");
-        assert!(s.contains("55 nodes"), "{s}");
+        assert!(s.contains("67 nodes"), "{s}");
         assert!(s.contains("schema v4"), "{s}");
     }
 
