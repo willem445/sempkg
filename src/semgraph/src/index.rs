@@ -31,15 +31,17 @@
 //! filesystem ancestor of another) are not supported and are rejected by
 //! [`index_roots`].
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rayon::prelude::*;
+use rusqlite::Connection;
 use walkdir::{DirEntry, WalkDir};
 
 use crate::model::Language;
 use crate::parse::{error_extract, extract, FileExtract};
+use crate::resolve::SymbolTable;
 use crate::writer::GraphWriter;
 use crate::{Error, Result};
 
@@ -94,8 +96,52 @@ pub fn index_roots(
     let namespaces = namespaces_for_roots(&roots);
     let now = now_millis();
 
-    // Enumerate every supported file across all roots, computing its stored path.
-    let mut work: Vec<(PathBuf, String, Language, i64)> = Vec::new();
+    let work = enumerate_files(&roots, &namespaces, options);
+    let extracts = parse_work(&work, now);
+
+    let mut nodes = Vec::new();
+    let mut edges = Vec::new();
+    let mut files = Vec::new();
+    let mut sites = Vec::new();
+    for e in extracts {
+        nodes.extend(e.nodes);
+        edges.extend(e.edges);
+        files.push(e.file_record);
+        sites.extend(e.sites);
+    }
+
+    // Pass 2 (Phase 2b): resolve every reference site against the global symbol
+    // table and append the resulting calls/references/imports/instantiates
+    // edges to the structural `contains` edges from pass 1.
+    let resolved = SymbolTable::build(&nodes).resolve_all(&sites);
+    edges.extend(resolved);
+
+    let mut writer = GraphWriter::create(db_path)?;
+    writer.write(&nodes, &edges, &files)?;
+    writer.finalize()?;
+
+    // Report the *actual* persisted counts. These can be lower than the raw
+    // `nodes.len()`/`edges.len()` because the writer's `INSERT OR IGNORE` dedups
+    // nodes that share an id (`kind`+`qualified_name`+`file_path`) — distinct
+    // definitions that collapse to one node under CodeGraph's id scheme. Reading
+    // them back keeps `index_roots` and [`sync`] reporting the same metric, so a
+    // sync is provably equal to a from-scratch index (see the sync tests).
+    let conn = Connection::open(db_path).map_err(|source| Error::Open {
+        path: db_path.display().to_string(),
+        source,
+    })?;
+    current_stats(&conn)
+}
+
+/// One unit of parse work: (absolute path on disk, stored db path, language,
+/// mtime in epoch millis).
+type Work = (PathBuf, String, Language, i64);
+
+/// Enumerate every supported file across all `roots`, computing each file's
+/// stored (namespaced, forward-slash) path. Shared by [`index_roots`] and
+/// [`sync`] so both see identical stored paths.
+fn enumerate_files(roots: &[PathBuf], namespaces: &[String], options: &IndexOptions) -> Vec<Work> {
+    let mut work: Vec<Work> = Vec::new();
     for (i, root) in roots.iter().enumerate() {
         let ns = &namespaces[i];
         for entry in WalkDir::new(root)
@@ -127,11 +173,14 @@ pub fn index_roots(
             work.push((path.to_path_buf(), stored, lang, mtime));
         }
     }
+    work
+}
 
-    // Parse in parallel. A file that can't be read as UTF-8 (or at all) is not
-    // dropped: it gets a `files` row with `errors` populated (see #78 review F6).
-    let extracts: Vec<FileExtract> = work
-        .par_iter()
+/// Parse a work list in parallel into [`FileExtract`]s. A file that can't be
+/// read as UTF-8 (or at all) is not dropped: it gets a `files` row with `errors`
+/// populated (see #78 review F6).
+fn parse_work(work: &[Work], now: i64) -> Vec<FileExtract> {
+    work.par_iter()
         .map(|(path, stored, lang, mtime)| match std::fs::read(path) {
             Ok(bytes) => match std::str::from_utf8(&bytes) {
                 Ok(src) => extract(src, stored, *lang, *mtime, now),
@@ -153,25 +202,287 @@ pub fn index_roots(
                 &format!("cannot read file: {e}"),
             ),
         })
-        .collect();
+        .collect()
+}
 
-    let mut nodes = Vec::new();
-    let mut edges = Vec::new();
-    let mut files = Vec::new();
-    for e in extracts {
-        nodes.extend(e.nodes);
-        edges.extend(e.edges);
-        files.push(e.file_record);
+/// Incrementally bring the database at `db_path` up to date with `roots`,
+/// re-parsing only files whose content changed, are new, or were deleted.
+///
+/// The `files.content_hash` (SHA-256, written by pass 1) is the change anchor:
+/// an unchanged file hashes the same and is skipped. The resulting database is
+/// **canonically equal** to a fresh [`index_roots`] of the same tree (identical
+/// nodes/edges/files, modulo `edges.id` autoincrement and `*_at` timestamps).
+///
+/// ## Invalidation set (the correctness core)
+///
+/// A file's edges are recomputed when the file changed/was added, **and** when
+/// the delta invalidates edges that point *into* it:
+///
+/// 1. **Nodes** of changed and deleted files are deleted; the `edges` FK
+///    `ON DELETE CASCADE` removes every edge incident to them — including
+///    resolved edges *from unchanged files into* a changed/deleted file's
+///    symbols (the "edges into its symbols" case).
+/// 2. Those cross-file edges must be re-created, which needs their **source**
+///    files' reference sites. So the re-resolution set is
+///    `changed ∪ added ∪ affected`, where `affected` = unchanged files that had
+///    a resolved edge whose target lived in a changed/deleted file. Only these
+///    unchanged files are re-parsed (for their sites); their nodes/`contains`
+///    edges are untouched.
+/// 3. A changed file may rename/move a symbol, changing its node id (the id
+///    hashes `qualified_name`+`file_path`); resolving the affected sources
+///    against the rebuilt global table re-points them to the new id, exactly as
+///    a from-scratch index would.
+///
+/// **Documented boundary:** a purely *additive* change that makes a previously
+/// unique global name ambiguous for an unchanged file with no prior edge into
+/// the delta is not re-resolved incrementally (that unchanged file is not in
+/// `affected`). This is the one case where `sync` can lag a from-scratch index;
+/// callers needing exactness after such a change should re-run [`index_roots`].
+/// The common dependency-directed edits (modify/add/delete/rename a file others
+/// call into) are always exact.
+pub fn sync(roots: &[PathBuf], db_path: &Path, options: &IndexOptions) -> Result<IndexStats> {
+    if roots.is_empty() {
+        return Err(Error::Invalid {
+            path: db_path.display().to_string(),
+            detail: "sync requires at least one source root".to_string(),
+        });
+    }
+    // No database yet → a sync is just a full index.
+    if !db_path.exists() {
+        return index_roots(roots, db_path, options);
     }
 
-    let mut writer = GraphWriter::create(db_path)?;
-    writer.write(&nodes, &edges, &files)?;
-    writer.finalize()?;
+    let roots = dedupe_roots(roots);
+    reject_nested_roots(&roots)?;
+    let namespaces = namespaces_for_roots(&roots);
+    let now = now_millis();
 
+    let work = enumerate_files(&roots, &namespaces, options);
+    let disk: HashMap<String, &Work> = work.iter().map(|w| (w.1.clone(), w)).collect();
+
+    let mut conn = Connection::open(db_path).map_err(|source| Error::Open {
+        path: db_path.display().to_string(),
+        source,
+    })?;
+    conn.pragma_update(None, "foreign_keys", true)?;
+
+    // Existing files: stored path → content_hash.
+    let db_hashes = read_file_hashes(&conn)?;
+
+    // Classify each stored path.
+    let mut changed: Vec<&Work> = Vec::new();
+    let mut added: Vec<&Work> = Vec::new();
+    for (stored, w) in &disk {
+        match db_hashes.get(stored) {
+            None => added.push(w),
+            Some(old_hash) => {
+                let bytes = std::fs::read(&w.0).unwrap_or_default();
+                if &crate::model::content_hash(&bytes) != old_hash {
+                    changed.push(w);
+                }
+            }
+        }
+    }
+    let deleted: Vec<String> = db_hashes
+        .keys()
+        .filter(|p| !disk.contains_key(*p))
+        .cloned()
+        .collect();
+
+    if changed.is_empty() && added.is_empty() && deleted.is_empty() {
+        // Nothing to do; report current totals.
+        return current_stats(&conn);
+    }
+
+    // Files whose *nodes* leave the DB (changed content or deleted from disk).
+    let mut gone: HashSet<String> = deleted.iter().cloned().collect();
+    for w in &changed {
+        gone.insert(w.1.clone());
+    }
+
+    // Re-parse changed ∪ added (full extraction) up front — we need the *new*
+    // symbol names to compute the invalidation set precisely.
+    let reparse: Vec<Work> = changed
+        .iter()
+        .chain(added.iter())
+        .map(|w| (*w).clone())
+        .collect();
+    let fresh = parse_work(&reparse, now);
+
+    // `delta_names` = every symbol name whose *global multiplicity* may have
+    // changed: names disappearing from `gone` files (read from the DB before we
+    // delete them) plus names introduced by the fresh parse. A name's move from
+    // unique→ambiguous (or back) shifts the confidence of edges that resolve to
+    // it, so any unchanged file resolving such a name must be recomputed.
+    let mut delta_names: HashSet<String> = names_in_files(&conn, &gone)?;
+    for e in &fresh {
+        for n in &e.nodes {
+            if n.kind != "file" && n.kind != "import" {
+                delta_names.insert(n.name.clone());
+            }
+        }
+    }
+
+    // `affected` = unchanged files (not `gone`) that hold a resolved edge whose
+    // target lives in a `gone` file (its edge was cascade-deleted) OR whose
+    // target *name* is in `delta_names` (its resolution/confidence may shift).
+    // We re-parse these for their sites only; their nodes/`contains` stay put.
+    let affected = affected_unchanged_files(&conn, &gone, &delta_names)?;
+
+    // Delete nodes of gone files (cascades their incident edges), and the gone
+    // files' `files` rows.
+    {
+        let tx = conn.transaction()?;
+        for path in gone.iter() {
+            tx.execute("DELETE FROM nodes WHERE file_path = ?1", [path])?;
+            tx.execute("DELETE FROM files WHERE path = ?1", [path])?;
+        }
+        // Delete the surviving resolved out-edges of `affected` files so we can
+        // recompute them cleanly (their edges into gone files were already
+        // cascade-deleted; this removes the rest, e.g. edges into unchanged
+        // files, avoiding duplicates on re-insert).
+        for path in &affected {
+            tx.execute(
+                "DELETE FROM edges WHERE kind != 'contains' AND source IN \
+                 (SELECT id FROM nodes WHERE file_path = ?1)",
+                [path],
+            )?;
+        }
+        tx.commit()?;
+    }
+
+    let affected_work: Vec<Work> = affected
+        .iter()
+        .filter_map(|p| disk.get(p).map(|w| (*w).clone()))
+        .collect();
+    let affected_extracts = parse_work(&affected_work, now);
+
+    // Insert fresh nodes/contains/files.
+    let mut new_nodes = Vec::new();
+    let mut new_contains = Vec::new();
+    let mut new_files = Vec::new();
+    let mut sites = Vec::new();
+    for e in fresh {
+        new_nodes.extend(e.nodes);
+        new_contains.extend(e.edges);
+        new_files.push(e.file_record);
+        sites.extend(e.sites);
+    }
+    // Affected files contribute only their sites (nodes/contains unchanged).
+    for e in affected_extracts {
+        sites.extend(e.sites);
+    }
+
+    {
+        let mut writer = crate::writer::GraphWriter::from_connection(conn);
+        writer.write(&new_nodes, &new_contains, &new_files)?;
+        // Rebuild the symbol table over the *current* full node set and resolve
+        // the sites of all re-parsed (reparse ∪ affected) files.
+        let all_nodes = writer.all_nodes()?;
+        let resolved = SymbolTable::build(&all_nodes).resolve_all(&sites);
+        writer.write(&[], &resolved, &[])?;
+        writer.finalize()?;
+    }
+
+    // Reopen to report the final totals.
+    let conn = Connection::open(db_path).map_err(|source| Error::Open {
+        path: db_path.display().to_string(),
+        source,
+    })?;
+    current_stats(&conn)
+}
+
+/// Read `files.path → content_hash` from an existing database.
+fn read_file_hashes(conn: &Connection) -> Result<HashMap<String, String>> {
+    let mut stmt = conn.prepare("SELECT path, content_hash FROM files")?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+        .filter_map(|r| r.ok());
+    Ok(rows.collect())
+}
+
+/// The distinct symbol names (excluding `file`/`import` nodes) defined in the
+/// given file set — read before those files' nodes are deleted, so their
+/// disappearing names can enter `delta_names`.
+fn names_in_files(conn: &Connection, files: &HashSet<String>) -> Result<HashSet<String>> {
+    if files.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let mut stmt = conn
+        .prepare("SELECT name FROM nodes WHERE kind NOT IN ('file','import') AND file_path = ?1")?;
+    let mut names = HashSet::new();
+    for path in files {
+        let rows = stmt
+            .query_map([path], |r| r.get::<_, String>(0))?
+            .filter_map(|r| r.ok());
+        names.extend(rows);
+    }
+    Ok(names)
+}
+
+/// Unchanged files that must be re-resolved because the delta invalidated one
+/// of their edges: an unchanged file (source not in `gone`) holding a resolved
+/// (non-`contains`) edge whose **target** either lives in a `gone` file (the
+/// edge was cascade-deleted) or whose **target name** is in `delta_names` (the
+/// name's global multiplicity may have shifted, changing the edge's resolution
+/// or confidence). This is the reverse-dependency blast radius of the change.
+fn affected_unchanged_files(
+    conn: &Connection,
+    gone: &HashSet<String>,
+    delta_names: &HashSet<String>,
+) -> Result<Vec<String>> {
+    if gone.is_empty() && delta_names.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT s.file_path, t.file_path, t.name \
+         FROM edges e \
+         JOIN nodes s ON s.id = e.source \
+         JOIN nodes t ON t.id = e.target \
+         WHERE e.kind != 'contains'",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?
+        .filter_map(|r| r.ok());
+
+    let mut out: HashSet<String> = HashSet::new();
+    for (src_file, tgt_file, tgt_name) in rows {
+        if gone.contains(&src_file) {
+            continue;
+        }
+        if gone.contains(&tgt_file) || delta_names.contains(&tgt_name) {
+            out.insert(src_file);
+        }
+    }
+    let mut v: Vec<String> = out.into_iter().collect();
+    v.sort();
+    Ok(v)
+}
+
+/// Summary counts for the database behind `conn`.
+fn current_stats(conn: &Connection) -> Result<IndexStats> {
+    let (files, nodes, edges) = conn.query_row(
+        "SELECT (SELECT COUNT(*) FROM files), (SELECT COUNT(*) FROM nodes), \
+                (SELECT COUNT(*) FROM edges)",
+        [],
+        |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        },
+    )?;
     Ok(IndexStats {
-        file_count: files.len(),
-        node_count: nodes.len(),
-        edge_count: edges.len(),
+        file_count: files as usize,
+        node_count: nodes as usize,
+        edge_count: edges as usize,
     })
 }
 
