@@ -259,10 +259,7 @@ fn every_language_fixture_clears_thresholds() {
         // `calls` may be N/A (None) when the golden has no calls edges; that is a
         // vacuous pass, not a failure.
         if let Some(calls) = report.calls_match_pct() {
-            assert!(
-                calls >= 90.0,
-                "{label}: calls parity {calls:.2}% < 90%"
-            );
+            assert!(calls >= 90.0, "{label}: calls parity {calls:.2}% < 90%");
         }
         checked += 1;
     }
