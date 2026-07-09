@@ -3,8 +3,14 @@
 The parity harness quantifies how closely the native **semgraph** indexer
 (issue #78, Phase 2) reproduces the graph a pinned **CodeGraph 0.9.7** build
 produces for the same source tree. It exists so language packs can be accepted
-against **objective thresholds** instead of eyeballing diffs, and so CI can gate
-the eventual cutover from the CodeGraph CLI to semgraph.
+against **objective thresholds** instead of eyeballing diffs, and it justified
+the cutover from the CodeGraph CLI to semgraph
+([ADR-006](arch/adr/adr-006-codegraph-cutover.md)).
+
+Note: since the cutover, CodeGraph is **not** a runtime or CI dependency of the
+product — it survives only as this developer-only parity baseline (the live mode
+shells out to a locally-installed `codegraph@0.9.7`; the offline gate needs
+nothing).
 
 - **Tool:** `cargo run -p semgraph --bin parity -- <tree> [flags]`
 - **Core library:** `semgraph::parity` (`src/semgraph/src/parity.rs`) — the pure,
