@@ -138,3 +138,40 @@ file's `errors` column. All recursion (including the Ruby `module` and Scala
 - Inheritance (`implements`/`extends`) and type-reference (`references`) edges for
   tier-3, and CodeGraph's synthesized interface-impl calls, are deliberately out
   of scope and tracked for a later phase.
+
+## Addendum — Edge-family alignment (issue #78)
+
+The "later phase" above landed: all tier-2 and tier-3 packs now emit the
+`extends`/`implements` (inheritance) and `references` (type-reference) edge
+families, matching tier-1's edge families across all 14 languages. Verified
+empirically against codegraph@0.9.7 and graded bidirectionally
+(missing + spurious) in `tier2_parity.rs` / `tier3_parity.rs`.
+
+- **Shared machinery.** Tier-3 gains two `LangSpec` hooks — `inheritance`
+  (class-like nodes) and `type_refs` (callables) — feeding `SitePayload::Inherit`
+  and `TypeRef`, plus a new `SitePayload::InheritAuto` whose edge kind is decided
+  by the *resolved target's* kind (a target `interface`/`trait` → `implements`,
+  else `extends`). Tier-2 reuses the tier-1 `parse::collect_inheritance_sites`
+  path. Resolution and the writer are unchanged.
+- **Per-language conventions** (all verified against 0.9.7): C — none; C++ —
+  `extends` for every `base_class_clause` type (no `implements`); Go — struct /
+  interface embedding → `extends`; Java — `extends`/`implements`/interface-extends;
+  Ruby — superclass → `extends` (mixins none); PHP — `extends` + `implements`
+  (incl. `use Trait`, anchored at the `use` statement); Kotlin — constructor-
+  invocation delegate → `extends`, bare delegate → `implements`; Swift —
+  target-kind decides (`InheritAuto`), `references` = **return type only**;
+  Scala — only the primary parent after `extends` (`with` mixins dropped), never
+  `implements`; C# — target-kind decides, `references` = return + parameter types.
+- **`references`** are emitted by Go, Java, Swift, and C# (the languages 0.9.7
+  emits them for); the rest emit none.
+- **Whitelisted deviations** (precision-first, never imitating a fabrication):
+  C++'s spurious `class → <method-return-type>` `extends` (0.9.7 misreads an
+  in-class method return type as a base) is dropped and whitelisted; the Java
+  type-name→constructor `references` misresolution is resolved to the class
+  (known-better). CodeGraph's synthesized interface→impl `calls` (NULL column)
+  remain excluded from graded `calls` everywhere.
+- **Offline gate generalized.** `parity_offline.rs` now gates every committed
+  language fixture (not just tier-1) on the ≥95%/≥90% thresholds.
+
+(The `tier3::extract_enum` depth-guard carry-over noted in the original brief was
+resolved independently by the tier-1 hardening work and is already in the base.)

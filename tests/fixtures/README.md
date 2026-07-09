@@ -136,8 +136,13 @@ done
 ### Per-language node/edge kinds and CodeGraph 0.9.7 quirks
 
 The native indexer reproduces each golden's **nodes** and **`calls`/`contains`/
-`imports`/`instantiates`** edges exactly. The intentional deviations (the P2c
-whitelist, pinned in `tier2_parity.rs`) are:
+`imports`/`instantiates`** edges exactly, and — since the issue #78 edge-family
+alignment — the inheritance/type-reference families **`extends`/`implements`/
+`references`** as well (graded bidirectionally in `tier2_parity.rs`): C++ single
++ multiple inheritance (`extends`; C++ has no `implements`), Go struct/interface
+embedding (`extends`), Java `extends`/`implements`/interface-extends, and Go/Java
+type `references`. C has none. The intentional deviations (the P2c whitelist,
+pinned in `tier2_parity.rs`) are:
 
 - **C** — no `variable` nodes for file-scope globals and no struct-field member
   nodes (CodeGraph emits neither); function/typedef signatures are NULL; local
@@ -148,11 +153,13 @@ whitelist, pinned in `tier2_parity.rs`) are:
   declarations and fields are not nodes); all signatures NULL. Member calls
   (`p->distanceTo(...)`) resolve name-based; a namespace-qualified free call
   (`geo::hypot_scalar(...)`) is dropped (0.9.7 strips namespaces so it matches no
-  symbol); `new Point(...)` → an `instantiates` edge to the class. *Known-better:*
-  we emit clean `///` docstrings where 0.9.7 keeps a stray leading `/` and bleeds
-  a trailing `// namespace geo` comment into `main`, and we omit the one
-  **spurious `extends` edge** 0.9.7 emits (it misreads an in-class method's
-  return type as a base class).
+  symbol); `new Point(...)` → an `instantiates` edge to the class. Genuine base
+  classes (`shapes.hpp`'s `Disc : Solid`, `Prism : Solid, Drawable`) → `extends`
+  edges, reproduced exactly. *Known-better:* we emit clean `///` docstrings where
+  0.9.7 keeps a stray leading `/` and bleeds a trailing `// namespace geo` comment
+  into `main`, and we omit the one **spurious `extends` edge** 0.9.7 emits in
+  `geometry.hpp` (it misreads the in-class method's `Scalar` return type as a base
+  class — `Point extends Scalar`), whitelisted in `tier2_parity.rs`.
 - **Go** — `type X = Y` aliases emit no node while `type X int` definitions do
   (kind `type_alias`); interfaces are `interface`, top-level consts are
   `constant`; methods are receiver-qualified (`Point::DistanceTo`); `is_exported`

@@ -13,10 +13,13 @@ Phase 2c part 3): Ruby, PHP, Kotlin, Swift, Scala, C#. See
 
 Parity is asserted by `src/semgraph/tests/tier3_parity.rs`: a native
 `index_roots` of each `<lang>/` must reproduce its golden's node keyset
-(`kind, qualified_name, file_path`) and its `calls` / `instantiates` / `imports`
-edge multisets (each graded bidirectionally on `source_qn, target_qn, line, col`
-— no missing, no spurious). All six currently reproduce their golden **exactly**
-(100% nodes and 100% of each graded edge family), above the ≥95%/≥90% gate.
+(`kind, qualified_name, file_path`) and its `calls` / `instantiates` / `imports` /
+`extends` / `implements` / `references` edge multisets (each graded
+bidirectionally on `source_qn, target_qn, line, col` — no missing, no spurious).
+The inheritance/type-reference families were added in the issue #78 edge-family
+alignment; each fixture now exercises every kind CodeGraph 0.9.7 supports for its
+language. All six currently reproduce their golden **exactly** (100% nodes and
+100% of each graded edge family), above the ≥95%/≥90% gate.
 
 ## Whitelist (known 0.9.7 emissions not reproduced)
 
@@ -30,9 +33,11 @@ edge multisets (each graded bidirectionally on `source_qn, target_qn, line, col`
 - **Scala `instantiates`**: 0.9.7 has no Scala instantiation handling, so
   `new Circle` yields no edge — graded as an exact empty multiset (the fixture's
   `new Circle` proves we emit none either).
-- **Un-graded edge kinds** (`implements`/`extends` inheritance, `references` type
-  annotations) are not emitted by the tier-3 packs — precision-first, consistent
-  with tier-1's `references` handling, and outside the issue's metrics. See ADR-005.
+The inheritance/type-reference families are reproduced **exactly** (no whitelist
+needed): `extends` (all six), `implements` (PHP/Kotlin/Swift/C#), and `references`
+(Swift return types; C# return + parameter types). Ruby `include` mixins, Scala
+`with` mixins, and everything else CodeGraph does not emit are correctly absent.
+See ADR-005's edge-alignment addendum.
 
 ## How the goldens were generated
 
