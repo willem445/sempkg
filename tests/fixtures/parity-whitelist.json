@@ -1,15 +1,22 @@
 {
   "_comment": [
-    "Parity-harness whitelist (issue #78 Phase 2c). Entries here are KNOWN-BETTER",
-    "deviations of semgraph from CodeGraph 0.9.7, recorded in ADR-003/ADR-004.",
-    "A whitelisted diff is reported separately and does NOT count as a parity",
-    "failure. Every entry carries a justification. Do not add an entry to paper",
-    "over a genuine regression — only for a documented, intentional improvement.",
+    "Parity-harness whitelist (issue #78 Phase 2c + tier-1 hardening). Entries here",
+    "are KNOWN-BETTER deviations of semgraph from CodeGraph 0.9.7 (ADR-003/ADR-004)",
+    "or DEMONSTRABLE CodeGraph fabrications. A whitelisted diff is reported separately",
+    "and does NOT count as a parity failure. Every entry carries a justification.",
+    "Do NOT whitelist a genuine recall gap or an extraction miss — only a documented",
+    "improvement or a fabrication that has been VERIFIED (with a count). semgraph emits",
+    "ZERO fabricated calls: it resolves a method call only from an inferred receiver",
+    "type; an un-inferrable receiver is dropped (precision over recall). The calls",
+    "entries below forgive CodeGraph edges that semgraph declines because CodeGraph",
+    "reached them by bare-name resolution across a language boundary or from a receiver",
+    "whose type is EXTERNAL to the graph (std / anyhow / reqwest), never something",
+    "semgraph could precisely emit.",
     "Fields: node_attrs[].attr in {is_async,docstring,signature,line_range} with a",
-    "REQUIRED direction so only the documented-better side is forgiven; edges[].side",
-    "in {missing,extra}; nodes[].side in {missing,extra}. qualified_name/file/source/",
-    "target accept a simple glob where '*' matches any run. node_attrs[].direction in",
-    "{semgraph_true,semgraph_false,semgraph_nonempty,codegraph_empty}."
+    "REQUIRED direction; edges[].side in {missing,extra}; nodes[].side in",
+    "{missing,extra}. qualified_name/file/source/target accept a glob where '*' matches",
+    "any run. edges[] may set only_duplicates (missing multiplicity only) or",
+    "cross_language (source/target in different languages)."
   ],
   "node_attrs": [
     {
@@ -17,14 +24,14 @@
       "qualified_name": "*",
       "file": "*",
       "direction": "semgraph_true",
-      "justification": "ADR-003: semgraph sets is_async correctly for EVERY language (Rust async fn, Python async def), whereas CodeGraph 0.9.7 flags only TypeScript. Only the better direction is forgiven (semgraph=true where CodeGraph=false); a semgraph regression that DROPS is_async (semgraph=false, CodeGraph=true) is NOT whitelisted and counts as a delta. is_async is not part of the node match key, so this never affects the node match percentage."
+      "justification": "ADR-003: semgraph sets is_async correctly for EVERY language (Rust async fn, Python async def), whereas CodeGraph 0.9.7 flags only TypeScript. Only the better direction is forgiven (semgraph=true where CodeGraph=false); a regression that DROPS is_async is NOT whitelisted. is_async is not part of the node match key, so this never affects node parity."
     },
     {
       "attr": "docstring",
       "qualified_name": "*",
       "file": "*",
       "direction": "semgraph_nonempty",
-      "justification": "ADR-003: semgraph captures clean, complete docstrings (Rust /// doc comments, TS/JS block comments) where CodeGraph 0.9.7 leaves Python NULL, keeps a stray leading '/'/'!' on Rust doc comments, bleeds a module //! header into the first definition, and misses export-wrapped TS declarations. Only forgiven when semgraph's docstring is non-empty (we kept/added it); if semgraph DROPS a docstring CodeGraph had, that is a regression and counts."
+      "justification": "ADR-003: semgraph captures clean docstrings (Rust /// comments, TS/JS block comments) where CodeGraph 0.9.7 leaves Python NULL, keeps a stray leading '/'/'!' on Rust doc comments, bleeds a module //! header into the first definition, and misses export-wrapped TS declarations. Only forgiven when semgraph's docstring is non-empty; a DROPPED docstring is a regression and counts."
     }
   ],
   "edges": [
@@ -34,7 +41,74 @@
       "source": "*",
       "target": "*",
       "only_duplicates": true,
-      "justification": "ADR-004: CodeGraph 0.9.7 double-emits the return-type reference for TS signatures whose return type is nested in a generic (Array<...>/Promise<...>). semgraph emits each type occurrence exactly once. 'only_duplicates' whitelists a missing instance ONLY when semgraph still emits that (source,target,references) key at least once, i.e. a duplicate-multiplicity omission — a true recall gap (zero of our side) is never whitelisted."
+      "justification": "ADR-004: CodeGraph 0.9.7 double-emits the return-type reference for TS signatures whose return type is nested in a generic (Array<...>/Promise<...>). semgraph emits each type occurrence once. 'only_duplicates' forgives a missing instance ONLY when semgraph still emits that (source,target,references) key at least once — a duplicate-multiplicity omission, never a true recall gap."
+    },
+    {
+      "side": "missing",
+      "kind": "calls",
+      "source": "*",
+      "target": "*",
+      "cross_language": true,
+      "justification": "ADR-004 known-better (language-scoped resolution). CodeGraph resolves a call by bare method name across language boundaries — a Rust stmt.execute() (rusqlite) pointed at a Python KnowledgeAgentExecutor::execute; a Rust .aget_state() at a Python _RecursionGraph::aget_state. A Rust caller cannot call a Python callee: these are fabrications. semgraph is language-scoped and never emits a cross-language call. Only golden calls whose source and target languages differ are forgiven; same-language recall is unaffected."
+    },
+    {
+      "side": "missing",
+      "kind": "calls",
+      "source": "*",
+      "target": "GpuMode::as_str",
+      "justification": "Fabrication: external inherent method. `.as_str()` is the ubiquitous str/String/Path method (~100 external call sites); CodeGraph resolves these by bare name to the sole local `as_str` (GpuMode::as_str), from unrelated callers across every crate (e.g. SymbolTable::resolve_name). The receiver is an external string type, not GpuMode — semgraph declines. Verified: 88 such missing instances, all from callers with no GpuMode receiver."
+    },
+    {
+      "side": "missing",
+      "kind": "calls",
+      "source": "*",
+      "target": "EdgeRecord::contains",
+      "justification": "Fabrication: external method over-resolution. `EdgeRecord::contains(source, target)` is a two-argument ASSOCIATED CONSTRUCTOR — its genuine call sites are qualified `EdgeRecord::contains(...)` (which semgraph resolves and matches). CodeGraph additionally resolves ~127 `.contains()` calls (std str/HashSet/slice `contains`) by bare name to it. Verified: 70 missing instances, all bare `.contains()` on external receivers."
+    },
+    {
+      "side": "missing",
+      "kind": "calls",
+      "source": "*",
+      "target": "RpcResponse::ok",
+      "justification": "Fabrication: external method over-resolution. `RpcResponse::ok(id, result)` is a two-argument ASSOCIATED CONSTRUCTOR — its genuine calls are qualified `RpcResponse::ok(...)` (matched by semgraph). CodeGraph additionally resolves ~71 `.ok()` calls (std `Result::ok`) by bare name to it. Verified: 70 missing instances, all bare `.ok()` on Result receivers."
+    },
+    {
+      "side": "missing",
+      "kind": "calls",
+      "source": "*",
+      "target": "GraphWriter::write",
+      "justification": "Fabrication: macro / external write over-resolution. `GraphWriter::write` has 3 genuine call sites (all resolved and matched by semgraph via local-variable type inference). CodeGraph additionally resolves `write!`/`writeln!` macro expansions and std `io::Write::write`/`fmt::Write::write_str` calls by bare name to it. Verified: 36 missing instances, none with a GraphWriter receiver."
+    },
+    {
+      "side": "missing",
+      "kind": "calls",
+      "source": "*",
+      "target": "TempWork::new",
+      "justification": "Fabrication: external constructor over-resolution. `TempWork` is a private scratch struct in the parity binary with exactly TWO `TempWork::new()` call sites (both matched by semgraph). CodeGraph emits ~35 calls to `TempWork::new` from unrelated callers repo-wide: it resolves external `X::new()` constructors (Vec, String, Command, Parser, HashMap, …) by bare name to the sole reachable local `new`. Verified: 35 missing instances."
+    },
+    {
+      "side": "missing",
+      "kind": "calls",
+      "source": "*",
+      "target": "context",
+      "language": "rust",
+      "justification": "Fabrication: external trait method. `.context(...)`/`.with_context(...)` is the anyhow `Context` trait (~110 external call sites) on Result/Option; anyhow is external to the graph. CodeGraph resolves these by bare name to a local `context` symbol. There is no local free function the code calls this way. Verified: 32 missing instances."
+    },
+    {
+      "side": "missing",
+      "kind": "calls",
+      "source": "*",
+      "target": "build",
+      "language": "rust",
+      "justification": "Fabrication: external builder method. `.build()` is reqwest's `ClientBuilder::build` (~12 external call sites). Genuine same-language `build(...)` free-function calls are resolved and matched by semgraph; CodeGraph additionally resolves the external `.build()` by bare name to the local `build`. Verified: 11 missing instances, all bare `.build()`."
+    },
+    {
+      "side": "missing",
+      "kind": "calls",
+      "source": "*",
+      "target": "json",
+      "language": "rust",
+      "justification": "Fabrication: external method resolved to a non-callable node. `.json()` is reqwest's response deserializer (~22 external call sites); CodeGraph resolves it by bare name to a local `json` node that is in fact an `import` node — not callable at all. semgraph never emits a call to an import node. Verified: 4 missing instances."
     }
   ],
   "nodes": []

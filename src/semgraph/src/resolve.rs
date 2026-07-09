@@ -23,9 +23,14 @@
 //! same-file → import-target → unique global → same-directory → same-language.
 //! A name that stays ambiguous after all of these is **dropped** — precision
 //! over recall for `calls` edges, as the issue directs. Qualified `A::b` calls
-//! resolve against `qualified_name` directly. Method calls resolve only when the
-//! receiver's type was inferred locally; an un-inferrable receiver is dropped
-//! rather than guessed.
+//! resolve against `qualified_name` directly (and may target an `enum_member`, so
+//! a tuple-variant constructor `Error::Sqlite(e)` becomes a `calls` edge). Method
+//! calls (`recv.m()`) resolve **only** from the receiver's inferred type — a
+//! local `let`/parameter, `self`, or a `self.field` typed from the enclosing
+//! type's declared fields → `Type::m`. An un-inferrable receiver is **dropped**,
+//! never resolved by method name alone: a bare name collides with std/library
+//! methods of the same name (`.as_str()`, `.get()`), so name resolution would
+//! fabricate — precision over recall, as the issue directs.
 //!
 //! ## `unresolved_refs` stays empty (documented deviation-that-isn't)
 //!
@@ -79,6 +84,14 @@ pub(crate) enum SitePayload {
     /// An import statement: a file → import-node edge. `module` is the imported
     /// module string (used only for metadata / module→file resolution).
     Import { target_id: String, module: String },
+    /// An inheritance relationship — a Rust supertrait / Python base class / TS
+    /// `extends` (→ `extends`), or a Rust `impl Trait for Type` / TS
+    /// `implements` (→ `implements`). `parent` is the referenced type name; the
+    /// edge source is the inheriting definition's node id (`from_id`).
+    Inherit {
+        parent: String,
+        edge_kind: &'static str,
+    },
 }
 
 /// A resolved target plus how it was found (for the edge's `metadata`).
@@ -90,12 +103,22 @@ struct Resolved<'a> {
 
 /// Node kinds that a bare/qualified *call* may target.
 const CALLABLE_KINDS: &[&str] = &["function", "method"];
+/// Node kinds a *qualified* call (`Type::x(...)`) may target. Adds `enum_member`
+/// so a tuple-variant constructor call (`LanceError::MissingFile(p)`,
+/// `Error::Sqlite(e)`) resolves to the variant as a `calls` edge, matching
+/// CodeGraph 0.9.7.
+const QUALIFIED_CALL_KINDS: &[&str] = &["function", "method", "enum_member"];
 /// Node kinds a constructor/`new` may target.
 const CLASS_KINDS: &[&str] = &["class", "struct", "interface"];
 /// Node kinds a type reference may target.
 const TYPE_KINDS: &[&str] = &["type_alias", "struct", "enum", "class", "interface"];
 /// Node kinds a *strict* type reference may target (no `type_alias`).
 const STRICT_TYPE_KINDS: &[&str] = &["struct", "enum", "class", "interface"];
+/// Node kinds an `extends` edge may target (a base class / supertrait / base
+/// interface).
+const EXTENDS_KINDS: &[&str] = &["class", "struct", "interface", "trait", "enum"];
+/// Node kinds an `implements` edge may target (a trait / interface).
+const IMPLEMENTS_KINDS: &[&str] = &["trait", "interface", "class"];
 
 /// A global index over every definition node, used to resolve reference sites.
 ///
@@ -219,10 +242,20 @@ impl<'a> SymbolTable<'a> {
             }
             SitePayload::QualifiedCall { qualifier, name } => {
                 let qn = format!("{qualifier}::{name}");
-                let r = self.resolve_qualified(from_file, &qn, CALLABLE_KINDS)?;
+                let r = self.resolve_qualified(from_file, &qn, QUALIFIED_CALL_KINDS)?;
                 Some(self.edge_meta(site, "calls", r.node, "qualified-name", 0.95))
             }
             SitePayload::MethodCall { recv_type, name } => {
+                // Resolve ONLY when the receiver's type was inferred locally (a
+                // typed local/parameter, `self`, or a `self.field` typed from the
+                // enclosing type's fields) → `Type::name`. An un-inferrable
+                // receiver is DROPPED, never resolved by method name alone: a bare
+                // method name routinely collides with a std/library method of the
+                // same name (`.as_str()` on a `String`, `.get()` on a `HashMap`),
+                // so name-based resolution would *fabricate* an edge to a
+                // same-named project symbol. Precision over recall (issue #78);
+                // CodeGraph's name-resolved edges that we decline are whitelisted
+                // as fabrications, not imitated.
                 let ty = recv_type.as_ref()?;
                 let qn = format!("{ty}::{name}");
                 let r = self.resolve_qualified(from_file, &qn, CALLABLE_KINDS)?;
@@ -274,6 +307,15 @@ impl<'a> SymbolTable<'a> {
                     col: Some(site.col),
                     provenance: None,
                 })
+            }
+            SitePayload::Inherit { parent, edge_kind } => {
+                let kinds = if *edge_kind == "implements" {
+                    IMPLEMENTS_KINDS
+                } else {
+                    EXTENDS_KINDS
+                };
+                let r = self.resolve_name(from_file, parent, kinds)?;
+                Some(self.edge(site, edge_kind, &r))
             }
         }
     }
@@ -708,5 +750,147 @@ mod tests {
             edges.is_empty(),
             "Rust Widget::new() must not resolve to a TS Widget::new: {edges:?}"
         );
+    }
+
+    /// A qualified call to an enum tuple-variant constructor (`Error::Sqlite(e)`)
+    /// resolves to the `enum_member` as a `calls` edge (matching CodeGraph).
+    #[test]
+    fn qualified_call_resolves_enum_variant_constructor() {
+        let caller = node("function", "f", "f", "a.rs", "rust");
+        let caller_id = caller.id.clone();
+        let variant = node("enum_member", "Sqlite", "Error::Sqlite", "a.rs", "rust");
+        let variant_id = variant.id.clone();
+        let nodes = vec![
+            node("file", "a.rs", "a.rs", "a.rs", "rust"),
+            caller,
+            variant,
+        ];
+        let site = RawSite {
+            from_id: caller_id,
+            line: 2,
+            col: 0,
+            payload: SitePayload::QualifiedCall {
+                qualifier: "Error".to_string(),
+                name: "Sqlite".to_string(),
+            },
+        };
+        let edges = SymbolTable::build(&nodes).resolve_all(&[site]);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].kind, "calls");
+        assert_eq!(edges[0].target, variant_id);
+    }
+
+    /// A method call whose receiver type could NOT be inferred is **dropped**,
+    /// never resolved by method name — even when the name is project-unique. A
+    /// bare name routinely collides with a std/library method of the same name,
+    /// so name-based resolution fabricates (rev-37 blocker 1). This also covers
+    /// the two-methods-one-file case (rev-37 blocker 2): an un-inferrable receiver
+    /// must not resolve to the wrong of two same-named methods.
+    #[test]
+    fn un_inferrable_method_receiver_drops_never_resolves_by_name() {
+        let caller = node("method", "run", "Mcp::run", "mcp.rs", "rust");
+        let caller_id = caller.id.clone();
+        let site = |name: &str| RawSite {
+            from_id: caller_id.clone(),
+            line: 2,
+            col: 0,
+            payload: SitePayload::MethodCall {
+                recv_type: None,
+                name: name.to_string(),
+            },
+        };
+
+        // Project-unique method name (`as_str`) — the real receiver at an
+        // un-inferrable site could be a std `String`, so we must NOT fabricate an
+        // edge to the sole local `GpuMode::as_str`.
+        let unique = vec![
+            node("file", "mcp.rs", "mcp.rs", "mcp.rs", "rust"),
+            node("file", "gpu.rs", "gpu.rs", "gpu.rs", "rust"),
+            caller.clone(),
+            node("method", "as_str", "GpuMode::as_str", "gpu.rs", "rust"),
+        ];
+        assert!(
+            SymbolTable::build(&unique)
+                .resolve_all(&[site("as_str")])
+                .is_empty(),
+            "un-inferrable `.as_str()` must drop, not resolve to the sole local as_str"
+        );
+
+        // Two same-named methods in ONE file (blocker 2): an un-inferrable
+        // receiver must not pick either A::m or B::m.
+        let two_in_one = vec![
+            node("file", "mcp.rs", "mcp.rs", "mcp.rs", "rust"),
+            caller,
+            node("method", "m", "A::m", "mcp.rs", "rust"),
+            node("method", "m", "B::m", "mcp.rs", "rust"),
+        ];
+        assert!(
+            SymbolTable::build(&two_in_one)
+                .resolve_all(&[site("m")])
+                .is_empty(),
+            "un-inferrable `.m()` with A::m and B::m in one file must drop"
+        );
+    }
+
+    /// Positive control: when the receiver type IS inferred, the method resolves
+    /// to `Type::name` (this is the only path that emits an instance-method call).
+    #[test]
+    fn inferred_receiver_resolves_qualified_method() {
+        let caller = node("method", "run", "Mcp::run", "mcp.rs", "rust");
+        let caller_id = caller.id.clone();
+        let target = node("method", "callees", "GraphDb::callees", "db.rs", "rust");
+        let target_id = target.id.clone();
+        let nodes = vec![
+            node("file", "mcp.rs", "mcp.rs", "mcp.rs", "rust"),
+            node("file", "db.rs", "db.rs", "db.rs", "rust"),
+            caller,
+            target,
+        ];
+        // recv_type inferred as GraphDb → resolves GraphDb::callees.
+        let edges = SymbolTable::build(&nodes)
+            .resolve_all(&[method_call_site(&caller_id, "GraphDb", "callees")]);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].kind, "calls");
+        assert_eq!(edges[0].target, target_id);
+    }
+
+    /// `Inherit` sites resolve to `extends`/`implements` edges against the right
+    /// kinds and are language-scoped.
+    #[test]
+    fn inherit_sites_resolve_to_extends_and_implements() {
+        let circle = node("struct", "Circle", "Circle", "a.rs", "rust");
+        let circle_id = circle.id.clone();
+        let shape = node("trait", "Shape", "Shape", "a.rs", "rust");
+        let shape_id = shape.id.clone();
+        let nodes = vec![node("file", "a.rs", "a.rs", "a.rs", "rust"), circle, shape];
+        let site = RawSite {
+            from_id: circle_id,
+            line: 5,
+            col: 0,
+            payload: SitePayload::Inherit {
+                parent: "Shape".to_string(),
+                edge_kind: "implements",
+            },
+        };
+        let edges = SymbolTable::build(&nodes).resolve_all(&[site]);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].kind, "implements");
+        assert_eq!(edges[0].target, shape_id);
+
+        // A bound to a name with no local type-like definition drops (a `Send`
+        // supertrait resolves to nothing rather than being fabricated).
+        let src2 = node("trait", "Named", "Named", "a.rs", "rust");
+        let src2_id = src2.id.clone();
+        let nodes2 = vec![node("file", "a.rs", "a.rs", "a.rs", "rust"), src2];
+        let site2 = RawSite {
+            from_id: src2_id,
+            line: 1,
+            col: 0,
+            payload: SitePayload::Inherit {
+                parent: "Send".to_string(),
+                edge_kind: "extends",
+            },
+        };
+        assert!(SymbolTable::build(&nodes2).resolve_all(&[site2]).is_empty());
     }
 }

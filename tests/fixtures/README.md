@@ -21,6 +21,7 @@ about, in each of the three tier-1 languages:
 - **functions** — free/module-level functions (`hypot`, `circle_area`, `magnitude`, …)
 - **methods** — instance/associated methods (`Point::new`, `Circle.area`, `Report.measure`, …)
 - **classes / structs / enums + members** — `Circle`/`Report` (classes), `Point` (Rust struct with fields), `Shape`/`Kind` (enums with variants/members)
+- **traits / interfaces + inheritance** — Rust `trait Measurable` / `trait NamedMeasurable: Measurable` (a `trait` node + a supertrait `extends` edge) and `impl Measurable for Point` (an `implements` edge); TypeScript `interface Measurable` (an `interface` node), `class Marker extends Base implements Measurable` (`extends` + `implements` edges); Python `class Square(Shape)` (an `extends` edge)
 - **imports** — `use` (Rust), `from … import` (Python), `import { … }` (TypeScript)
 - **cross-file calls** — every language's entry file calls into its sibling file (e.g. `rust/lib.rs` → `rust/geometry.rs`), producing resolved `calls` edges across `file_path` boundaries
 - **type alias** — `Scalar` (Rust `type` alias and TypeScript `type` alias)
@@ -32,11 +33,15 @@ about, in each of the three tier-1 languages:
 
 ### Observed contents of `codegraph-v4.db`
 
-Indexing produced **7 files, 55 nodes, 116 edges**. As reported by CodeGraph 0.9.7:
+Indexing produced **7 files, 67 nodes, 135 edges**. As reported by CodeGraph 0.9.7:
 
-- Node kinds: `class`, `enum`, `enum_member`, `file`, `function`, `import`, `method`, `struct`, `type_alias`, `variable`
-- Edge kinds: `calls`, `contains`, `imports`, `instantiates`, `references`
+- Node kinds: `class`, `enum`, `enum_member`, `file`, `function`, `import`, `interface`, `method`, `struct`, `trait`, `type_alias`, `variable`
+- Edge kinds: `calls`, `contains`, `extends`, `implements`, `imports`, `instantiates`, `references`
+- `extends` = 3 (Rust supertrait, Python/TS class inheritance), `implements` = 2 (Rust `impl Trait for Type`, TS `class … implements`)
 - `schema_versions` max = **4**
+- The fixture source is stored with **LF** line endings; regenerate on an LF
+  checkout (or normalize first) so multi-line signatures match — semgraph
+  normalizes CRLF→LF, so the golden must be LF.
 
 > **Note on CodeGraph 0.9.7 quirks** (captured faithfully — the contract is
 > "what the tool actually emits", not an idealized graph):

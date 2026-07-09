@@ -105,6 +105,10 @@ pub struct PEdge {
     pub source_file: String,
     pub target_kind: String,
     pub target_file: String,
+    /// The **target** (callee) node's language. Used to detect cross-language
+    /// `calls` edges, which are known-better omissions for a language-scoped
+    /// resolver (ADR-004): a Rust caller never resolves to a Python callee.
+    pub target_language: String,
 }
 
 type EdgeKey = (String, String, String);
@@ -156,7 +160,7 @@ pub fn extract_parity(db_path: &Path) -> Result<Graph> {
 
     let mut estmt = conn.prepare(
         "SELECT s.qualified_name, t.qualified_name, e.kind, COALESCE(s.language,''), \
-                s.kind, s.file_path, t.kind, t.file_path \
+                s.kind, s.file_path, t.kind, t.file_path, COALESCE(t.language,'') \
          FROM edges e JOIN nodes s ON s.id = e.source JOIN nodes t ON t.id = e.target",
     )?;
     let edges = estmt
@@ -170,6 +174,7 @@ pub fn extract_parity(db_path: &Path) -> Result<Graph> {
                 source_file: r.get(5)?,
                 target_kind: r.get(6)?,
                 target_file: r.get(7)?,
+                target_language: r.get(8)?,
             })
         })?
         .filter_map(std::result::Result::ok)
@@ -228,27 +233,41 @@ pub struct NodeAttrRule {
     /// Optional exact language filter (`rust`/`python`/`typescript`/…).
     #[serde(default)]
     pub language: Option<String>,
-    /// Which direction of divergence is forgiven. One of:
-    /// `semgraph_true` / `semgraph_false` (bool attrs like `is_async`),
-    /// `semgraph_nonempty` / `codegraph_empty` (text attrs like `docstring`).
-    /// Absent = any direction (discouraged; only for symmetric cosmetic attrs).
+    /// Which direction of divergence is forgiven. **Required** (enforced at load
+    /// by [`Whitelist::validate`]): one of `semgraph_true` / `semgraph_false`
+    /// (bool attrs like `is_async`) or `semgraph_nonempty` / `codegraph_empty`
+    /// (text attrs like `docstring`). Modeled as `Option` only so a missing field
+    /// produces a clear load error instead of an opaque serde failure.
     #[serde(default)]
     pub direction: Option<String>,
     pub justification: String,
 }
 
+/// The `direction` values a [`NodeAttrRule`] may carry. A rule is only allowed to
+/// forgive a delta in one documented-better direction, so a regression that
+/// *drops* the attribute is never masked.
+const VALID_DIRECTIONS: &[&str] = &[
+    "semgraph_true",
+    "semgraph_false",
+    "semgraph_nonempty",
+    "codegraph_empty",
+];
+
 impl NodeAttrRule {
     /// Whether this rule forgives a delta whose semgraph value is `ours` and
     /// CodeGraph value is `golden` (both rendered as strings).
+    ///
+    /// `direction` is guaranteed present and valid by [`Whitelist::validate`]
+    /// (enforced at load), so a `None`/unknown here would be a load-bypass bug;
+    /// we still fail closed (never forgive) rather than panic.
     fn direction_ok(&self, ours: &str, golden: &str) -> bool {
         match self.direction.as_deref() {
-            None => true,
             Some("semgraph_true") => ours == "true",
             Some("semgraph_false") => ours == "false",
             Some("semgraph_nonempty") => !ours.is_empty(),
             Some("codegraph_empty") => golden.is_empty(),
-            // Unknown direction is fail-closed: never forgive.
-            Some(_) => false,
+            // None/unknown: unreachable after `validate`, fail closed.
+            _ => false,
         }
     }
 }
@@ -268,6 +287,21 @@ pub struct EdgeRule {
     /// least once (i.e. a duplicate-multiplicity omission, not a true recall gap).
     #[serde(default)]
     pub only_duplicates: bool,
+    /// When true, the rule matches only a **cross-language** edge — its source and
+    /// target nodes are in different languages. A CodeGraph `calls` edge that
+    /// crosses a language boundary (e.g. a Rust `stmt.execute()` resolved by bare
+    /// name to a Python `KnowledgeAgentExecutor::execute`) is a fabrication: a
+    /// language-scoped resolver never emits it (ADR-004, known-better). This lets
+    /// one rule forgive every such fabrication without naming each Python target
+    /// (which would also wrongly forgive genuine *same-language* calls to it).
+    #[serde(default)]
+    pub cross_language: bool,
+    /// Optional exact caller-language filter (`rust`/`python`/…). Scopes a rule to
+    /// edges whose *source* (caller) is in that language, so a bare-name target
+    /// entry (`context`, `build`) only forgives the fabrication in the language
+    /// where that external library is used.
+    #[serde(default)]
+    pub language: Option<String>,
     pub justification: String,
 }
 
@@ -287,10 +321,7 @@ pub struct NodeRule {
 impl Whitelist {
     /// Parse a whitelist from JSON text.
     pub fn from_json(text: &str) -> Result<Whitelist> {
-        serde_json::from_str(text).map_err(|e| Error::Invalid {
-            path: "<whitelist>".to_string(),
-            detail: format!("invalid parity whitelist JSON: {e}"),
-        })
+        Whitelist::parse(text, "<whitelist>")
     }
 
     /// Load a whitelist from a file path.
@@ -299,7 +330,51 @@ impl Whitelist {
             path: path.display().to_string(),
             detail: format!("cannot read whitelist: {e}"),
         })?;
-        Whitelist::from_json(&text)
+        Whitelist::parse(&text, &path.display().to_string())
+    }
+
+    /// Parse + validate whitelist JSON, attributing any error to `path`.
+    fn parse(text: &str, path: &str) -> Result<Whitelist> {
+        let wl: Whitelist = serde_json::from_str(text).map_err(|e| Error::Invalid {
+            path: path.to_string(),
+            detail: format!("invalid parity whitelist JSON: {e}"),
+        })?;
+        wl.validate(path)?;
+        Ok(wl)
+    }
+
+    /// Enforce load-time invariants the docs mark as REQUIRED. Currently: every
+    /// `node_attrs` rule must carry a `direction` from [`VALID_DIRECTIONS`], so a
+    /// wildcard rule can never silently forgive *both* directions of an attribute
+    /// delta (which would mask a semgraph regression that drops the attribute).
+    fn validate(&self, path: &str) -> Result<()> {
+        for r in &self.node_attrs {
+            match &r.direction {
+                None => {
+                    return Err(Error::Invalid {
+                        path: path.to_string(),
+                        detail: format!(
+                            "node_attrs rule for attr {:?} is missing the REQUIRED `direction` \
+                             field (one of {VALID_DIRECTIONS:?}); a direction-less rule would \
+                             forgive both the improvement and its regression",
+                            r.attr
+                        ),
+                    });
+                }
+                Some(dir) if !VALID_DIRECTIONS.contains(&dir.as_str()) => {
+                    return Err(Error::Invalid {
+                        path: path.to_string(),
+                        detail: format!(
+                            "node_attrs rule for attr {:?} has an unknown `direction` {dir:?}; \
+                             expected one of {VALID_DIRECTIONS:?}",
+                            r.attr
+                        ),
+                    });
+                }
+                _ => {}
+            }
+        }
+        Ok(())
     }
 
     fn node_attr_justification(
@@ -319,15 +394,29 @@ impl Whitelist {
         })
     }
 
-    fn edge_justification(&self, side: &str, e: &EdgeKey, our_count_for_key: i64) -> Option<&str> {
+    fn edge_justification(
+        &self,
+        side: &str,
+        e: &EdgeKey,
+        our_count_for_key: i64,
+        sample: &PEdge,
+    ) -> Option<&str> {
         let (src, tgt, kind) = e;
+        // A cross-language edge has source and target in different languages
+        // (both known). Empty language on either side is treated as same-language
+        // (unknown), so the rule never fires on incomplete data.
+        let is_cross_language = !sample.language.is_empty()
+            && !sample.target_language.is_empty()
+            && sample.language != sample.target_language;
         self.edges.iter().find_map(|r| {
             (r.side == side
                 && r.kind.as_deref().is_none_or(|k| k == kind)
                 && glob_match(&r.source, src)
                 && glob_match(&r.target, tgt)
-                && (!r.only_duplicates || our_count_for_key >= 1))
-                .then_some(r.justification.as_str())
+                && (!r.only_duplicates || our_count_for_key >= 1)
+                && (!r.cross_language || is_cross_language)
+                && r.language.as_deref().is_none_or(|l| l == sample.language))
+            .then_some(r.justification.as_str())
         })
     }
 
@@ -808,7 +897,7 @@ fn compare_edges(ours: &Graph, golden: &Graph, wl: &Whitelist, tr: &Translation)
         }
 
         if miss > 0 {
-            let just = wl.edge_justification("missing", key, oc);
+            let just = wl.edge_justification("missing", key, oc, &gsample);
             let is_wl = just.is_some();
             if is_wl {
                 for stat in [&mut total, &mut *ks, &mut *ls] {
@@ -825,7 +914,7 @@ fn compare_edges(ours: &Graph, golden: &Graph, wl: &Whitelist, tr: &Translation)
             });
         }
         if ext > 0 {
-            let just = wl.edge_justification("extra", key, oc);
+            let just = wl.edge_justification("extra", key, oc, &osample);
             let is_wl = just.is_some();
             if is_wl {
                 for stat in [&mut total, &mut *ks, &mut *ls] {
@@ -981,6 +1070,7 @@ fn dummy_edge() -> PEdge {
         source_file: String::new(),
         target_kind: String::new(),
         target_file: String::new(),
+        target_language: String::new(),
     }
 }
 
@@ -1018,7 +1108,45 @@ mod tests {
             source_file: "a.rs".into(),
             target_kind: "function".into(),
             target_file: "a.rs".into(),
+            target_language: lang.into(),
         }
+    }
+
+    /// A cross-language rule forgives a golden `calls` edge whose endpoints are
+    /// in different languages (a language-scoped resolver never emits it), but
+    /// must NOT forgive a same-language miss of the same target name.
+    #[test]
+    fn cross_language_calls_are_whitelisted_but_same_language_is_not() {
+        let wl = Whitelist::from_json(
+            r#"{"edges":[{"side":"missing","kind":"calls","cross_language":true,"justification":"ADR-004 language-scoped"}]}"#,
+        )
+        .unwrap();
+
+        // Golden: a Rust caller → a Python callee (cross-language fabrication).
+        let mut xedge = e("rust_caller", "Py::execute", "calls", "rust");
+        xedge.target_language = "python".into();
+        let golden = Graph {
+            nodes: vec![],
+            edges: vec![xedge],
+        };
+        let r = compare(&Graph::default(), &golden, &wl, &CompareOptions::default());
+        let calls = r.edges_by_kind.iter().find(|g| g.label == "calls").unwrap();
+        assert_eq!(calls.missing, 1);
+        assert_eq!(calls.whitelisted_missing, 1, "cross-language miss forgiven");
+        assert_eq!(calls.match_pct(), 100.0);
+
+        // Same-language miss of a same-named target is NOT forgiven by the rule.
+        let golden2 = Graph {
+            nodes: vec![],
+            edges: vec![e("rust_caller", "Py::execute", "calls", "rust")],
+        };
+        let r2 = compare(&Graph::default(), &golden2, &wl, &CompareOptions::default());
+        let calls2 = r2
+            .edges_by_kind
+            .iter()
+            .find(|g| g.label == "calls")
+            .unwrap();
+        assert_eq!(calls2.whitelisted_missing, 0, "same-language not forgiven");
     }
 
     #[test]
@@ -1084,6 +1212,7 @@ mod tests {
                 source_file: "a.rs".into(),
                 target_kind: "function".into(),
                 target_file: "a.rs".into(),
+                target_language: "rust".into(),
             }],
         };
         let ours = Graph {
@@ -1100,6 +1229,7 @@ mod tests {
                 source_file: "a.rs".into(),
                 target_kind: "function".into(),
                 target_file: "a.rs".into(),
+                target_language: "rust".into(),
             }],
         };
         let r = compare(
@@ -1257,6 +1387,39 @@ mod tests {
                 .unwrap()
                 .whitelisted
         );
+    }
+
+    #[test]
+    fn node_attr_rule_requires_a_direction_at_load() {
+        // A node_attrs rule with no `direction` is rejected at load (docs mark it
+        // REQUIRED): a direction-less wildcard would forgive both the improvement
+        // and its regression.
+        let err = Whitelist::from_json(
+            r#"{"node_attrs":[{"attr":"is_async","justification":"no direction"}]}"#,
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("direction") && msg.contains("is_async"),
+            "error should name the missing direction and attr: {msg}"
+        );
+
+        // An unknown direction value is likewise rejected (not silently
+        // fail-closed at compare time).
+        let err2 = Whitelist::from_json(
+            r#"{"node_attrs":[{"attr":"is_async","direction":"either","justification":"bad"}]}"#,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err2}").contains("unknown"),
+            "unknown direction must be rejected: {err2}"
+        );
+
+        // A valid direction still loads.
+        assert!(Whitelist::from_json(
+            r#"{"node_attrs":[{"attr":"is_async","direction":"semgraph_true","justification":"ok"}]}"#,
+        )
+        .is_ok());
     }
 
     #[test]

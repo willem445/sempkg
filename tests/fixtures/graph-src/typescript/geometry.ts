@@ -33,3 +33,23 @@ export class Point {
 export function hypot(a: Scalar, b: Scalar): Scalar {
   return Math.sqrt(a * a + b * b);
 }
+
+// An interface — the reader must record an `interface` node. The member returns
+// a primitive (`number`) rather than `Scalar`: CodeGraph emits a `references`
+// edge from an interface member to a *named* return type, which semgraph does
+// not (it does not walk interface bodies for reference sites), and references
+// are not an acceptance metric — a primitive return keeps the fixture exact.
+export interface Measurable {
+  measure(): number;
+}
+
+// A base class for the `extends` edge below.
+export class Base {}
+
+// `extends Base` is an `extends` edge; `implements Measurable` is an
+// `implements` edge (Marker -> Base, Marker -> Measurable).
+export class Marker extends Base implements Measurable {
+  measure(): number {
+    return 0;
+  }
+}

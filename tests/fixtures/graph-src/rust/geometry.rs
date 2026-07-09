@@ -48,3 +48,24 @@ impl Shape {
 pub fn hypot(a: Scalar, b: Scalar) -> Scalar {
     (a * a + b * b).sqrt()
 }
+
+/// A trait — the reader must record a `trait` node. Its defaulted method is a
+/// method node contained by the trait.
+pub trait Measurable {
+    /// Default method (has a body, so it is emitted as a `method`).
+    fn measure(&self) -> Scalar {
+        0.0
+    }
+}
+
+/// A sub-trait: the `: Measurable` supertrait bound is an `extends` edge
+/// (`NamedMeasurable` -> `Measurable`).
+pub trait NamedMeasurable: Measurable {
+    /// Another default method.
+    fn describe(&self) -> Scalar {
+        1.0
+    }
+}
+
+// `impl Measurable for Point` — an `implements` edge (`Point` -> `Measurable`).
+impl Measurable for Point {}

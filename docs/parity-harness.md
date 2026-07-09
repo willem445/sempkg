@@ -135,15 +135,46 @@ regression — only a documented improvement.
 - **`edges[]`** — `side` ∈ `{missing, extra}`; optional `kind`, `source`/`target`
   globs. `only_duplicates: true` whitelists a *missing* edge instance **only**
   when semgraph still emits that key at least once (a duplicate-multiplicity
-  omission, not a true recall gap).
+  omission, not a true recall gap). `cross_language: true` whitelists a *missing*
+  edge **only** when its source and target nodes are in **different languages** —
+  a CodeGraph fabrication that a language-scoped resolver (ADR-004) never emits
+  (e.g. a Rust `stmt.execute()` resolved by bare name to a Python
+  `KnowledgeAgentExecutor::execute`). One such rule forgives every cross-language
+  fabrication without naming each foreign target — which would also wrongly
+  forgive a *genuine same-language* call to a symbol of that name. `language:
+  "rust"` scopes a rule to edges whose *caller* is in that language, so a bare-name
+  target entry (`context`, `build`) only fires where that external library is used.
 - **`nodes[]`** — `side` ∈ `{missing, extra}`; optional `kind`, `qualified_name`/
   `file` globs.
 - Globs support `*` matching any run (`Array<*>`, `python/*`).
 
-The three current entries correspond exactly to the three ADR-003/004
-known-better categories: `is_async` correctness across all languages, docstring
-cleanups, and the omission of CodeGraph's duplicate nested-generic return-type
-`references`.
+The whitelist has two tiers of entry. The **ADR-003/004 known-better** ones —
+`is_async` correctness across all languages, docstring cleanups, and the omission
+of CodeGraph's duplicate nested-generic return-type `references` — are the ones
+the committed *fixture* exercises. The **CodeGraph-fabrication** ones (tier-1
+hardening) forgive `calls` edges that CodeGraph 0.9.7 emits but that are provably
+wrong, so semgraph correctly declines them rather than imitating (per issue #78):
+
+- **cross-language `calls`** (`cross_language: true`) — a language-scoped
+  resolver never crosses a language boundary (ADR-004);
+- **external-library over-resolution** — CodeGraph resolves a call by *bare
+  method name* even when the receiver's type is external to the graph
+  (`.as_str()` → `str`, `.contains()` → str/`HashSet`, `.ok()` → `Result`,
+  `.context()` → anyhow, `.build()`/`.json()` → reqwest, `.write()` → `write!`,
+  `X::new()` → std constructors), so it points the edge at a same-named local
+  symbol the code never calls. Each entry names the fabricated *target*, documents
+  the std/library method, and states a **verified count** — and is only added when
+  the target's genuine calls use a form semgraph matches (a qualified call or an
+  associated constructor like `EdgeRecord::contains(a, b)`), so the `.method()`
+  misses are *unambiguously* the external over-resolution. Targets whose bare
+  `.method()` could also be a genuine same-language instance call (`.get()`,
+  `.query()`, `.status()`, `.open()`) are **not** whitelisted — they count as
+  honest recall gaps rather than risk masking a real miss.
+
+semgraph itself emits **zero** fabricated calls: it resolves a method call only
+from an inferred receiver type and drops an un-inferrable receiver (precision over
+recall). Never whitelist a *genuine* recall gap or an extraction miss — only a
+documented improvement or a demonstrable, verified CodeGraph fabrication.
 
 ## Adding a language to the acceptance flow
 

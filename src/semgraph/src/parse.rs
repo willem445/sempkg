@@ -156,7 +156,21 @@ pub fn extract(
             _ => continue,
         };
         let kind = reclassify(raw_kind, node, language);
-        let qualified = qualified_name(node, &name, src, language);
+        // CodeGraph 0.9.7 records only file/module-level imports; a `use`/`import`
+        // nested inside a function or closure body is not emitted. Match that.
+        if kind == "import" && import_in_function_body(node, language) {
+            continue;
+        }
+        // Tier-1 imports are named by their module root and NOT qualified by an
+        // enclosing scope (a `use std::…;` inside `mod tests` is `std`, not
+        // `tests::std`), matching CodeGraph 0.9.7. The tier-2/3 packs have their
+        // own import conventions (e.g. CodeGraph package-qualifies Java imports as
+        // `fixture::java.util.List`), so leave those to `qualified_name`.
+        let qualified = if kind == "import" && language.is_tier1() {
+            name.clone()
+        } else {
+            qualified_name(node, &name, src, language)
+        };
         let start = node.start_position();
         let end = node.end_position();
         let mut rec = NodeRecord::new(
@@ -227,7 +241,16 @@ pub fn extract(
     //    type-reference sites walked over each definition's signature, and
     //    import sites reusing the emitted `import` nodes. These are resolved to
     //    edges after all files are parsed (see `crate::resolve`).
-    let sites = collect_sites(root, src, language, &file_id, &ts_to_id, &emitted, &nodes);
+    let sites = collect_sites(
+        root,
+        src,
+        language,
+        &file_id,
+        &ts_to_id,
+        &emitted,
+        &nodes,
+        &type_nodes,
+    );
 
     let errors = if root.has_error() {
         Some("[\"syntax errors present\"]".to_string())
@@ -257,6 +280,7 @@ pub fn extract(
 /// Collect every reference site in one file: call/method/constructor sites (via
 /// the language's refs query), type-reference sites (walked over each
 /// definition's signature), and import sites (from the emitted `import` nodes).
+#[allow(clippy::too_many_arguments)]
 fn collect_sites(
     root: Node,
     src: &str,
@@ -265,6 +289,7 @@ fn collect_sites(
     ts_to_id: &HashMap<usize, String>,
     emitted: &[(Node, usize)],
     nodes: &[NodeRecord],
+    type_nodes: &HashMap<String, String>,
 ) -> Vec<RawSite> {
     let mut sites = Vec::new();
 
@@ -292,6 +317,9 @@ fn collect_sites(
         .collect();
     // Cache of locals maps, computed lazily per enclosing callable.
     let mut locals_cache: HashMap<String, HashMap<String, String>> = HashMap::new();
+    // type name → (field name → field type name), so a `self.field.method()`
+    // receiver can be typed from the enclosing type's declared fields.
+    let field_types = collect_field_types(root, src, lang);
 
     // 4a. Call / method / constructor sites via the refs query.
     let (_ts_lang, refs_query) = compiled_refs(lang);
@@ -325,6 +353,7 @@ fn collect_sites(
                 &from_id,
                 &def_node_by_id,
                 &encl_type_by_id,
+                &field_types,
                 &mut locals_cache,
             )
         };
@@ -381,10 +410,209 @@ fn collect_sites(
         });
     }
 
+    // 4d. Inheritance sites: extends (base class / supertrait / base interface)
+    //     and implements (Rust `impl Trait for Type`, TS `class … implements`).
+    collect_inheritance_sites(root, src, lang, emitted, nodes, type_nodes, &mut sites);
+
     sites
 }
 
+/// Collect `extends`/`implements` inheritance sites, matching CodeGraph 0.9.7's
+/// conventions per language:
+/// - **Rust**: a `trait Sub: Super` supertrait bound → `extends` (from the
+///   trait); an `impl Trait for Type` block → `implements` (from the `Type`
+///   struct/enum to the trait). Plain `impl Type {}` yields nothing.
+/// - **Python**: every base in `class C(Base, …)` → `extends` (from the class).
+/// - **TS/JS**: `class C extends Base` → `extends`; `class C implements I, …` →
+///   `implements`. (CodeGraph 0.9.7 does not record `interface X extends Y`
+///   inheritance — its clause walker misses `extends_type_clause` — so we don't
+///   either, keeping edge parity exact.)
+fn collect_inheritance_sites(
+    root: Node,
+    src: &str,
+    lang: Language,
+    emitted: &[(Node, usize)],
+    nodes: &[NodeRecord],
+    type_nodes: &HashMap<String, String>,
+    sites: &mut Vec<RawSite>,
+) {
+    // Definition-anchored inheritance (class/trait heritage): source is the
+    // definition's own node id.
+    for (node, idx) in emitted {
+        let rec = &nodes[*idx];
+        let from_id = rec.id.clone();
+        match lang {
+            // Rust supertrait bounds: `trait Named: Shape + Send`.
+            Language::Rust if rec.kind == "trait" => {
+                if let Some(bounds) = child_of_kind(*node, "trait_bounds") {
+                    for name in bound_type_names(bounds, src) {
+                        push_inherit(sites, &from_id, bounds, "extends", name);
+                    }
+                }
+            }
+            // Python `class C(Base, …)` bases.
+            Language::Python if rec.kind == "class" => {
+                if let Some(supers) = node.child_by_field_name("superclasses") {
+                    let mut c = supers.walk();
+                    for arg in supers.named_children(&mut c) {
+                        if matches!(arg.kind(), "identifier" | "attribute") {
+                            let name = node_text(arg, src).to_string();
+                            push_inherit(sites, &from_id, arg, "extends", name);
+                        }
+                    }
+                }
+            }
+            // TS/JS classes: class_heritage → extends_clause / implements_clause.
+            // (CodeGraph records inheritance for classes only.)
+            Language::TypeScript | Language::Tsx | Language::JavaScript if rec.kind == "class" => {
+                if let Some(heritage) = child_of_kind(*node, "class_heritage") {
+                    let mut c = heritage.walk();
+                    for clause in heritage.named_children(&mut c) {
+                        let edge = match clause.kind() {
+                            "extends_clause" => "extends",
+                            "implements_clause" => "implements",
+                            _ => continue,
+                        };
+                        for (nm, pos) in heritage_clause_types(clause, src) {
+                            push_inherit(sites, &from_id, pos, edge, nm);
+                        }
+                    }
+                }
+            }
+            // Non-inheriting definitions, and the tier-2 (C/C++/Go/Java) and
+            // tier-3 packs (which emit no inheritance from this pass — tier-3 has
+            // its own extractor), add nothing here.
+            _ => {}
+        }
+    }
+
+    // Rust `impl Trait for Type` → an `implements` edge from the implementing
+    // type's node (found by name among the file's structs/enums) to the trait.
+    if lang == Language::Rust {
+        for impl_node in descendants_of_kind(root, "impl_item") {
+            if let Some((type_name, trait_name, pos)) = rust_impl_for(impl_node, src) {
+                if let Some(type_id) = type_nodes.get(&type_name) {
+                    push_inherit(sites, type_id, pos, "implements", trait_name);
+                }
+            }
+        }
+    }
+}
+
+/// Push an `Inherit` site at `pos`'s coordinate.
+fn push_inherit(
+    sites: &mut Vec<RawSite>,
+    from_id: &str,
+    pos: Node,
+    edge_kind: &'static str,
+    parent: String,
+) {
+    let start = pos.start_position();
+    sites.push(RawSite {
+        from_id: from_id.to_string(),
+        line: start.row as u32 + 1,
+        col: start.column as u32,
+        payload: SitePayload::Inherit { parent, edge_kind },
+    });
+}
+
+/// The first direct child of `node` with kind `kind`.
+fn child_of_kind<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
+    let mut c = node.walk();
+    let found = node.children(&mut c).find(|ch| ch.kind() == kind);
+    found
+}
+
+/// Type names referenced by a Rust `trait_bounds` node (`type_identifier`s,
+/// including the inner identifier of a `generic_type` bound like `Trait<'a>`).
+fn bound_type_names(bounds: Node, src: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut c = bounds.walk();
+    for b in bounds.named_children(&mut c) {
+        match b.kind() {
+            "type_identifier" => out.push(node_text(b, src).to_string()),
+            "generic_type" => {
+                if let Some(inner) = child_of_kind(b, "type_identifier") {
+                    out.push(node_text(inner, src).to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// The (name, position) of each heritage target in a TS `extends_clause` /
+/// `implements_clause` — the leftmost identifier of each listed type.
+fn heritage_clause_types<'a>(clause: Node<'a>, src: &str) -> Vec<(String, Node<'a>)> {
+    let mut out = Vec::new();
+    let mut c = clause.walk();
+    for t in clause.named_children(&mut c) {
+        // Skip type_arguments (`<T>`) that sit alongside the base in some grammars.
+        if t.kind() == "type_arguments" {
+            continue;
+        }
+        if let Some(name) = leftmost_identifier(t, src) {
+            out.push((name, t));
+        }
+    }
+    out
+}
+
+/// The leftmost identifier text of a type expression (`Base` from `Base`,
+/// `ns.Base` → `ns`, `Base<T>` → `Base`).
+fn leftmost_identifier(node: Node, src: &str) -> Option<String> {
+    match node.kind() {
+        "identifier" | "type_identifier" | "property_identifier" => {
+            Some(node_text(node, src).to_string())
+        }
+        _ => {
+            let first = node.named_child(0)?;
+            leftmost_identifier(first, src)
+        }
+    }
+}
+
+/// For a Rust `impl_item`, if it is an `impl Trait for Type` block, return
+/// `(type_name, trait_name, trait_position)`. Plain `impl Type {}` → `None`.
+fn rust_impl_for<'a>(node: Node<'a>, src: &str) -> Option<(String, String, Node<'a>)> {
+    let trait_node = node.child_by_field_name("trait")?;
+    let type_node = node.child_by_field_name("type")?;
+    let trait_name = last_path_segment(bare_type_text(trait_node, src));
+    let type_name = last_path_segment(bare_type_text(type_node, src));
+    if trait_name.is_empty() || type_name.is_empty() {
+        None
+    } else {
+        Some((type_name, trait_name, trait_node))
+    }
+}
+
+/// The base type text with any generic argument list stripped (`Point<T>` →
+/// `Point`, `geometry::Point` kept for the caller's `last_path_segment`).
+fn bare_type_text<'a>(node: Node<'a>, src: &'a str) -> &'a str {
+    let txt = node_text(node, src);
+    txt.split('<').next().unwrap_or(txt).trim()
+}
+
+/// All descendants of `root` (inclusive) whose kind is `kind`, in document order.
+fn descendants_of_kind<'a>(root: Node<'a>, kind: &str) -> Vec<Node<'a>> {
+    let mut out = Vec::new();
+    let mut stack = vec![root];
+    while let Some(n) = stack.pop() {
+        if n.kind() == kind {
+            out.push(n);
+        }
+        let mut c = n.walk();
+        for ch in n.children(&mut c) {
+            stack.push(ch);
+        }
+    }
+    out.sort_by_key(|n| (n.start_byte(), n.end_byte()));
+    out
+}
+
 /// Derive a call/method/constructor payload from a captured call node.
+#[allow(clippy::too_many_arguments)]
 fn call_payload(
     call: Node,
     src: &str,
@@ -392,6 +620,7 @@ fn call_payload(
     from_id: &str,
     def_node_by_id: &HashMap<String, Node>,
     encl_type_by_id: &HashMap<String, String>,
+    field_types: &HashMap<String, HashMap<String, String>>,
     locals_cache: &mut HashMap<String, HashMap<String, String>>,
 ) -> Option<SitePayload> {
     // Java call sites are `method_invocation` nodes (no `function` field).
@@ -402,6 +631,7 @@ fn call_payload(
             from_id,
             def_node_by_id,
             encl_type_by_id,
+            field_types,
             locals_cache,
         );
     }
@@ -470,6 +700,7 @@ fn call_payload(
                     from_id,
                     def_node_by_id,
                     encl_type_by_id,
+                    field_types,
                     locals_cache,
                     lang,
                 );
@@ -490,6 +721,7 @@ fn call_payload(
                     from_id,
                     def_node_by_id,
                     encl_type_by_id,
+                    field_types,
                     locals_cache,
                     lang,
                 );
@@ -510,6 +742,7 @@ fn call_payload(
                     from_id,
                     def_node_by_id,
                     encl_type_by_id,
+                    field_types,
                     locals_cache,
                     lang,
                 );
@@ -549,12 +782,14 @@ fn new_payload(new_expr: Node, src: &str, lang: Language) -> Option<SitePayload>
 /// - `recv.method(...)` where the receiver's type is locally inferable (a typed
 ///   parameter/local, or `this`) → a qualified call against that type's method;
 /// - any other receiver (array element, chained call) → dropped.
+#[allow(clippy::too_many_arguments)]
 fn java_call_payload(
     call: Node,
     src: &str,
     from_id: &str,
     def_node_by_id: &HashMap<String, Node>,
     encl_type_by_id: &HashMap<String, String>,
+    field_types: &HashMap<String, HashMap<String, String>>,
     locals_cache: &mut HashMap<String, HashMap<String, String>>,
 ) -> Option<SitePayload> {
     let name = field_text(call, "name", src)?;
@@ -569,6 +804,7 @@ fn java_call_payload(
         from_id,
         def_node_by_id,
         encl_type_by_id,
+        field_types,
         locals_cache,
         Language::Java,
     ) {
@@ -601,18 +837,27 @@ fn starts_uppercase(s: &str) -> bool {
 }
 
 /// Infer a receiver expression's type name: `self`/`this` → the enclosing type;
-/// a bare identifier → its locally inferred type; anything else → `None`.
+/// `self.field` → the enclosing type's declared field type; a bare identifier →
+/// its locally inferred type; anything else → `None`.
+#[allow(clippy::too_many_arguments)]
 fn receiver_type(
     recv: Node,
     src: &str,
     from_id: &str,
     def_node_by_id: &HashMap<String, Node>,
     encl_type_by_id: &HashMap<String, String>,
+    field_types: &HashMap<String, HashMap<String, String>>,
     locals_cache: &mut HashMap<String, HashMap<String, String>>,
     lang: Language,
 ) -> Option<String> {
     if matches!(recv.kind(), "self" | "this") {
         return encl_type_by_id.get(from_id).cloned();
+    }
+    // `self.field` / `this.field`: type the receiver from the enclosing type's
+    // declared field, so `self.graph.callees()` resolves through `graph: GraphDb`.
+    if let Some(field) = self_field_name(recv, src, lang) {
+        let encl = encl_type_by_id.get(from_id)?;
+        return field_types.get(encl)?.get(&field).cloned();
     }
     if recv.kind() != "identifier" {
         return None;
@@ -641,6 +886,112 @@ fn receiver_type(
 /// The last `::`-segment of a Rust path (`geometry::Point` → `Point`).
 fn last_path_segment(path: &str) -> String {
     path.rsplit("::").next().unwrap_or(path).trim().to_string()
+}
+
+/// If `recv` is a `self.field` / `this.field` access (a field/member/attribute
+/// expression whose object is `self`/`this`), return the field's name.
+fn self_field_name(recv: Node, src: &str, lang: Language) -> Option<String> {
+    // Only tier-1 languages get `self.field` typing (the field-type map is built
+    // for them). Other packs fall through to their own receiver handling.
+    let (obj_field, name_field, expected_kind) = match lang {
+        Language::Rust => ("value", "field", "field_expression"),
+        Language::Python => ("object", "attribute", "attribute"),
+        Language::TypeScript | Language::Tsx | Language::JavaScript => {
+            ("object", "property", "member_expression")
+        }
+        _ => return None,
+    };
+    if recv.kind() != expected_kind {
+        return None;
+    }
+    let obj = recv.child_by_field_name(obj_field)?;
+    let obj_txt = node_text(obj, src);
+    if !matches!(obj.kind(), "self" | "this") && !matches!(obj_txt, "self" | "this") {
+        return None;
+    }
+    let field = recv.child_by_field_name(name_field)?;
+    if matches!(
+        field.kind(),
+        "field_identifier" | "property_identifier" | "identifier"
+    ) {
+        Some(node_text(field, src).to_string())
+    } else {
+        None
+    }
+}
+
+/// Build a `type name → (field name → field type name)` map for one file, so a
+/// `self.field.method()` receiver can be typed from the type's declared fields.
+/// Covers Rust struct fields and TS class field annotations (Python class fields
+/// are rarely type-annotated at class scope, and CodeGraph emits no Python type
+/// references, so they are skipped).
+fn collect_field_types(
+    root: Node,
+    src: &str,
+    lang: Language,
+) -> HashMap<String, HashMap<String, String>> {
+    let mut out: HashMap<String, HashMap<String, String>> = HashMap::new();
+    match lang {
+        Language::Rust => {
+            for st in descendants_of_kind(root, "struct_item") {
+                let Some(name) = field_text(st, "name", src) else {
+                    continue;
+                };
+                let Some(body) = st.child_by_field_name("body") else {
+                    continue;
+                };
+                let mut c = body.walk();
+                for f in body.named_children(&mut c) {
+                    if f.kind() != "field_declaration" {
+                        continue;
+                    }
+                    if let (Some(fname), Some(fty)) =
+                        (f.child_by_field_name("name"), f.child_by_field_name("type"))
+                    {
+                        if let Some(t) = bare_type_name(node_text(fty, src)) {
+                            out.entry(name.clone())
+                                .or_default()
+                                .insert(node_text(fname, src).to_string(), t);
+                        }
+                    }
+                }
+            }
+        }
+        Language::TypeScript | Language::Tsx | Language::JavaScript => {
+            for cls in descendants_of_kind(root, "class_declaration")
+                .into_iter()
+                .chain(descendants_of_kind(root, "abstract_class_declaration"))
+            {
+                let Some(name) = field_text(cls, "name", src) else {
+                    continue;
+                };
+                let Some(body) = cls.child_by_field_name("body") else {
+                    continue;
+                };
+                let mut c = body.walk();
+                for m in body.named_children(&mut c) {
+                    if m.kind() != "public_field_definition" {
+                        continue;
+                    }
+                    if let (Some(fname), Some(ann)) =
+                        (m.child_by_field_name("name"), m.child_by_field_name("type"))
+                    {
+                        // `type` is a `type_annotation` (`: T`); read its inner type.
+                        let inner = ann.named_child(0).unwrap_or(ann);
+                        if let Some(t) = bare_type_name(node_text(inner, src)) {
+                            out.entry(name.clone())
+                                .or_default()
+                                .insert(node_text(fname, src).to_string(), t);
+                        }
+                    }
+                }
+            }
+        }
+        // Python class fields are rarely type-annotated at class scope, and the
+        // tier-2/tier-3 packs do not use this map, so no field types are collected.
+        _ => {}
+    }
+    out
 }
 
 /// Build a `variable name → type name` map for one callable body: parameter
@@ -1369,21 +1720,7 @@ fn import_name(node: Node, src: &str, lang: Language) -> Option<String> {
         | Language::Swift
         | Language::Scala
         | Language::CSharp => unreachable!("tier-3 handled by tier3::extract"),
-        Language::Rust => {
-            // `use geometry::{...};` → `geometry` (first path segment).
-            let text = node_text(node, src);
-            let rest = text.strip_prefix("use").unwrap_or(text).trim_start();
-            let seg: String = rest
-                .chars()
-                .take_while(|c| !matches!(c, ':' | '{' | ';' | ' ' | '\t' | '\n' | '('))
-                .collect();
-            let seg = seg.trim();
-            if seg.is_empty() {
-                None
-            } else {
-                Some(seg.to_string())
-            }
-        }
+        Language::Rust => rust_use_root(node, src),
         Language::Python => {
             if node.kind() == "import_from_statement" {
                 let module = field_text(node, "module_name", src)?;
@@ -1446,6 +1783,70 @@ fn import_name(node: Node, src: &str, lang: Language) -> Option<String> {
             found.map(|n| node_text(n, src).to_string())
         }
     }
+}
+
+/// The root module of a Rust `use` declaration, mirroring CodeGraph 0.9.7's
+/// `getRootModule`: the leftmost path segment (`crate`/`super`/`self`/a crate or
+/// module name), ignoring any leading `pub`/visibility.
+///
+/// Returns `None` — so the import node is dropped — when the use argument is a
+/// form CodeGraph also skips: a wildcard (`use x::*;`) or an aliased top-level
+/// `use x as y;`. Only `scoped_use_list` / `scoped_identifier` / `use_list` /
+/// `identifier` arguments produce an import (the exact set CodeGraph handles).
+fn rust_use_root(node: Node, src: &str) -> Option<String> {
+    // The use argument is the sole named child once any visibility_modifier /
+    // attribute is skipped. Match CodeGraph's accepted argument kinds exactly.
+    let mut c = node.walk();
+    let arg = node.named_children(&mut c).find(|ch| {
+        matches!(
+            ch.kind(),
+            "scoped_use_list" | "scoped_identifier" | "use_list" | "identifier"
+        )
+    })?;
+    Some(rust_use_leftmost(arg, src))
+}
+
+/// The leftmost identifier of a Rust use-tree node (`crate::foo::Bar` → `crate`,
+/// `geometry::{…}` → `geometry`).
+fn rust_use_leftmost(node: Node, src: &str) -> String {
+    let first = match node.named_child(0) {
+        Some(f) => f,
+        None => return node_text(node, src).to_string(),
+    };
+    match first.kind() {
+        "identifier" | "crate" | "super" | "self" => node_text(first, src).to_string(),
+        "scoped_identifier" | "scoped_use_list" => rust_use_leftmost(first, src),
+        _ => node_text(first, src).to_string(),
+    }
+}
+
+/// Whether an import definition is nested inside a function/closure body. Such
+/// local imports are skipped to match CodeGraph 0.9.7, which records only
+/// file/module-level (and, for Rust, `mod`-level) imports.
+fn import_in_function_body(node: Node, lang: Language) -> bool {
+    let mut cur = node.parent();
+    while let Some(n) = cur {
+        let is_fn = match lang {
+            Language::Rust => matches!(n.kind(), "function_item" | "closure_expression"),
+            Language::Python => matches!(n.kind(), "function_definition" | "lambda"),
+            Language::TypeScript | Language::Tsx | Language::JavaScript => matches!(
+                n.kind(),
+                "function_declaration"
+                    | "function_expression"
+                    | "arrow_function"
+                    | "generator_function_declaration"
+                    | "method_definition"
+            ),
+            // Tier-2 (C/C++/Go/Java) imports/includes are always file-level, so
+            // none are ever function-body-nested; tier-3 has its own extractor.
+            _ => false,
+        };
+        if is_fn {
+            return true;
+        }
+        cur = n.parent();
+    }
+    false
 }
 
 // ---- signature -----------------------------------------------------------
@@ -1668,7 +2069,7 @@ fn apply_flags(rec: &mut NodeRecord, node: Node, src: &str, lang: Language, kind
         | Language::Scala
         | Language::CSharp => unreachable!("tier-3 handled by tier3::extract"),
         Language::Rust => {
-            if matches!(kind, "function" | "method" | "struct" | "enum")
+            if matches!(kind, "function" | "method" | "struct" | "enum" | "trait")
                 && has_child_kind(node, "visibility_modifier")
             {
                 rec.visibility = Some("public".to_string());
@@ -2297,6 +2698,158 @@ import { hypot } from "./geometry";
         assert_eq!(
             find(&nodes, "fixture::C::C").unwrap().signature.as_deref(),
             Some("(double a)")
+        );
+    }
+
+    // ---- tier-1 hardening: trait/interface nodes + inheritance edges --------
+
+    /// Collect `(kind, source_qn, target_qn)` for the extends/implements edges an
+    /// extract resolves against its own nodes (single-file resolution).
+    fn inheritance_edges(ex: &FileExtract) -> Vec<(String, String, String)> {
+        use crate::resolve::SymbolTable;
+        let edges = SymbolTable::build(&ex.nodes).resolve_all(&ex.sites);
+        let by_id = |id: &str| {
+            ex.nodes
+                .iter()
+                .find(|n| n.id == id)
+                .map(|n| n.qualified_name.clone())
+                .unwrap_or_default()
+        };
+        edges
+            .iter()
+            .filter(|e| matches!(e.kind.as_str(), "extends" | "implements"))
+            .map(|e| (e.kind.clone(), by_id(&e.source), by_id(&e.target)))
+            .collect()
+    }
+
+    #[test]
+    fn rust_trait_nodes_supertrait_extends_and_impl_implements() {
+        let src = "\
+pub trait Shape { fn area(&self) -> f64; }
+pub trait Named: Shape { fn label(&self) -> String; }
+pub struct Circle;
+impl Shape for Circle { fn area(&self) -> f64 { 0.0 } }
+impl Circle { fn helper(&self) {} }
+";
+        let ex = extract(src, "a.rs", Language::Rust, 0, 0);
+        // trait nodes exist with kind `trait`.
+        assert_eq!(find(&ex.nodes, "Shape").unwrap().kind, "trait");
+        assert_eq!(find(&ex.nodes, "Named").unwrap().kind, "trait");
+        let edges = inheritance_edges(&ex);
+        // Supertrait: Named extends Shape.
+        assert!(edges.contains(&("extends".into(), "Named".into(), "Shape".into())));
+        // impl Shape for Circle → Circle implements Shape.
+        assert!(edges.contains(&("implements".into(), "Circle".into(), "Shape".into())));
+        // Plain `impl Circle {}` emits no inheritance edge.
+        assert_eq!(
+            edges.iter().filter(|(k, _, _)| k == "implements").count(),
+            1
+        );
+    }
+
+    #[test]
+    fn ts_interface_nodes_and_class_extends_implements() {
+        let src = "\
+export interface Shape { area(): number; }
+export class Base {}
+export class Circle extends Base implements Shape {
+  area(): number { return 0; }
+}
+";
+        let ex = extract(src, "a.ts", Language::TypeScript, 0, 0);
+        assert_eq!(find(&ex.nodes, "Shape").unwrap().kind, "interface");
+        let edges = inheritance_edges(&ex);
+        assert!(edges.contains(&("extends".into(), "Circle".into(), "Base".into())));
+        assert!(edges.contains(&("implements".into(), "Circle".into(), "Shape".into())));
+    }
+
+    #[test]
+    fn python_class_inheritance_is_extends() {
+        let src = "\
+class Base:
+    pass
+
+class Derived(Base):
+    pass
+";
+        let ex = extract(src, "a.py", Language::Python, 0, 0);
+        let edges = inheritance_edges(&ex);
+        assert!(edges.contains(&("extends".into(), "Derived".into(), "Base".into())));
+    }
+
+    #[test]
+    fn rust_imports_are_unqualified_deduped_by_line_and_scope_filtered() {
+        let src = "\
+use crate::foo::Bar;
+use crate::baz::Qux;
+pub use crate::model::Thing;
+use std::collections::HashMap;
+
+pub struct S;
+impl S {
+    pub fn go(&self) {
+        use std::fmt::Write;
+        let _ = HashMap::<u8, u8>::new();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+}
+";
+        let nodes = extract_nodes(src, "a.rs", Language::Rust);
+        let imports: Vec<&NodeRecord> = nodes.iter().filter(|n| n.kind == "import").collect();
+        // Every import is named by its root and NOT qualified by an enclosing
+        // scope (no `tests::std`, no `pub`).
+        assert!(imports.iter().all(|i| !i.qualified_name.contains("::")));
+        assert!(imports.iter().all(|i| i.name != "pub"));
+        // `pub use crate::…` roots at `crate`, not `pub`.
+        assert_eq!(
+            imports.iter().filter(|i| i.name == "crate").count(),
+            3,
+            "three `use crate::…` (incl the pub use), each a distinct node"
+        );
+        // The `use std::fmt::Write` inside `fn go` is skipped (function-body).
+        // Module-level `use std::…` (HashMap) and the `mod tests` `use std::sync`
+        // are kept → two distinct `std` imports.
+        assert_eq!(
+            imports.iter().filter(|i| i.name == "std").count(),
+            2,
+            "module-level + mod-level std imports kept; fn-body one skipped"
+        );
+        // Wildcard `use super::*` is skipped (CodeGraph skips use_wildcard).
+        assert!(imports.iter().all(|i| i.name != "super"));
+    }
+
+    #[test]
+    fn self_field_method_call_is_typed_from_struct_fields() {
+        // `self.db.query()` should carry recv_type = the field's type (Db), so the
+        // resolver can resolve `Db::query`.
+        let src = "\
+pub struct Db;
+impl Db { pub fn query(&self) {} }
+pub struct App { db: Db }
+impl App {
+    pub fn run(&self) { self.db.query(); }
+}
+";
+        let ex = extract(src, "a.rs", Language::Rust, 0, 0);
+        use crate::resolve::SymbolTable;
+        let edges = SymbolTable::build(&ex.nodes).resolve_all(&ex.sites);
+        let target_qn = |id: &str| {
+            ex.nodes
+                .iter()
+                .find(|n| n.id == id)
+                .map(|n| n.qualified_name.as_str())
+                .unwrap_or("")
+        };
+        assert!(
+            edges
+                .iter()
+                .any(|e| e.kind == "calls" && target_qn(&e.target) == "Db::query"),
+            "self.db.query() resolves to Db::query via field typing"
         );
     }
 }
