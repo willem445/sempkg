@@ -70,7 +70,12 @@ pub(crate) enum SitePayload {
     /// A `new Name(...)` expression (TS/JS) → `instantiates`.
     New { name: String },
     /// A type identifier appearing in a signature/field annotation → `references`.
+    /// Resolves against any type-like kind, including `type_alias`.
     TypeRef { name: String },
+    /// Like [`SitePayload::TypeRef`] but resolving *only* to a concrete type
+    /// (`struct`/`interface`/`class`/`enum`, never a `type_alias`) — Go and Java,
+    /// where CodeGraph never references a plain alias. See `crate::parse`.
+    TypeRefStrict { name: String },
     /// An import statement: a file → import-node edge. `module` is the imported
     /// module string (used only for metadata / module→file resolution).
     Import { target_id: String, module: String },
@@ -89,6 +94,8 @@ const CALLABLE_KINDS: &[&str] = &["function", "method"];
 const CLASS_KINDS: &[&str] = &["class", "struct", "interface"];
 /// Node kinds a type reference may target.
 const TYPE_KINDS: &[&str] = &["type_alias", "struct", "enum", "class", "interface"];
+/// Node kinds a *strict* type reference may target (no `type_alias`).
+const STRICT_TYPE_KINDS: &[&str] = &["struct", "enum", "class", "interface"];
 
 /// A global index over every definition node, used to resolve reference sites.
 ///
@@ -108,6 +115,8 @@ pub(crate) struct SymbolTable<'a> {
     id_to_file: HashMap<&'a str, &'a str>,
     /// File path → its `language`, so language scoping is O(1) per lookup.
     file_to_lang: HashMap<&'a str, &'a str>,
+    /// The set of file paths present in the graph (for include→file resolution).
+    file_paths: HashSet<&'a str>,
 }
 
 impl<'a> SymbolTable<'a> {
@@ -155,6 +164,7 @@ impl<'a> SymbolTable<'a> {
             imported_files,
             id_to_file,
             file_to_lang,
+            file_paths,
         }
     }
 
@@ -226,7 +236,28 @@ impl<'a> SymbolTable<'a> {
                 let r = self.resolve_name(from_file, name, TYPE_KINDS)?;
                 Some(self.edge(site, "references", &r))
             }
+            SitePayload::TypeRefStrict { name } => {
+                let r = self.resolve_name(from_file, name, STRICT_TYPE_KINDS)?;
+                Some(self.edge(site, "references", &r))
+            }
             SitePayload::Import { target_id, module } => {
+                // C/C++ `#include "local.h"` that resolves to a file in the graph
+                // targets that file's node (CodeGraph does the same); an
+                // unresolved/system include falls back to the import node.
+                if matches!(self.language_of(from_file), Some("c") | Some("cpp")) {
+                    if let Some(path) = resolve_include_to_file(from_file, module, &self.file_paths)
+                    {
+                        return Some(EdgeRecord {
+                            source: site.from_id.clone(),
+                            target: format!("file:{path}"),
+                            kind: "imports".to_string(),
+                            metadata: Some(metadata_json(0.9, "import")),
+                            line: Some(site.line),
+                            col: Some(site.col),
+                            provenance: None,
+                        });
+                    }
+                }
                 // Import edges always land (the target is our own import node);
                 // a resolvable relative module reads as a stronger match.
                 let (by, conf) = if module.starts_with('.') {
@@ -474,6 +505,30 @@ fn resolve_module_to_file(from_file: &str, module: &str, files: &HashSet<&str>) 
     candidates.push(format!("{base}/__init__.py"));
 
     candidates.into_iter().find(|c| files.contains(c.as_str()))
+}
+
+/// Resolve a C/C++ `#include` header path to a concrete file in the graph.
+///
+/// Tries the header relative to the including file's directory, then by basename
+/// anywhere in the graph (CodeGraph resolves local includes by name). System
+/// includes (`<math.h>` for headers not in the tree) return `None`.
+fn resolve_include_to_file(from_file: &str, header: &str, files: &HashSet<&str>) -> Option<String> {
+    let dir = parent_dir(from_file);
+    let joined = join_relative(dir, header);
+    if files.contains(joined.as_str()) {
+        return Some(joined);
+    }
+    // Fall back to a unique basename match anywhere in the graph.
+    let base = header.rsplit('/').next().unwrap_or(header);
+    let matches: Vec<&str> = files
+        .iter()
+        .copied()
+        .filter(|f| f.rsplit('/').next() == Some(base))
+        .collect();
+    if matches.len() == 1 {
+        return Some(matches[0].to_string());
+    }
+    None
 }
 
 /// Join a forward-slash `rel` onto `dir`, resolving leading `../` segments.

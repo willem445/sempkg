@@ -105,3 +105,60 @@ return-type `references`), each with a justification. Whitelisted diffs are
 reported separately and do not count as parity failures. The offline gate
 `src/semgraph/tests/parity_offline.rs` exercises the golden DB against this
 whitelist and requires ≥95% node / ≥90% `calls` parity.
+
+## Tier-2 language goldens (`graph-src-tier2/`, issue #78 Phase 2c)
+
+`graph-src-tier2/<lang>/` holds a small **per-language** source tree (C, C++, Go,
+Java) exercising the same construct matrix as the tier-1 fixture — functions,
+methods, classes/structs/enums + members, imports/includes, top-level
+variables, type aliases/typedefs, and cross-file calls — and each is indexed
+**independently** into its own committed golden `codegraph-v4-<lang>.db`
+(CodeGraph 0.9.7, schema v4). The native indexer's parity against these goldens
+is asserted by `src/semgraph/tests/tier2_parity.rs`.
+
+Regenerate each golden from the repo root (same procedure as above, per dir):
+
+```bash
+codegraph --version   # -> 0.9.7
+for lang in c cpp go java; do
+  codegraph init --index tests/fixtures/graph-src-tier2/$lang
+  cp tests/fixtures/graph-src-tier2/$lang/.codegraph/codegraph.db \
+     tests/fixtures/codegraph-v4-$lang.db
+  rm -rf tests/fixtures/graph-src-tier2/$lang/.codegraph
+done
+```
+
+### Per-language node/edge kinds and CodeGraph 0.9.7 quirks
+
+The native indexer reproduces each golden's **nodes** and **`calls`/`contains`/
+`imports`/`instantiates`** edges exactly. The intentional deviations (the P2c
+whitelist, pinned in `tier2_parity.rs`) are:
+
+- **C** — no `variable` nodes for file-scope globals and no struct-field member
+  nodes (CodeGraph emits neither); function/typedef signatures are NULL; local
+  `#include "x.h"` resolves its `imports` edge to the included file's node.
+  Everything (nodes and all edges) matches exactly.
+- **C++** — namespaces are ignored (no node, not part of qualified names); a
+  method is captured at its out-of-line `Type::method` definition (in-class
+  declarations and fields are not nodes); all signatures NULL. *Known-better:*
+  we emit clean `///` docstrings where 0.9.7 keeps a stray leading `/` and
+  bleeds a trailing `// namespace geo` comment into `main`, and we omit the one
+  **spurious `extends` edge** 0.9.7 emits (it misreads an in-class method's
+  return type as a base class).
+- **Go** — `type X = Y` aliases emit no node while `type X int` definitions do
+  (kind `type_alias`); interfaces are `interface`, top-level consts are
+  `constant`; methods are receiver-qualified (`Point::DistanceTo`); `is_exported`
+  is set on type/func decls but not var/const/method. *Known-better:* we capture
+  Go type-declaration docstrings that 0.9.7 leaves NULL (it records only
+  func/method/var docs).
+- **Java** — `package` becomes a `namespace` node and every declaration is
+  qualified `package::Class::member`; fields are `field` nodes with `<type>
+  <name>` signatures; methods use `<return> (<params>)` (constructors omit the
+  return); `Class.method(...)` calls resolve by qualified name while instance
+  `recv.m(...)` calls are dropped. *Known-better:* one type reference whose name
+  collides with a constructor (`Point`) is resolved by 0.9.7 to the constructor
+  method; we resolve it to the class.
+
+These are the same class of *known-better* deviations ADR-003/ADR-004 already
+document for tier-1 (`is_async`, Rust/TS docstrings, language-scoped
+resolution).
