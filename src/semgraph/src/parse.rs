@@ -1072,7 +1072,9 @@ impl RecvCtx<'_> {
                 Some(RecvExpr::Return(Box::new(self.call_ref(recv, locals)?)))
             }
             // Transparent Rust wrappers around the real receiver expression.
-            "try_expression" | "await_expression" | "parenthesized_expression"
+            "try_expression"
+            | "await_expression"
+            | "parenthesized_expression"
             | "reference_expression" => self.recv_expr(recv.named_child(0)?, locals),
             _ => None,
         }
@@ -1166,9 +1168,10 @@ impl RecvCtx<'_> {
                         locals.insert("self".to_string(), RecvExpr::Type(t.to_string()));
                     }
                 } else if p.kind() == "parameter" {
-                    if let (Some(pat), Some(ty)) =
-                        (p.child_by_field_name("pattern"), p.child_by_field_name("type"))
-                    {
+                    if let (Some(pat), Some(ty)) = (
+                        p.child_by_field_name("pattern"),
+                        p.child_by_field_name("type"),
+                    ) {
                         if pat.kind() == "identifier" {
                             put(node_text(pat, self.src), node_text(ty, self.src));
                         }
@@ -1186,9 +1189,10 @@ impl RecvCtx<'_> {
             }
             Language::TypeScript | Language::Tsx | Language::JavaScript => {
                 if matches!(p.kind(), "required_parameter" | "optional_parameter") {
-                    if let (Some(pat), Some(ann)) =
-                        (p.child_by_field_name("pattern"), p.child_by_field_name("type"))
-                    {
+                    if let (Some(pat), Some(ann)) = (
+                        p.child_by_field_name("pattern"),
+                        p.child_by_field_name("type"),
+                    ) {
                         if pat.kind() == "identifier" {
                             let inner = ann.named_child(0).unwrap_or(ann);
                             put(node_text(pat, self.src), node_text(inner, self.src));
@@ -1229,9 +1233,10 @@ impl RecvCtx<'_> {
         match self.lang {
             Language::Rust => {
                 if node.kind() == "let_declaration" {
-                    if let (Some(pat), Some(val)) =
-                        (node.child_by_field_name("pattern"), node.child_by_field_name("value"))
-                    {
+                    if let (Some(pat), Some(val)) = (
+                        node.child_by_field_name("pattern"),
+                        node.child_by_field_name("value"),
+                    ) {
                         if pat.kind() == "identifier" {
                             if let Some(re) = self.value_type(val, locals) {
                                 locals.insert(node_text(pat, self.src).to_string(), re);
@@ -1262,9 +1267,10 @@ impl RecvCtx<'_> {
             }
             Language::TypeScript | Language::Tsx | Language::JavaScript => {
                 if node.kind() == "variable_declarator" {
-                    if let (Some(name), Some(val)) =
-                        (node.child_by_field_name("name"), node.child_by_field_name("value"))
-                    {
+                    if let (Some(name), Some(val)) = (
+                        node.child_by_field_name("name"),
+                        node.child_by_field_name("value"),
+                    ) {
                         if name.kind() == "identifier" {
                             // An explicit `: T` annotation wins over the initializer.
                             let re = node
@@ -1318,7 +1324,9 @@ impl RecvCtx<'_> {
     /// transparent wrapper (`v?`, `v.await`, `(v)`) → its inner value.
     fn value_type(&self, val: Node, locals: &HashMap<String, RecvExpr>) -> Option<RecvExpr> {
         match val.kind() {
-            "try_expression" | "await_expression" | "parenthesized_expression"
+            "try_expression"
+            | "await_expression"
+            | "parenthesized_expression"
             | "reference_expression" => self.value_type(val.named_child(0)?, locals),
             "struct_expression" => {
                 let name = val.child_by_field_name("name")?;
@@ -3230,7 +3238,9 @@ pub fn go(x: Unknown) {
         assert!(calls.iter().any(|q| q == "Row::cell"), "{calls:?}");
         // The un-inferrable `x.mystery()` is dropped (no `mystery` target).
         assert!(
-            !calls.iter().any(|q| q.ends_with("::mystery") || q == "mystery"),
+            !calls
+                .iter()
+                .any(|q| q.ends_with("::mystery") || q == "mystery"),
             "un-inferrable receiver must drop: {calls:?}"
         );
     }
@@ -3268,5 +3278,36 @@ def run(c: Client):
             .collect();
         assert!(calls.iter().any(|q| q == "Client::send"), "{calls:?}");
         assert!(calls.iter().any(|q| q == "Agent::ask"), "{calls:?}");
+    }
+
+    /// rev-44 BLOCKER (end-to-end): a TS/JS `T[]`-returning call must not
+    /// fabricate an element-type method call. `const list = items(); list.find()`
+    /// is `Array.prototype.find`, not `Query::find`.
+    #[test]
+    fn ts_array_return_does_not_fabricate_method_call() {
+        use crate::resolve::SymbolTable;
+        let src = "\
+class Query { run(): void {} }
+function items(): Query[] { return []; }
+function go(): void {
+  const list = items();
+  list.run();
+}
+";
+        let ex = extract(src, "a.ts", Language::TypeScript, 0, 0);
+        let edges = SymbolTable::build(&ex.nodes).resolve_all(&ex.sites);
+        let tqn = |id: &str| {
+            ex.nodes
+                .iter()
+                .find(|n| n.id == id)
+                .map(|n| n.qualified_name.clone())
+                .unwrap_or_default()
+        };
+        assert!(
+            !edges
+                .iter()
+                .any(|e| e.kind == "calls" && tqn(&e.target) == "Query::run"),
+            "list.run() on a Query[] must not resolve to Query::run"
+        );
     }
 }

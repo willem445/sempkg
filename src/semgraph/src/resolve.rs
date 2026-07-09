@@ -502,6 +502,45 @@ impl<'a> SymbolTable<'a> {
         })
     }
 
+    /// Like [`Self::resolve_qualified`] but **drops** on same-language ambiguity
+    /// instead of a lexicographic tie-break. Used when the resolved callee's
+    /// *return type* matters (return-type / chained inference): two same-named
+    /// methods can have different return types, so picking one arbitrarily would
+    /// fabricate a downstream edge. Same-file / imported-file evidence still pins
+    /// unambiguously; a genuinely ambiguous global name yields `None` — matching
+    /// the bare-name path (rev-44).
+    fn resolve_qualified_strict(
+        &self,
+        from_file: &str,
+        qn: &str,
+        kinds: &[&str],
+    ) -> Option<Resolved<'a>> {
+        let caller_lang = self.language_of(from_file);
+        let cands: Vec<usize> = self
+            .by_qn
+            .get(qn)
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|&i| kinds.contains(&self.nodes[i].kind.as_str()))
+            .filter(|&i| caller_lang.is_none_or(|l| self.nodes[i].language == l))
+            .collect();
+        let i = self
+            .pick(&cands, |n| n.file_path == from_file)
+            .or_else(|| {
+                self.imported_files.get(from_file).and_then(|imports| {
+                    self.pick(&cands, |n| imports.iter().any(|f| f == &n.file_path))
+                })
+            })
+            // No same-file/import pin: resolve only when globally unambiguous.
+            .or_else(|| (cands.len() == 1).then(|| cands[0]))?;
+        Some(Resolved {
+            node: &self.nodes[i],
+            resolved_by: "qualified-name",
+            confidence: 0.95,
+        })
+    }
+
     /// Type a method-call receiver ([`RecvExpr`]) to a concrete type name, or
     /// `None` if the evidence doesn't pin one. `depth` bounds a `a.b().c()…` chain.
     fn resolve_recv(&self, from_file: &str, recv: &RecvExpr, depth: usize) -> Option<String> {
@@ -537,13 +576,13 @@ impl<'a> SymbolTable<'a> {
             }
             CallRef::Qualified { qualifier, name } => {
                 let qn = format!("{qualifier}::{name}");
-                let r = self.resolve_qualified(from_file, &qn, CALLABLE_KINDS)?;
+                let r = self.resolve_qualified_strict(from_file, &qn, CALLABLE_KINDS)?;
                 self.return_type_of(r.node)
             }
             CallRef::Method { recv, name } => {
                 let ty = self.resolve_recv(from_file, recv, depth + 1)?;
                 let qn = format!("{ty}::{name}");
-                let r = self.resolve_qualified(from_file, &qn, CALLABLE_KINDS)?;
+                let r = self.resolve_qualified_strict(from_file, &qn, CALLABLE_KINDS)?;
                 self.return_type_of(r.node)
             }
         }
@@ -553,7 +592,17 @@ impl<'a> SymbolTable<'a> {
     /// for `Type::method` resolution. See [`Self::return_type_full`] for the
     /// generic-preserving form used by element inference.
     fn return_type_of(&self, node: &NodeRecord) -> Option<String> {
-        bare_type_name(&self.return_type_full(node)?)
+        let full = self.return_type_full(node)?;
+        // A collection or union return is NOT a project type to resolve methods
+        // on: `items(): Query[]` returns an Array (its `.find()` is
+        // Array.prototype.find, not Query::find), and `A | B` has no single type.
+        // Bare-naming would strip `Query[]` to `Query` and pick a union arm — both
+        // fabricate. The for-loop `Element` path uses `return_type_full` directly,
+        // so element inference still works.
+        if is_collection_type(&full) || is_union_type(&full) {
+            return None;
+        }
+        bare_type_name(&full)
     }
 
     /// The type a callable returns, keeping collection generics intact
@@ -578,22 +627,19 @@ impl<'a> SymbolTable<'a> {
 
     /// Like [`Self::callref_type`] but keeps the callee's full generic return type
     /// (`Vec<LocalPackage>`), so a loop variable's element type can be read.
-    fn callref_return_full(
-        &self,
-        from_file: &str,
-        cref: &CallRef,
-        depth: usize,
-    ) -> Option<String> {
+    fn callref_return_full(&self, from_file: &str, cref: &CallRef, depth: usize) -> Option<String> {
         let node = match cref {
             CallRef::Bare { name } => self.resolve_name(from_file, name, CALLABLE_KINDS)?.node,
             CallRef::Qualified { qualifier, name } => {
                 let qn = format!("{qualifier}::{name}");
-                self.resolve_qualified(from_file, &qn, CALLABLE_KINDS)?.node
+                self.resolve_qualified_strict(from_file, &qn, CALLABLE_KINDS)?
+                    .node
             }
             CallRef::Method { recv, name } => {
                 let ty = self.resolve_recv(from_file, recv, depth + 1)?;
                 let qn = format!("{ty}::{name}");
-                self.resolve_qualified(from_file, &qn, CALLABLE_KINDS)?.node
+                self.resolve_qualified_strict(from_file, &qn, CALLABLE_KINDS)?
+                    .node
             }
         };
         self.return_type_full(node)
@@ -826,16 +872,96 @@ fn unwrap_transparent(ty: &str) -> &str {
     cur
 }
 
+/// Container type constructors whose value is a collection, not a single project
+/// type — a method call on the whole value is a collection method, not the
+/// element's. Covers Rust, TS/JS, and Python typing names.
+const CONTAINERS: &[&str] = &[
+    "Vec",
+    "VecDeque",
+    "Deque",
+    "Array",
+    "ReadonlyArray",
+    "HashMap",
+    "BTreeMap",
+    "IndexMap",
+    "HashSet",
+    "BTreeSet",
+    "IndexSet",
+    "FrozenSet",
+    "Set",
+    "Map",
+    "List",
+    "Dict",
+    "Tuple",
+    "Sequence",
+    "Iterator",
+    "Iterable",
+];
+
+/// Whether a return-type string is a collection — a postfix array (`T[]`,
+/// `readonly T[]`), a Rust slice (`[T]`), or a known container generic
+/// (`Vec<T>` / `Array<T>` / `List[T]` …). Such a value's `.method()` is a
+/// collection method, so it must not type a receiver (only its element type can,
+/// via the for-loop `Element` path).
+fn is_collection_type(ty: &str) -> bool {
+    let mut t = ty.trim();
+    t = t.strip_prefix("readonly ").unwrap_or(t).trim();
+    t = t.trim_start_matches('&').trim();
+    t = t.strip_prefix("mut ").unwrap_or(t).trim();
+    if t.ends_with("[]") || t.starts_with('[') {
+        return true;
+    }
+    if let Some(open) = t.find(['<', '[']) {
+        let name = t[..open]
+            .trim()
+            .rsplit([':', '.'])
+            .next()
+            .unwrap_or("")
+            .trim();
+        if CONTAINERS.contains(&name) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether a return-type string is a top-level union (`A | B`, TS) — no single
+/// type to resolve a method on, so it types nothing.
+fn is_union_type(ty: &str) -> bool {
+    let mut depth = 0i32;
+    for c in ty.chars() {
+        match c {
+            '<' | '[' | '(' => depth += 1,
+            '>' | ']' | ')' => depth -= 1,
+            '|' if depth == 0 => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
 /// The element type NAME of a collection type: `Vec<Pkg>` / `&[Pkg]` /
-/// `VecDeque<Pkg>` / `HashSet<Pkg>` → `Pkg`. The first type argument of the
-/// outermost `<…>`/`[…]`, bare-named. `None` if there is no bracketed element
-/// (e.g. a scalar return type — not a collection to iterate).
+/// `VecDeque<Pkg>` / `HashSet<Pkg>` → `Pkg`, and a postfix array `Pkg[]` → `Pkg`.
+/// The first type argument of the outermost `<…>`/`[…]` (or the base of a postfix
+/// array), bare-named. `None` if there is no element to read.
 fn element_type(ty: &str) -> Option<String> {
-    let ty = ty.trim().trim_start_matches('&').trim();
-    let ty = ty.strip_prefix("mut ").unwrap_or(ty).trim();
-    let open = ty.find(['<', '['])?;
-    let inner = first_generic_arg(&ty[open..])?;
-    bare_type_name(inner)
+    let mut ty = ty.trim();
+    ty = ty.strip_prefix("readonly ").unwrap_or(ty).trim();
+    ty = ty.trim_start_matches('&').trim();
+    ty = ty.strip_prefix("mut ").unwrap_or(ty).trim();
+    // Postfix array `T[]` → `T`; else the first type argument of `Vec<T>`/`[T]`.
+    let elem = if let Some(base) = ty.strip_suffix("[]") {
+        base.trim()
+    } else {
+        let open = ty.find(['<', '['])?;
+        first_generic_arg(&ty[open..])?
+    };
+    // An element that is itself a collection or union types nothing (a method on
+    // a `Vec<Vec<T>>`/`T[][]` element is a collection method).
+    if is_collection_type(elem) || is_union_type(elem) {
+        return None;
+    }
+    bare_type_name(elem)
 }
 
 /// The first type argument of a `<A, B>` / `[A, B]` list (given the slice
@@ -1178,19 +1304,34 @@ mod tests {
     #[test]
     fn extract_return_type_and_element_parse_signatures() {
         // Rust `->`, TS `):`, wrapper unwrap, Self passthrough, fn-typed param.
-        assert_eq!(extract_return_type("(&self) -> Scalar").as_deref(), Some("Scalar"));
+        assert_eq!(
+            extract_return_type("(&self) -> Scalar").as_deref(),
+            Some("Scalar")
+        );
         assert_eq!(
             extract_return_type("(p: &Path) -> Result<GraphDb>").as_deref(),
             Some("GraphDb")
         );
-        assert_eq!(extract_return_type("(): Promise<Foo>").as_deref(), Some("Foo"));
-        assert_eq!(extract_return_type("(self) -> Optional[Bar]").as_deref(), Some("Bar"));
-        assert_eq!(extract_return_type("(r: f64) -> Self").as_deref(), Some("Self"));
+        assert_eq!(
+            extract_return_type("(): Promise<Foo>").as_deref(),
+            Some("Foo")
+        );
+        assert_eq!(
+            extract_return_type("(self) -> Optional[Bar]").as_deref(),
+            Some("Bar")
+        );
+        assert_eq!(
+            extract_return_type("(r: f64) -> Self").as_deref(),
+            Some("Self")
+        );
         assert_eq!(extract_return_type("(a: i32)").as_deref(), None); // no return type
-        // A `->` inside a fn-typed parameter must not be read as the return type.
+                                                                      // A `->` inside a fn-typed parameter must not be read as the return type.
         assert_eq!(extract_return_type("(f: fn() -> i32)").as_deref(), None);
         // Element type of a collection return.
-        assert_eq!(element_type("Vec<LocalPackage>").as_deref(), Some("LocalPackage"));
+        assert_eq!(
+            element_type("Vec<LocalPackage>").as_deref(),
+            Some("LocalPackage")
+        );
         assert_eq!(element_type("&[Pkg]").as_deref(), Some("Pkg"));
         assert_eq!(element_type("GraphDb"), None); // not a collection
     }
@@ -1206,7 +1347,14 @@ mod tests {
         let nodes = vec![
             node("file", "a.rs", "a.rs", "a.rs", "rust"),
             caller,
-            node_sig("function", "open", "open", "a.rs", "rust", "(p: &Path) -> Result<GraphDb>"),
+            node_sig(
+                "function",
+                "open",
+                "open",
+                "a.rs",
+                "rust",
+                "(p: &Path) -> Result<GraphDb>",
+            ),
             node("struct", "GraphDb", "GraphDb", "a.rs", "rust"),
             query,
         ];
@@ -1232,7 +1380,13 @@ mod tests {
     fn chained_call_resolves_via_inner_return_type() {
         let caller = node("function", "f", "f", "a.rs", "rust");
         let cid = caller.id.clone();
-        let resolve_all = node("method", "resolve_all", "SymbolTable::resolve_all", "a.rs", "rust");
+        let resolve_all = node(
+            "method",
+            "resolve_all",
+            "SymbolTable::resolve_all",
+            "a.rs",
+            "rust",
+        );
         let rid = resolve_all.id.clone();
         let nodes = vec![
             node("file", "a.rs", "a.rs", "a.rs", "rust"),
@@ -1271,12 +1425,25 @@ mod tests {
     fn for_loop_element_type_resolves_method() {
         let caller = node("function", "run", "run", "a.rs", "rust");
         let cid = caller.id.clone();
-        let abs = node("method", "abs_path", "LocalPackage::abs_path", "a.rs", "rust");
+        let abs = node(
+            "method",
+            "abs_path",
+            "LocalPackage::abs_path",
+            "a.rs",
+            "rust",
+        );
         let aid = abs.id.clone();
         let nodes = vec![
             node("file", "a.rs", "a.rs", "a.rs", "rust"),
             caller,
-            node_sig("function", "list", "list", "a.rs", "rust", "() -> Vec<LocalPackage>"),
+            node_sig(
+                "function",
+                "list",
+                "list",
+                "a.rs",
+                "rust",
+                "() -> Vec<LocalPackage>",
+            ),
             node("struct", "LocalPackage", "LocalPackage", "a.rs", "rust"),
             abs,
         ];
@@ -1285,7 +1452,9 @@ mod tests {
             line: 2,
             col: 0,
             payload: SitePayload::MethodCall {
-                recv: Some(RecvExpr::Element(Box::new(CallRef::Bare { name: "list".into() }))),
+                recv: Some(RecvExpr::Element(Box::new(CallRef::Bare {
+                    name: "list".into(),
+                }))),
                 name: "abs_path".into(),
             },
         };
@@ -1316,7 +1485,9 @@ mod tests {
             line: 2,
             col: 0,
             payload: SitePayload::MethodCall {
-                recv: Some(RecvExpr::Return(Box::new(CallRef::Bare { name: "open".into() }))),
+                recv: Some(RecvExpr::Return(Box::new(CallRef::Bare {
+                    name: "open".into(),
+                }))),
                 name: "query".into(),
             },
         };
@@ -1338,7 +1509,14 @@ mod tests {
         let nodes = vec![
             node("file", "a.rs", "a.rs", "a.rs", "rust"),
             caller,
-            node_sig("method", "origin", "Point::origin", "a.rs", "rust", "() -> Self"),
+            node_sig(
+                "method",
+                "origin",
+                "Point::origin",
+                "a.rs",
+                "rust",
+                "() -> Self",
+            ),
             node("struct", "Point", "Point", "a.rs", "rust"),
             dist,
         ];
@@ -1374,12 +1552,200 @@ mod tests {
             line: 2,
             col: 0,
             payload: SitePayload::MethodCall {
-                recv: Some(RecvExpr::Return(Box::new(CallRef::Bare { name: "Agent".into() }))),
+                recv: Some(RecvExpr::Return(Box::new(CallRef::Bare {
+                    name: "Agent".into(),
+                }))),
                 name: "ask".into(),
             },
         };
         let pedges = SymbolTable::build(&pnodes).resolve_all(&[psite]);
         assert_eq!(pedges.len(), 1);
         assert_eq!(pedges[0].target, ask_id);
+    }
+
+    #[test]
+    fn collection_and_union_type_detection() {
+        assert!(is_collection_type("Query[]"));
+        assert!(is_collection_type("readonly Query[]"));
+        assert!(is_collection_type("Query[][]"));
+        assert!(is_collection_type("&[Pkg]"));
+        assert!(is_collection_type("Vec<Pkg>"));
+        assert!(is_collection_type("Array<Query>"));
+        assert!(is_collection_type("List[Pkg]"));
+        assert!(!is_collection_type("GraphDb"));
+        assert!(!is_collection_type("Result")); // a bare wrapper name, not a collection
+        assert!(is_union_type("A | B"));
+        assert!(is_union_type("Foo<A | B> | Bar"));
+        assert!(!is_union_type("Foo<A | B>")); // the `|` is nested
+        assert!(!is_union_type("GraphDb"));
+        // Element extraction, incl. postfix arrays and nested-collection rejection.
+        assert_eq!(element_type("Query[]").as_deref(), Some("Query"));
+        assert_eq!(element_type("Vec<Pkg>").as_deref(), Some("Pkg"));
+        assert_eq!(element_type("&[Pkg]").as_deref(), Some("Pkg"));
+        assert_eq!(element_type("Vec<Vec<T>>"), None); // element is itself a collection
+        assert_eq!(element_type("T[][]"), None);
+    }
+
+    /// rev-44 BLOCKER: a `T[]`-returning call must NOT type the receiver as `T`
+    /// (`list = items(); list.find()` is `Array.prototype.find`, not `Query::find`).
+    /// The for-loop `Element` path over the same call still resolves.
+    #[test]
+    fn ts_array_return_does_not_fabricate_but_element_does() {
+        let caller = node("function", "f", "f", "a.ts", "typescript");
+        let cid = caller.id.clone();
+        let run = node("method", "run", "Query::run", "a.ts", "typescript");
+        let run_id = run.id.clone();
+        let base = vec![
+            node("file", "a.ts", "a.ts", "a.ts", "typescript"),
+            caller,
+            node_sig(
+                "function",
+                "items",
+                "items",
+                "a.ts",
+                "typescript",
+                "(): Query[]",
+            ),
+            node("class", "Query", "Query", "a.ts", "typescript"),
+            run,
+        ];
+        let mk = |recv: RecvExpr| RawSite {
+            from_id: cid.clone(),
+            line: 2,
+            col: 0,
+            payload: SitePayload::MethodCall {
+                recv: Some(recv),
+                name: "run".into(),
+            },
+        };
+        // `const list = items(); list.run()` — list is an Array, NOT a Query.
+        let ret_edges = SymbolTable::build(&base).resolve_all(&[mk(RecvExpr::Return(Box::new(
+            CallRef::Bare {
+                name: "items".into(),
+            },
+        )))]);
+        assert!(
+            ret_edges.is_empty(),
+            "T[] return must not type the receiver as T: {ret_edges:?}"
+        );
+        // `for x of items() { x.run() }` — x IS a Query.
+        let elem_edges = SymbolTable::build(&base).resolve_all(&[mk(RecvExpr::Element(Box::new(
+            CallRef::Bare {
+                name: "items".into(),
+            },
+        )))]);
+        assert_eq!(elem_edges.len(), 1, "element path should resolve");
+        assert_eq!(elem_edges[0].target, run_id);
+    }
+
+    /// rev-44 (1): a union return type `A | B` types nothing (no arbitrary pick).
+    #[test]
+    fn union_return_type_yields_no_receiver() {
+        let caller = node("function", "f", "f", "a.ts", "typescript");
+        let cid = caller.id.clone();
+        let nodes = vec![
+            node("file", "a.ts", "a.ts", "a.ts", "typescript"),
+            caller,
+            node_sig(
+                "function",
+                "pick",
+                "pick",
+                "a.ts",
+                "typescript",
+                "(): A | B",
+            ),
+            node("class", "A", "A", "a.ts", "typescript"),
+            node("method", "m", "A::m", "a.ts", "typescript"),
+        ];
+        let site = RawSite {
+            from_id: cid,
+            line: 2,
+            col: 0,
+            payload: SitePayload::MethodCall {
+                recv: Some(RecvExpr::Return(Box::new(CallRef::Bare {
+                    name: "pick".into(),
+                }))),
+                name: "m".into(),
+            },
+        };
+        assert!(SymbolTable::build(&nodes).resolve_all(&[site]).is_empty());
+    }
+
+    /// rev-44 (2): the qualified/chained callee path DROPS on same-language
+    /// ambiguity (two `T::make` with different return types) — the wrong-of-two
+    /// standard applies to every path, not just the bare-name one.
+    #[test]
+    fn ambiguous_qualified_callee_return_type_drops() {
+        let caller = node("function", "f", "f", "top.rs", "rust");
+        let cid = caller.id.clone();
+        let nodes = vec![
+            node("file", "top.rs", "top.rs", "top.rs", "rust"),
+            node("file", "a.rs", "a.rs", "a.rs", "rust"),
+            node("file", "b.rs", "b.rs", "b.rs", "rust"),
+            caller,
+            // Two `T::make`, different files, DIFFERENT return types.
+            node_sig("method", "make", "T::make", "a.rs", "rust", "() -> GraphDb"),
+            node_sig("method", "make", "T::make", "b.rs", "rust", "() -> Widget"),
+            node("struct", "GraphDb", "GraphDb", "a.rs", "rust"),
+            node("method", "query", "GraphDb::query", "a.rs", "rust"),
+        ];
+        let site = RawSite {
+            from_id: cid,
+            line: 2,
+            col: 0,
+            payload: SitePayload::MethodCall {
+                recv: Some(RecvExpr::Return(Box::new(CallRef::Qualified {
+                    qualifier: "T".into(),
+                    name: "make".into(),
+                }))),
+                name: "query".into(),
+            },
+        };
+        assert!(
+            SymbolTable::build(&nodes).resolve_all(&[site]).is_empty(),
+            "ambiguous T::make must drop, not tie-break"
+        );
+    }
+
+    /// rev-44 (3, defensive): a chain through a trait default method that returns
+    /// `Self` drops on a concrete impl type that has no own copy of the method,
+    /// so a refactor can't turn it into a fabrication. `w.make().other()` with
+    /// `w: Widget` and only `Tr::make` defined → `Widget::make` doesn't resolve.
+    #[test]
+    fn self_on_trait_default_method_chain_drops() {
+        let caller = node("function", "f", "f", "a.rs", "rust");
+        let cid = caller.id.clone();
+        let nodes = vec![
+            node("file", "a.rs", "a.rs", "a.rs", "rust"),
+            caller,
+            node("trait", "Tr", "Tr", "a.rs", "rust"),
+            node_sig(
+                "method",
+                "make",
+                "Tr::make",
+                "a.rs",
+                "rust",
+                "(&self) -> Self",
+            ),
+            node("method", "other", "Tr::other", "a.rs", "rust"),
+            node("struct", "Widget", "Widget", "a.rs", "rust"),
+        ];
+        // `w.make().other()` with `w: Widget` — no `Widget::make` node exists.
+        let site = RawSite {
+            from_id: cid,
+            line: 2,
+            col: 0,
+            payload: SitePayload::MethodCall {
+                recv: Some(RecvExpr::Return(Box::new(CallRef::Method {
+                    recv: RecvExpr::Type("Widget".into()),
+                    name: "make".into(),
+                }))),
+                name: "other".into(),
+            },
+        };
+        assert!(
+            SymbolTable::build(&nodes).resolve_all(&[site]).is_empty(),
+            "trait-default Self chain on a concrete type must drop"
+        );
     }
 }

@@ -260,8 +260,17 @@ variables** iterating a typed collection. Inference is strictly evidence-based
 (a resolved return type or annotation), never name-frequency; semgraph still emits
 **zero** fabricated calls.
 
-Measured on this repo's `src/` (live, convention-normalized): `calls` **83.4% →
-86.3%**, and the true *genuine*-calls recall (fabrications excluded from the
+A return type that is itself a **collection** (a postfix array `T[]`, a slice, or
+a `Vec`/`Array`/`List`… generic) or a **union** (`A | B`) types *nothing* on the
+`Return` path: the value is an array/union, so `.method()` on it is a collection
+method, not the element's — and a `T[]` receiver must not be read as `T` (only the
+for-loop `Element` path reads the element type). Likewise the qualified/chained
+callee path **drops** on same-language ambiguity rather than tie-breaking (two
+same-named methods can return different types). These guards keep the "zero
+fabricated calls" invariant total across every path (rev-44).
+
+Measured on this repo's `src/` (live, convention-normalized): `calls` **83.2% →
+86.4%**, and the true *genuine*-calls recall (fabrications excluded from the
 denominator) **~82.6% → ~86.8%**. The remaining genuine gap is receivers with no
 static evidence — untyped Python fixture parameters and iteration over a bare
 local collection — which remain dropped rather than guessed.
