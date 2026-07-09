@@ -82,6 +82,7 @@ use thiserror::Error;
 
 pub mod index;
 pub mod model;
+pub mod parity;
 pub mod parse;
 pub(crate) mod resolve;
 pub mod writer;
@@ -90,6 +91,7 @@ pub use index::{
     index_roots, namespaces_for_roots, resolve_stored_path, sync, IndexOptions, IndexStats,
 };
 pub use model::{content_hash, node_id, EdgeRecord, FileRecord, Language, NodeRecord};
+pub use parity::{compare, extract_parity, CompareOptions, Graph, ParityReport, Whitelist};
 pub use parse::{extract, FileExtract};
 pub use writer::GraphWriter;
 

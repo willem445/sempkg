@@ -94,3 +94,14 @@ rm -rf tests/fixtures/graph-src/.codegraph
 If you ever regenerate this fixture with a newer CodeGraph, update the schema
 version, counts, and quirk notes above — and be aware that doing so changes the
 compatibility contract the reader is tested against.
+
+## `parity-whitelist.json`
+
+The parity harness (issue #78 Phase 2c; `docs/parity-harness.md`) diffs a
+semgraph-built graph against `codegraph-v4.db`. `parity-whitelist.json` lists the
+**known-better** deviations from CodeGraph 0.9.7 recorded in ADR-003/ADR-004
+(`is_async` correctness, docstring cleanups, and the CodeGraph duplicate
+return-type `references`), each with a justification. Whitelisted diffs are
+reported separately and do not count as parity failures. The offline gate
+`src/semgraph/tests/parity_offline.rs` exercises the golden DB against this
+whitelist and requires ≥95% node / ≥90% `calls` parity.

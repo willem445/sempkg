@@ -5467,9 +5467,11 @@ dependencies = [
 name = "semgraph"
 version = "0.6.0"
 dependencies = [
+ "clap",
  "hex",
  "rayon",
  "rusqlite",
+ "serde",
  "serde_json",
  "sha2 0.11.0",
  "streaming-iterator",
@@ -5480,6 +5482,7 @@ dependencies = [
  "tree-sitter-rust",
  "tree-sitter-typescript",
  "walkdir",
+ "which",
 ]
 
 [[package]]
