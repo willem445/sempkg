@@ -25,14 +25,6 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@v5
 
-      - name: Install Node.js
-        uses: actions/setup-node@v6
-        with:
-          node-version: "lts/*"
-
-      - name: Install codegraph
-        run: npm install -g @colbymchenry/codegraph
-
       - name: Install dependencies
         run: uv pip install --system -e ".[dev]"
 
@@ -175,14 +167,6 @@ jobs:
 
       - name: Install Python test dependencies
         run: uv pip install --system pytest
-
-      - name: Install Node.js
-        uses: actions/setup-node@v6
-        with:
-          node-version: "lts/*"
-
-      - name: Install codegraph CLI (required by sembundle indexer)
-        run: npm install -g @colbymchenry/codegraph
 
       # ---- Rust build dependencies ----
 
