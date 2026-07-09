@@ -1,7 +1,8 @@
 //! Incremental-sync tests (issue #78, Phase 2b).
 //!
 //! Every scenario (no-op / modify-callee / modify-caller / add / delete /
-//! rename) asserts the same invariant: after [`sync`], the database is
+//! rename / competing-definition multiplicity flip) asserts the same invariant:
+//! after [`sync`], the database is
 //! **canonically equal** to a from-scratch [`index_roots`] of the same tree —
 //! identical nodes, edges, and files, ignoring only the autoincrement
 //! `edges.id` and the wall-clock `updated_at` / `modified_at` / `indexed_at`
@@ -379,4 +380,75 @@ fn callee_change_updates_unedited_caller_edges() {
         "callee rename: sync must equal from-scratch"
     );
     assert_healthy(&db);
+}
+
+/// Case (c) — the hardest invalidation path: editing file A changes the *global
+/// multiplicity* of a symbol name, which must flip an edge between two OTHER
+/// files (B → C) that A never references directly. B is unchanged on disk, yet
+/// its edge must be recomputed. This exercises the `delta_names` clause of the
+/// invalidation set (target-file-only tracing would miss it). Sync must equal a
+/// from-scratch index.
+#[test]
+fn competing_definition_flips_edge_between_other_files() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path().join("src");
+    let pkg = root.join("pkg");
+    fs::create_dir_all(&pkg).unwrap();
+    // C defines `target`; B calls it. No competitor yet → `target` is unique, so
+    // B → C resolves.
+    fs::write(pkg.join("c.py"), "def target():\n    return 1\n").unwrap();
+    fs::write(pkg.join("b.py"), "def caller():\n    return target()\n").unwrap();
+    let db = dir.path().join("codegraph.db");
+    index_roots(std::slice::from_ref(&root), &db, &IndexOptions::default()).unwrap();
+
+    // Where does B's `caller` resolve its `target()` call?
+    let caller_target_files = |db: &Path| -> Vec<String> {
+        let conn = Connection::open(db).unwrap();
+        let mut st = conn
+            .prepare(
+                "SELECT t.file_path FROM edges e \
+                 JOIN nodes s ON s.id = e.source JOIN nodes t ON t.id = e.target \
+                 WHERE e.kind='calls' AND s.qualified_name='caller' AND t.name='target'",
+            )
+            .unwrap();
+        let mut v: Vec<String> = st
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        v.sort();
+        v
+    };
+    assert_eq!(
+        caller_target_files(&db),
+        vec!["pkg/c.py".to_string()],
+        "baseline: B → C edge present (target is globally unique)"
+    );
+
+    // Add a COMPETING `target` in a new file A in the same package. `target` is
+    // now ambiguous (A and C, same dir), so B's call no longer resolves — the
+    // B → C edge must disappear, though A never mentions B or C.
+    fs::write(pkg.join("a.py"), "def target():\n    return 2\n").unwrap();
+    sync(std::slice::from_ref(&root), &db, &IndexOptions::default()).unwrap();
+
+    assert!(
+        caller_target_files(&db).is_empty(),
+        "competing definition must drop B's now-ambiguous call edge, got {:?}",
+        caller_target_files(&db)
+    );
+    assert_healthy(&db);
+
+    // And the whole DB equals a from-scratch index of the same tree.
+    let scratch = dir.path().join("scratch.db");
+    index_roots(
+        std::slice::from_ref(&root),
+        &scratch,
+        &IndexOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        snapshot(&db),
+        snapshot(&scratch),
+        "case-(c) multiplicity flip: sync must equal from-scratch"
+    );
 }

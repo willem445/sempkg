@@ -103,6 +103,11 @@ pub(crate) struct SymbolTable<'a> {
     /// For each file path, the set of *other* file paths it imports (resolved
     /// from its import statements) — the "import-target" precedence tier.
     imported_files: HashMap<&'a str, Vec<String>>,
+    /// Node id → its `file_path`, so resolving a site's `from_id` is O(1) rather
+    /// than an O(nodes) scan per site.
+    id_to_file: HashMap<&'a str, &'a str>,
+    /// File path → its `language`, so language scoping is O(1) per lookup.
+    file_to_lang: HashMap<&'a str, &'a str>,
 }
 
 impl<'a> SymbolTable<'a> {
@@ -118,7 +123,13 @@ impl<'a> SymbolTable<'a> {
             .map(|n| n.file_path.as_str())
             .collect();
 
+        let mut id_to_file: HashMap<&str, &str> = HashMap::with_capacity(nodes.len());
+        let mut file_to_lang: HashMap<&str, &str> = HashMap::new();
         for (i, n) in nodes.iter().enumerate() {
+            id_to_file.insert(n.id.as_str(), n.file_path.as_str());
+            file_to_lang
+                .entry(n.file_path.as_str())
+                .or_insert(n.language.as_str());
             if n.kind == "file" || n.kind == "import" {
                 continue;
             }
@@ -142,6 +153,8 @@ impl<'a> SymbolTable<'a> {
             by_name,
             by_qn,
             imported_files,
+            id_to_file,
+            file_to_lang,
         }
     }
 
@@ -312,18 +325,21 @@ impl<'a> SymbolTable<'a> {
         None
     }
 
-    /// The `language` recorded for `file_path` (from any of its nodes).
+    /// The `language` recorded for `file_path` (O(1) via [`Self::file_to_lang`]).
     fn language_of(&self, file_path: &str) -> Option<&'a str> {
-        self.nodes
-            .iter()
-            .find(|n| n.file_path == file_path)
-            .map(|n| n.language.as_str())
+        self.file_to_lang.get(file_path).copied()
     }
 
-    /// Resolve an explicit `qualified_name`. Qualified calls are unambiguous by
-    /// construction, so on a tie we still pick deterministically (same-file →
-    /// import → lexicographic) rather than dropping.
+    /// Resolve an explicit `qualified_name` (a Rust `A::b` path call, or a method
+    /// call whose receiver type was inferred). Candidates are **language-scoped**
+    /// to the caller's file first — a qualified name that collides across
+    /// languages (e.g. Rust `Point::dist` and TS `Point::dist`) must never
+    /// resolve a Rust call to the TypeScript symbol. If the caller's language has
+    /// no matching definition we **drop** (precision over recall), rather than
+    /// falling back to a foreign symbol. Within the caller's language, ties break
+    /// same-file → import-target → lexicographically.
     fn resolve_qualified(&self, from_file: &str, qn: &str, kinds: &[&str]) -> Option<Resolved<'a>> {
+        let caller_lang = self.language_of(from_file);
         let cands: Vec<usize> = self
             .by_qn
             .get(qn)
@@ -331,6 +347,7 @@ impl<'a> SymbolTable<'a> {
             .flatten()
             .copied()
             .filter(|&i| kinds.contains(&self.nodes[i].kind.as_str()))
+            .filter(|&i| caller_lang.is_none_or(|l| self.nodes[i].language == l))
             .collect();
         if cands.is_empty() {
             return None;
@@ -372,11 +389,9 @@ impl<'a> SymbolTable<'a> {
             })
     }
 
+    /// The `file_path` owning `node_id` (O(1) via [`Self::id_to_file`]).
     fn file_of(&self, node_id: &str) -> Option<&'a str> {
-        self.nodes
-            .iter()
-            .find(|n| n.id == node_id)
-            .map(|n| n.file_path.as_str())
+        self.id_to_file.get(node_id).copied()
     }
 
     fn edge(&self, site: &RawSite, kind: &str, r: &Resolved<'a>) -> EdgeRecord {
@@ -552,6 +567,91 @@ mod tests {
         assert_eq!(
             resolve_module_to_file("python/main.py", "asyncio", &files),
             None
+        );
+    }
+
+    // ---- cross-language resolution guard (rev-21 blocking finding) ----------
+
+    fn node(kind: &str, name: &str, qn: &str, file: &str, lang: &str) -> NodeRecord {
+        NodeRecord::new(kind, name, qn, file, lang, 1, 3, 0, 0, 0)
+    }
+
+    fn method_call_site(from_id: &str, recv_type: &str, name: &str) -> RawSite {
+        RawSite {
+            from_id: from_id.to_string(),
+            line: 2,
+            col: 4,
+            payload: SitePayload::MethodCall {
+                recv_type: Some(recv_type.to_string()),
+                name: name.to_string(),
+            },
+        }
+    }
+
+    /// A qualified/method call must NEVER resolve across a language boundary,
+    /// even when the `qualified_name` collides. A Rust `p.dist()` (receiver typed
+    /// `Point`) with no Rust `Point::dist` must DROP, not fall through to a
+    /// TypeScript `Point::dist` via the lexicographic tie-break. The golden
+    /// fixture has no such collision, so this case is constructed explicitly.
+    #[test]
+    fn qualified_call_never_resolves_across_languages() {
+        let go = node("function", "go", "go", "go.rs", "rust");
+        let go_id = go.id.clone();
+        let base = vec![
+            node("file", "go.rs", "go.rs", "go.rs", "rust"),
+            node("file", "geo.ts", "geo.ts", "geo.ts", "typescript"),
+            go,
+            node("class", "Point", "Point", "geo.ts", "typescript"),
+            // A TypeScript Point::dist — the ONLY definition of that qualified name.
+            node("method", "dist", "Point::dist", "geo.ts", "typescript"),
+        ];
+
+        // Rust caller: p.dist() with p: Point, but there is no *Rust* Point::dist.
+        let edges =
+            SymbolTable::build(&base).resolve_all(&[method_call_site(&go_id, "Point", "dist")]);
+        assert!(
+            edges.is_empty(),
+            "a Rust call must not resolve to a TypeScript Point::dist: {edges:?}"
+        );
+
+        // Positive control: add a Rust Point::dist → now it resolves, and to the
+        // Rust one (same language), never the TypeScript collision.
+        let mut with_rust = base.clone();
+        with_rust.push(node("method", "dist", "Point::dist", "go.rs", "rust"));
+        let edges = SymbolTable::build(&with_rust)
+            .resolve_all(&[method_call_site(&go_id, "Point", "dist")]);
+        assert_eq!(edges.len(), 1, "should resolve within Rust");
+        assert_eq!(edges[0].kind, "calls");
+        let target = with_rust.iter().find(|n| n.id == edges[0].target).unwrap();
+        assert_eq!(target.file_path, "go.rs");
+        assert_eq!(target.language, "rust");
+    }
+
+    /// The same guard for an explicit Rust path call `Point::new(..)`: a bare
+    /// qualified call to a name that exists only in another language drops.
+    #[test]
+    fn explicit_qualified_path_call_is_language_scoped() {
+        let caller = node("function", "make", "make", "a.rs", "rust");
+        let caller_id = caller.id.clone();
+        let nodes = vec![
+            node("file", "a.rs", "a.rs", "a.rs", "rust"),
+            node("file", "b.ts", "b.ts", "b.ts", "typescript"),
+            caller,
+            node("method", "new", "Widget::new", "b.ts", "typescript"),
+        ];
+        let site = RawSite {
+            from_id: caller_id,
+            line: 2,
+            col: 4,
+            payload: SitePayload::QualifiedCall {
+                qualifier: "Widget".to_string(),
+                name: "new".to_string(),
+            },
+        };
+        let edges = SymbolTable::build(&nodes).resolve_all(&[site]);
+        assert!(
+            edges.is_empty(),
+            "Rust Widget::new() must not resolve to a TS Widget::new: {edges:?}"
         );
     }
 }

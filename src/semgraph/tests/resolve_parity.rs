@@ -3,10 +3,10 @@
 //!
 //! The compatibility contract for resolution: a native `index_roots` of
 //! `tests/fixtures/graph-src` must reproduce CodeGraph's **`calls`** edges
-//! exactly (source qn, target qn, kind, line) — the graded metric (≥90% per the
-//! issue; we hold 100% on the fixture) — and its `imports`/`instantiates` edges
-//! exactly. `references` are reproduced up to a small, documented whitelist of
-//! CodeGraph return-type duplicate emissions (see `WHITELIST` below).
+//! exactly (source qn, target qn, kind, line, **col**) — the graded metric (≥90%
+//! per the issue; we hold 100% on the fixture) — and its `imports`/
+//! `instantiates` edges exactly. `references` are reproduced up to a small,
+//! documented whitelist of CodeGraph return-type duplicate emissions.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -21,17 +21,18 @@ fn golden_db() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/codegraph-v4.db")
 }
 
-/// An edge as `(source_qn, target_qn, kind, line)` — the parity key. `line` is
-/// the call-site line (`edges.line`).
-type EdgeKey = (String, String, String, i64);
+/// An edge as `(source_qn, target_qn, kind, line, col)` — the parity key.
+/// `line`/`col` are the call-site coordinates (`edges.line`/`edges.col`).
+type EdgeKey = (String, String, String, i64, i64);
 
 /// Read every non-`contains` edge from `db_path`, joined back to node
-/// qualified names, keyed by `(source_qn, target_qn, kind, line)`.
+/// qualified names, keyed by `(source_qn, target_qn, kind, line, col)`.
 fn edge_keys(db_path: &Path, kind: &str) -> Vec<EdgeKey> {
     let conn = rusqlite::Connection::open(db_path).unwrap();
     let mut stmt = conn
         .prepare(
-            "SELECT s.qualified_name, t.qualified_name, e.kind, COALESCE(e.line, -1) \
+            "SELECT s.qualified_name, t.qualified_name, e.kind, \
+                    COALESCE(e.line, -1), COALESCE(e.col, -1) \
              FROM edges e JOIN nodes s ON s.id = e.source JOIN nodes t ON t.id = e.target \
              WHERE e.kind = ?1",
         )
@@ -42,6 +43,7 @@ fn edge_keys(db_path: &Path, kind: &str) -> Vec<EdgeKey> {
             r.get::<_, String>(1)?,
             r.get::<_, String>(2)?,
             r.get::<_, i64>(3)?,
+            r.get::<_, i64>(4)?,
         ))
     })
     .unwrap()

@@ -45,14 +45,20 @@ The compatibility contract remains `tests/fixtures/codegraph-v4.db` (CodeGraph
   so the same tree yields the same edges every run. Ambiguity is broken by a
   fixed precedence, then lexicographically by `file_path`.
 - **Precedence** (matching CodeGraph 0.9.7's name-based heuristics): for a bare
-  name, `same-file → import-target → unique-global → same-directory`. The global
-  fallbacks are **language-scoped** (a Rust call never resolves to a same-named
-  TypeScript function). A name still ambiguous after all tiers is **dropped** —
-  *precision over recall for `calls` edges*, per the issue directive. Qualified
-  `A::b` calls resolve against `qualified_name` directly; method calls resolve
-  only when the receiver's type was inferred (an un-inferrable receiver is
-  dropped, not guessed). Constructors (`new T` / a bare call to a class name)
-  emit `instantiates`; type identifiers in signatures emit `references`.
+  name, `same-file → import-target → unique-global → same-directory`. A name
+  still ambiguous after all tiers is **dropped** — *precision over recall for
+  `calls` edges*, per the issue directive. Qualified `A::b` calls resolve against
+  `qualified_name` directly; method calls resolve only when the receiver's type
+  was inferred (an un-inferrable receiver is dropped, not guessed). Constructors
+  (`new T` / a bare call to a class name) emit `instantiates`; type identifiers
+  in signatures emit `references`.
+- **No cross-language resolution.** *Every* resolution path — the bare-name
+  global fallbacks **and** the `qualified_name` (qualified/method-call) lookups —
+  is **language-scoped** to the caller's file: a Rust `Point::dist()` never
+  resolves to a same-named TypeScript `Point::dist`; if the caller's language has
+  no matching definition the site is dropped, not pointed at a foreign symbol.
+  The golden fixture has no cross-language name collision, so this is pinned by a
+  purpose-built regression test in `resolve.rs` rather than by the fixture.
 - **`edges.metadata`** carries `{"confidence":x,"resolvedBy":s}` matching the
   fixture's convention (`qualified-name`/`instance-method`/`import`/`exact-match`,
   with confidence tracking global name uniqueness).
