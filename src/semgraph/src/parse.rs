@@ -2092,7 +2092,10 @@ import { hypot } from "./geometry";
         let dist = find(&nodes, "Point::Dist").unwrap();
         assert_eq!(dist.kind, "method");
         assert_eq!(dist.signature.as_deref(), Some("(o Point) Scalar"));
-        assert_eq!(find(&nodes, "Hypot").unwrap().signature.as_deref(), Some("(a, b Scalar) Scalar"));
+        assert_eq!(
+            find(&nodes, "Hypot").unwrap().signature.as_deref(),
+            Some("(a, b Scalar) Scalar")
+        );
         // is_exported on type/func decls only.
         assert!(find(&nodes, "Point").unwrap().is_exported);
         assert!(find(&nodes, "Hypot").unwrap().is_exported);
