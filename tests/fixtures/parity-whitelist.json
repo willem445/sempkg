@@ -1,0 +1,41 @@
+{
+  "_comment": [
+    "Parity-harness whitelist (issue #78 Phase 2c). Entries here are KNOWN-BETTER",
+    "deviations of semgraph from CodeGraph 0.9.7, recorded in ADR-003/ADR-004.",
+    "A whitelisted diff is reported separately and does NOT count as a parity",
+    "failure. Every entry carries a justification. Do not add an entry to paper",
+    "over a genuine regression — only for a documented, intentional improvement.",
+    "Fields: node_attrs[].attr in {is_async,docstring,signature,line_range} with a",
+    "REQUIRED direction so only the documented-better side is forgiven; edges[].side",
+    "in {missing,extra}; nodes[].side in {missing,extra}. qualified_name/file/source/",
+    "target accept a simple glob where '*' matches any run. node_attrs[].direction in",
+    "{semgraph_true,semgraph_false,semgraph_nonempty,codegraph_empty}."
+  ],
+  "node_attrs": [
+    {
+      "attr": "is_async",
+      "qualified_name": "*",
+      "file": "*",
+      "direction": "semgraph_true",
+      "justification": "ADR-003: semgraph sets is_async correctly for EVERY language (Rust async fn, Python async def), whereas CodeGraph 0.9.7 flags only TypeScript. Only the better direction is forgiven (semgraph=true where CodeGraph=false); a semgraph regression that DROPS is_async (semgraph=false, CodeGraph=true) is NOT whitelisted and counts as a delta. is_async is not part of the node match key, so this never affects the node match percentage."
+    },
+    {
+      "attr": "docstring",
+      "qualified_name": "*",
+      "file": "*",
+      "direction": "semgraph_nonempty",
+      "justification": "ADR-003: semgraph captures clean, complete docstrings (Rust /// doc comments, TS/JS block comments) where CodeGraph 0.9.7 leaves Python NULL, keeps a stray leading '/'/'!' on Rust doc comments, bleeds a module //! header into the first definition, and misses export-wrapped TS declarations. Only forgiven when semgraph's docstring is non-empty (we kept/added it); if semgraph DROPS a docstring CodeGraph had, that is a regression and counts."
+    }
+  ],
+  "edges": [
+    {
+      "side": "missing",
+      "kind": "references",
+      "source": "*",
+      "target": "*",
+      "only_duplicates": true,
+      "justification": "ADR-004: CodeGraph 0.9.7 double-emits the return-type reference for TS signatures whose return type is nested in a generic (Array<...>/Promise<...>). semgraph emits each type occurrence exactly once. 'only_duplicates' whitelists a missing instance ONLY when semgraph still emits that (source,target,references) key at least once, i.e. a duplicate-multiplicity omission — a true recall gap (zero of our side) is never whitelisted."
+    }
+  ],
+  "nodes": []
+}
