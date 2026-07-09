@@ -245,6 +245,20 @@ fn run_semgraph(
         });
     }
 
+    // A missing/typo'd `--source-dir` must be a hard error, not a silent empty
+    // graph: `semgraph::index_roots` would just walk nothing and succeed, and if
+    // it were the only root the build would produce a valid-but-empty bundle
+    // (the old CodeGraph path errored here). Only non-excluded roots are checked
+    // — an excluded root is skipped on purpose above.
+    for root in &roots {
+        if !root.is_dir() {
+            return Err(PackError::InvalidField {
+                field: "source_dirs".to_string(),
+                reason: format!("source directory does not exist: {}", root.display()),
+            });
+        }
+    }
+
     // Translate sembundle's exclude_dirs into semgraph's absolute-prefix form.
     // Absolute entries are used as-is; a relative entry `ex` is expanded to
     // `<root>/<ex>` for every root, matching the old per-root exclusion rule.
@@ -1408,6 +1422,23 @@ mod tests {
         );
         let roots = included_roots(&[a.clone(), b.clone()], std::slice::from_ref(&b));
         assert_eq!(roots, vec![a]);
+    }
+
+    /// A nonexistent explicitly-passed `--source-dir` must error, not silently
+    /// produce an empty graph (the #79 bug's cousin). The old CodeGraph path
+    /// errored here; the native path must too.
+    #[test]
+    fn run_semgraph_errors_on_missing_root() {
+        let out = tempfile::TempDir::new().unwrap();
+        let missing = out.path().join("does-not-exist");
+        let err = run_semgraph(std::slice::from_ref(&missing), out.path(), &[]).unwrap_err();
+        match err {
+            PackError::InvalidField { field, reason } => {
+                assert_eq!(field, "source_dirs");
+                assert!(reason.contains("does not exist"), "{reason}");
+            }
+            other => panic!("expected InvalidField, got {other:?}"),
+        }
     }
 
     /// Issue #79: two `-s` roots that share the same basename must both land in

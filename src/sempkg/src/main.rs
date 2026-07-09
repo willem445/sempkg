@@ -1738,8 +1738,7 @@ fn add_from_github(
 
     sembundle::build(build_opts).with_context(|| {
         format!(
-            "Failed to build bundle for {}@{}. \
-             Ensure `codegraph` is on your PATH.",
+            "Failed to build bundle for {}@{}.",
             resolved.package_name, resolved.version
         )
     })?;
@@ -2386,8 +2385,7 @@ fn add_from_local(
 
     sembundle::build(build_opts).with_context(|| {
         format!(
-            "Failed to build bundle for {}@{} from '{}'.\n\
-             Ensure `codegraph` is on your PATH.",
+            "Failed to build bundle for {}@{} from '{}'.",
             package_name,
             version,
             canonical.display()

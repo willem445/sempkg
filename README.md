@@ -223,9 +223,11 @@ sempkg add https://github.company.com/org/repo/releases/tag/v3.0.3 --full
 
 | Requirement | Notes |
 |-------------|-------|
-| [CodeGraph](https://github.com/colbymchenry/codegraph) | Must be on `PATH`. Install with `npm install -g @colbymchenry/codegraph`. |
 | Rust toolchain | Required only when building `sempkg` and `sembundle` from source. Not needed when using the install scripts. |
 | Python 3.11+ | Required only for `sempkg-registry`. |
+
+Indexing is fully native (built-in `semgraph` indexer) — there is **no**
+CodeGraph/Node dependency for building or querying bundles.
 
 ---
 
