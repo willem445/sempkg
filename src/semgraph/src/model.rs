@@ -21,7 +21,7 @@
 
 use sha2::{Digest, Sha256};
 
-/// A source language the parse layer understands (tier-1 rollout).
+/// A source language the parse layer understands (tier-1 + tier-2 rollout).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Language {
     Rust,
@@ -33,6 +33,14 @@ pub enum Language {
     /// JavaScript / JSX (`.js`, `.jsx`, `.mjs`, `.cjs`) — parsed with the `tsx`
     /// grammar, which is a superset that accepts plain JS and JSX.
     JavaScript,
+    /// C (`.c`, `.h`) — tier-2.
+    C,
+    /// C++ (`.cpp`, `.cc`, `.cxx`, `.hpp`, `.hh`, `.hxx`) — tier-2.
+    Cpp,
+    /// Go (`.go`) — tier-2.
+    Go,
+    /// Java (`.java`) — tier-2.
+    Java,
 }
 
 impl Language {
@@ -44,6 +52,10 @@ impl Language {
             "ts" | "mts" | "cts" => Some(Language::TypeScript),
             "tsx" => Some(Language::Tsx),
             "js" | "jsx" | "mjs" | "cjs" => Some(Language::JavaScript),
+            "c" | "h" => Some(Language::C),
+            "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx" => Some(Language::Cpp),
+            "go" => Some(Language::Go),
+            "java" => Some(Language::Java),
             _ => None,
         }
     }
@@ -63,6 +75,10 @@ impl Language {
             Language::Python => "python",
             Language::TypeScript | Language::Tsx => "typescript",
             Language::JavaScript => "javascript",
+            Language::C => "c",
+            Language::Cpp => "cpp",
+            Language::Go => "go",
+            Language::Java => "java",
         }
     }
 }

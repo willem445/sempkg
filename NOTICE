@@ -22,4 +22,5 @@ CodeGraph (@colbymchenry/codegraph)
 
 tree-sitter and grammar crates
     tree-sitter (MIT), tree-sitter-rust (MIT), tree-sitter-python (MIT),
-    tree-sitter-typescript (MIT).
+    tree-sitter-typescript (MIT), tree-sitter-c (MIT), tree-sitter-cpp (MIT),
+    tree-sitter-go (MIT), tree-sitter-java (MIT).

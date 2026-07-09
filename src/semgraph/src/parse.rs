@@ -178,15 +178,35 @@ pub fn extract(
     }
 
     // 3. Structural `contains` edges.
+    //    Java attaches its top-level declarations to the file's `namespace`
+    //    (package) node rather than directly to the file, matching CodeGraph.
+    let namespace_id = (language == Language::Java)
+        .then(|| {
+            emitted.iter().find_map(|(_, idx)| {
+                (nodes[*idx].kind == "namespace").then(|| nodes[*idx].id.clone())
+            })
+        })
+        .flatten();
     for (node, idx) in &emitted {
         let child_id = nodes[*idx].id.clone();
-        let parent_id =
+        let mut parent_id =
             nearest_emitted_ancestor(*node, &ts_to_id).unwrap_or_else(|| file_id.clone());
+        if let Some(ns) = &namespace_id {
+            if parent_id == file_id && nodes[*idx].kind != "namespace" {
+                parent_id = ns.clone();
+            }
+        }
         edges.push(EdgeRecord::contains(parent_id.clone(), child_id.clone()));
 
-        // Rust: a method is also contained by its impl's target type.
-        if language == Language::Rust && nodes[*idx].kind == "method" {
-            if let Some(type_name) = enclosing_impl_type(*node, src) {
+        // A method is also contained by its owning type when the type is defined
+        // in the same file: Rust `impl` blocks and Go value/pointer receivers.
+        if nodes[*idx].kind == "method" {
+            let type_name = match language {
+                Language::Rust => enclosing_impl_type(*node, src),
+                Language::Go => go_receiver_type(*node, src),
+                _ => None,
+            };
+            if let Some(type_name) = type_name {
                 if let Some(type_id) = type_nodes.get(&type_name) {
                     if *type_id != parent_id {
                         edges.push(EdgeRecord::contains(type_id.clone(), child_id.clone()));
@@ -311,9 +331,10 @@ fn collect_sites(
         }
     }
 
-    // 4b. Type-reference sites over each definition's signature (Rust + TS/JS
-    //     only — CodeGraph emits no Python type references, so neither do we).
-    if lang != Language::Python {
+    // 4b. Type-reference sites over each definition's signature. CodeGraph emits
+    //     no type references for Python, C, or C++, so neither do we; Rust/TS,
+    //     Go, and Java each contribute their signature type identifiers.
+    if !matches!(lang, Language::Python | Language::C | Language::Cpp) {
         for (node, idx) in emitted {
             if !matches!(nodes[*idx].kind.as_str(), "function" | "method") {
                 continue;
@@ -325,6 +346,14 @@ fn collect_sites(
 
     // 4c. Import sites: file → import-node edges. A plain Python `import X`
     //     (module alias, not a `from` import) gets no edge, matching CodeGraph.
+    //     Java attaches its imports to the file's `namespace` (package) node.
+    let namespace_id = (lang == Language::Java)
+        .then(|| {
+            emitted.iter().find_map(|(_, idx)| {
+                (nodes[*idx].kind == "namespace").then(|| nodes[*idx].id.clone())
+            })
+        })
+        .flatten();
     for (node, idx) in emitted {
         if nodes[*idx].kind != "import" {
             continue;
@@ -333,8 +362,9 @@ fn collect_sites(
             continue;
         }
         let rec = &nodes[*idx];
+        let from_id = namespace_id.clone().unwrap_or_else(|| file_id.to_string());
         sites.push(RawSite {
-            from_id: file_id.to_string(),
+            from_id,
             line: rec.start_line,
             col: rec.start_column,
             payload: SitePayload::Import {
@@ -357,8 +387,58 @@ fn call_payload(
     encl_type_by_id: &HashMap<String, String>,
     locals_cache: &mut HashMap<String, HashMap<String, String>>,
 ) -> Option<SitePayload> {
+    // Java call sites are `method_invocation` nodes (no `function` field).
+    if lang == Language::Java {
+        return java_call_payload(
+            call,
+            src,
+            from_id,
+            def_node_by_id,
+            encl_type_by_id,
+            locals_cache,
+        );
+    }
     let func = call.child_by_field_name("function")?;
     match lang {
+        Language::C => match func.kind() {
+            "identifier" => Some(SitePayload::CallOrCtor {
+                name: node_text(func, src).to_string(),
+            }),
+            _ => None,
+        },
+        Language::Cpp => match func.kind() {
+            "identifier" => Some(SitePayload::CallOrCtor {
+                name: node_text(func, src).to_string(),
+            }),
+            // Member call `recv.m(...)` / `recv->m(...)`: resolve the method by
+            // its (unique) name — 0.9.7 does not type the C++ receiver.
+            "field_expression" => {
+                field_text(func, "field", src).map(|name| SitePayload::CallOrCtor { name })
+            }
+            // `ns::func(...)` qualified call → resolves against its qualified name.
+            "qualified_identifier" => {
+                let name = field_text(func, "name", src)?;
+                let scope = func.child_by_field_name("scope")?;
+                Some(SitePayload::QualifiedCall {
+                    qualifier: last_scope_segment(node_text(scope, src)),
+                    name,
+                })
+            }
+            _ => None,
+        },
+        Language::Go => match func.kind() {
+            "identifier" => Some(SitePayload::CallOrCtor {
+                name: node_text(func, src).to_string(),
+            }),
+            // Selector call `recv.M(...)` (or `pkg.F(...)`): resolve by method
+            // name; a package function that is not a graph symbol simply drops.
+            "selector_expression" => {
+                field_text(func, "field", src).map(|name| SitePayload::CallOrCtor { name })
+            }
+            _ => None,
+        },
+        Language::Java => None, // handled above
+
         Language::Rust => match func.kind() {
             "identifier" => Some(SitePayload::CallOrCtor {
                 name: node_text(func, src).to_string(),
@@ -428,16 +508,84 @@ fn call_payload(
     }
 }
 
-/// Derive the class name a `new X(...)` expression constructs (TS/JS).
-fn new_payload(new_expr: Node, src: &str, _lang: Language) -> Option<SitePayload> {
-    let ctor = new_expr.child_by_field_name("constructor")?;
-    if ctor.kind() == "identifier" {
-        Some(SitePayload::New {
-            name: node_text(ctor, src).to_string(),
-        })
-    } else {
-        None
+/// Derive the class name a construction expression builds — a `new X(...)`
+/// (TS/JS `new_expression`, Java `object_creation_expression`, C++
+/// `new_expression`). Resolves to an `instantiates` edge to the class node.
+fn new_payload(new_expr: Node, src: &str, lang: Language) -> Option<SitePayload> {
+    match lang {
+        Language::TypeScript | Language::Tsx | Language::JavaScript => {
+            let ctor = new_expr.child_by_field_name("constructor")?;
+            (ctor.kind() == "identifier").then(|| SitePayload::New {
+                name: node_text(ctor, src).to_string(),
+            })
+        }
+        // Java `new Point(...)` and C++ `new geo::Point(...)` name the class in a
+        // `type:` field; a namespaced C++ type keeps only its last segment.
+        Language::Java | Language::Cpp => {
+            let ty = new_expr.child_by_field_name("type")?;
+            let name = last_scope_segment(node_text(ty, src));
+            (!name.is_empty()).then_some(SitePayload::New { name })
+        }
+        _ => None,
     }
+}
+
+/// Derive a Java `method_invocation` payload:
+/// - unqualified `method(...)` → resolve by name (`CallOrCtor`);
+/// - `Class.method(...)` (receiver is a class-name identifier) → a qualified call
+///   against `package::Class::method`;
+/// - `recv.method(...)` where the receiver's type is locally inferable (a typed
+///   parameter/local, or `this`) → a qualified call against that type's method;
+/// - any other receiver (array element, chained call) → dropped.
+fn java_call_payload(
+    call: Node,
+    src: &str,
+    from_id: &str,
+    def_node_by_id: &HashMap<String, Node>,
+    encl_type_by_id: &HashMap<String, String>,
+    locals_cache: &mut HashMap<String, HashMap<String, String>>,
+) -> Option<SitePayload> {
+    let name = field_text(call, "name", src)?;
+    let Some(obj) = call.child_by_field_name("object") else {
+        return Some(SitePayload::CallOrCtor { name });
+    };
+    let pkg = java_package(call, src);
+    // A typed local/parameter receiver (or `this`) resolves via its type.
+    if let Some(ty) = receiver_type(
+        obj,
+        src,
+        from_id,
+        def_node_by_id,
+        encl_type_by_id,
+        locals_cache,
+        Language::Java,
+    ) {
+        return Some(SitePayload::QualifiedCall {
+            qualifier: qualify_java_type(&ty, pkg.as_deref()),
+            name,
+        });
+    }
+    // A bare class-name identifier is a static `Class.method(...)` call.
+    if obj.kind() == "identifier" && starts_uppercase(node_text(obj, src)) {
+        return Some(SitePayload::QualifiedCall {
+            qualifier: qualify_java_type(node_text(obj, src), pkg.as_deref()),
+            name,
+        });
+    }
+    None
+}
+
+/// Package-qualify a Java simple type name (`Point` → `fixture::Point`); an
+/// already-qualified type (`fixture::Point`, e.g. from `this`) is left as-is.
+fn qualify_java_type(ty: &str, pkg: Option<&str>) -> String {
+    match pkg {
+        Some(p) if !ty.contains("::") => format!("{p}::{ty}"),
+        _ => ty.to_string(),
+    }
+}
+
+fn starts_uppercase(s: &str) -> bool {
+    s.chars().next().is_some_and(|c| c.is_uppercase())
 }
 
 /// Infer a receiver expression's type name: `self`/`this` → the enclosing type;
@@ -567,6 +715,21 @@ fn infer_param(
                 }
             }
         }
+        Language::Java => {
+            // `Point a` → a : Point.
+            if p.kind() == "formal_parameter" {
+                if let (Some(ty), Some(nm)) =
+                    (p.child_by_field_name("type"), p.child_by_field_name("name"))
+                {
+                    if let Some(t) = bare_type_name(node_text(ty, src)) {
+                        locals.insert(node_text(nm, src).to_string(), t);
+                    }
+                }
+            }
+        }
+        // C++/Go resolve method calls by name, so per-parameter local type
+        // inference is unused for them.
+        Language::C | Language::Cpp | Language::Go => {}
     }
 }
 
@@ -626,6 +789,26 @@ fn walk_assignments(node: Node, src: &str, lang: Language, locals: &mut HashMap<
                 }
             }
         }
+        Language::Java => {
+            // `Point origin = …;` → origin : Point (the declared type, not the
+            // initializer — Java locals are explicitly typed).
+            if node.kind() == "local_variable_declaration" {
+                if let Some(ty) = node.child_by_field_name("type") {
+                    if let Some(t) = bare_type_name(node_text(ty, src)) {
+                        let mut c = node.walk();
+                        for d in node.named_children(&mut c) {
+                            if d.kind() == "variable_declarator" {
+                                if let Some(nm) = d.child_by_field_name("name") {
+                                    locals.insert(node_text(nm, src).to_string(), t.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // C/C++/Go do not use body-assignment local inference.
+        Language::C | Language::Cpp | Language::Go => {}
     }
     let mut c = node.walk();
     for child in node.children(&mut c) {
@@ -664,6 +847,10 @@ fn collect_type_refs(
 ) {
     // The subtree(s) that constitute the "signature" for this definition kind.
     let mut regions: Vec<Node> = Vec::new();
+    // Go/Java resolve type references *strictly* to concrete types (struct /
+    // interface / class / enum), excluding type aliases — matching CodeGraph,
+    // which never references a Go alias like `Scalar`.
+    let mut strict = false;
     match lang {
         Language::Rust | Language::TypeScript | Language::Tsx | Language::JavaScript => {
             if node.kind() == "public_field_definition" {
@@ -680,19 +867,49 @@ fn collect_type_refs(
                 }
             }
         }
-        Language::Python => {}
+        Language::Go => {
+            strict = true;
+            // Parameters + result type; the receiver is a separate field, so it
+            // is excluded (CodeGraph does not reference the receiver type).
+            if let Some(p) = node.child_by_field_name("parameters") {
+                regions.push(p);
+            }
+            if let Some(r) = node.child_by_field_name("result") {
+                regions.push(r);
+            }
+        }
+        Language::Java => {
+            strict = true;
+            // Parameter list + return type.
+            if let Some(p) = node.child_by_field_name("parameters") {
+                regions.push(p);
+            }
+            if let Some(r) = node.child_by_field_name("type") {
+                regions.push(r);
+            }
+        }
+        Language::Python | Language::C | Language::Cpp => {}
     }
     for region in regions {
-        collect_type_identifiers(region, src, from_id, sites);
+        collect_type_identifiers(region, src, from_id, strict, sites);
     }
 }
 
 /// Recursively collect `type_identifier` nodes under `region`, one `TypeRef`
-/// site each, at the identifier's own position.
-fn collect_type_identifiers(region: Node, src: &str, from_id: &str, sites: &mut Vec<RawSite>) {
+/// (or `TypeRefStrict`, excluding aliases) site each, at the identifier's own
+/// position.
+fn collect_type_identifiers(
+    region: Node,
+    src: &str,
+    from_id: &str,
+    strict: bool,
+    sites: &mut Vec<RawSite>,
+) {
     let mut stack = vec![region];
     let mut found: Vec<Node> = Vec::new();
     while let Some(n) = stack.pop() {
+        // Java uses `type_identifier`; Go type identifiers also surface as
+        // `type_identifier` in its grammar.
         if n.kind() == "type_identifier" {
             found.push(n);
         }
@@ -705,13 +922,17 @@ fn collect_type_identifiers(region: Node, src: &str, from_id: &str, sites: &mut 
     found.sort_by_key(|n| (n.start_byte(), n.end_byte()));
     for id in found {
         let start = id.start_position();
+        let name = node_text(id, src).to_string();
+        let payload = if strict {
+            SitePayload::TypeRefStrict { name }
+        } else {
+            SitePayload::TypeRef { name }
+        };
         sites.push(RawSite {
             from_id: from_id.to_string(),
             line: start.row as u32 + 1,
             col: start.column as u32,
-            payload: SitePayload::TypeRef {
-                name: node_text(id, src).to_string(),
-            },
+            payload,
         });
     }
 }
@@ -799,6 +1020,28 @@ fn field_text(node: Node, field: &str, src: &str) -> Option<String> {
 /// The definition's own (unqualified) name, or `None` to drop it (e.g. a
 /// `from __future__ import` that CodeGraph also elides).
 fn def_name(node: Node, kind: &str, src: &str, lang: Language) -> Option<String> {
+    // Tier-2 languages derive several names from declarators/specs rather than a
+    // plain `name:` field.
+    match lang {
+        Language::C | Language::Cpp if matches!(kind, "function" | "method") => {
+            return cpp_declarator_id(node).map(|id| last_scope_segment(node_text(id, src)));
+        }
+        // A C `typedef double Scalar;` names the alias in its `declarator`
+        // (`type_identifier`); C++ `using X = …;` uses a `name:` field.
+        Language::C | Language::Cpp if kind == "type_alias" => {
+            return field_text(node, "name", src).or_else(|| field_text(node, "declarator", src));
+        }
+        Language::Go if matches!(kind, "constant" | "variable") => {
+            return go_spec_name(node, src);
+        }
+        Language::Java if kind == "namespace" => {
+            return java_package_of_decl(node, src);
+        }
+        Language::Java if kind == "field" => {
+            return java_field_name(node, src);
+        }
+        _ => {}
+    }
     match kind {
         "import" => import_name(node, src, lang),
         "variable" => field_text(node, "left", src).or_else(|| field_text(node, "name", src)),
@@ -809,13 +1052,93 @@ fn def_name(node: Node, kind: &str, src: &str, lang: Language) -> Option<String>
     }
 }
 
-/// Reclassify a captured `function` as a `method` when it is nested in a
-/// type/impl/class body.
+/// The last `::`-scope segment of a C++ (qualified) identifier
+/// (`geo::Point::distanceTo` → `distanceTo`, `hypot_scalar` → `hypot_scalar`).
+fn last_scope_segment(text: &str) -> String {
+    text.rsplit("::").next().unwrap_or(text).trim().to_string()
+}
+
+/// The innermost identifier node of a C/C++ `function_definition`'s declarator
+/// (an `identifier`, `field_identifier`, or `qualified_identifier`), reached by
+/// following the `declarator` field to its end.
+fn cpp_declarator_id(node: Node) -> Option<Node> {
+    let mut cur = node.child_by_field_name("declarator")?;
+    while let Some(inner) = cur.child_by_field_name("declarator") {
+        cur = inner;
+    }
+    Some(cur)
+}
+
+/// The first name of a Go `const_spec` / `var_spec` (its leading `identifier`).
+fn go_spec_name(node: Node, src: &str) -> Option<String> {
+    if let Some(n) = node.child_by_field_name("name") {
+        return Some(node_text(n, src).to_string());
+    }
+    let mut c = node.walk();
+    let found = node
+        .named_children(&mut c)
+        .find(|n| n.kind() == "identifier");
+    found.map(|n| node_text(n, src).to_string())
+}
+
+/// The variable name of a Java `field_declaration` (its declarator's `name:`).
+fn java_field_name(node: Node, src: &str) -> Option<String> {
+    let mut c = node.walk();
+    let decl = node
+        .named_children(&mut c)
+        .find(|n| n.kind() == "variable_declarator")?;
+    decl.child_by_field_name("name")
+        .map(|n| node_text(n, src).to_string())
+}
+
+/// The dotted package name of a Java `package_declaration` node.
+fn java_package_of_decl(node: Node, src: &str) -> Option<String> {
+    let mut c = node.walk();
+    let found = node
+        .named_children(&mut c)
+        .find(|n| matches!(n.kind(), "scoped_identifier" | "identifier"));
+    found.map(|n| node_text(n, src).to_string())
+}
+
+/// Reclassify a captured node to its final kind:
+/// - a `function` nested in a type/impl/class body (or, in C++, defined with a
+///   `Type::member` qualified declarator) becomes a `method`;
+/// - a Go `type_alias` capture is refined to `struct`/`interface`/`type_alias`
+///   by its right-hand side.
 fn reclassify(kind: &str, node: Node, lang: Language) -> String {
-    if kind == "function" && has_method_container(node, lang) {
-        return "method".to_string();
+    if lang == Language::Go && kind == "type_alias" {
+        return go_type_kind(node).to_string();
+    }
+    if kind == "function" {
+        if lang == Language::Cpp {
+            // A C++ definition whose declarator name is qualified (`Point::m`) is
+            // an out-of-line method; a plain identifier is a free function.
+            if let Some(id) = cpp_declarator_id(node) {
+                if id.kind() == "qualified_identifier" {
+                    return "method".to_string();
+                }
+            }
+            return "function".to_string();
+        }
+        if has_method_container(node, lang) {
+            return "method".to_string();
+        }
     }
     kind.to_string()
+}
+
+/// Classify a Go `type_spec`/`type_alias` capture by its right-hand side:
+/// a `struct_type` → `struct`, an `interface_type` → `interface`, else
+/// `type_alias` (`type Kind int`, `type Scalar = float64`).
+fn go_type_kind(node: Node) -> &'static str {
+    if let Some(ty) = node.child_by_field_name("type") {
+        match ty.kind() {
+            "struct_type" => return "struct",
+            "interface_type" => return "interface",
+            _ => {}
+        }
+    }
+    "type_alias"
 }
 
 fn has_method_container(node: Node, lang: Language) -> bool {
@@ -836,11 +1159,31 @@ fn is_method_container(kind: &str, lang: Language) -> bool {
         Language::TypeScript | Language::Tsx | Language::JavaScript => {
             matches!(kind, "class_declaration" | "abstract_class_declaration")
         }
+        // C++ methods are reclassified by their qualified declarator, not by
+        // container nesting; the other tier-2 languages capture methods directly.
+        Language::C | Language::Cpp | Language::Go | Language::Java => false,
     }
 }
 
 /// Build the `::`-joined qualified name by walking enclosing type containers.
 fn qualified_name(node: Node, name: &str, src: &str, lang: Language) -> String {
+    // Method qualification that does not come from ancestor nesting:
+    // C++ out-of-line methods carry a `Type::method` declarator, and Go methods
+    // are qualified by their receiver type.
+    match lang {
+        Language::Cpp => {
+            if let Some(qn) = cpp_method_qn(node, src) {
+                return qn;
+            }
+        }
+        Language::Go if node.kind() == "method_declaration" => {
+            if let Some(recv) = go_receiver_type(node, src) {
+                return format!("{recv}::{name}");
+            }
+        }
+        _ => {}
+    }
+
     let mut parts = Vec::new();
     let mut cur = node.parent();
     while let Some(n) = cur {
@@ -849,12 +1192,55 @@ fn qualified_name(node: Node, name: &str, src: &str, lang: Language) -> String {
         }
         cur = n.parent();
     }
+    parts.reverse();
+    // Java qualifies every declaration by its file's package (but the package
+    // node itself is named by the package, not `package::package`).
+    if lang == Language::Java && node.kind() != "package_declaration" {
+        if let Some(pkg) = java_package(node, src) {
+            parts.insert(0, pkg);
+        }
+    }
     if parts.is_empty() {
         name.to_string()
     } else {
-        parts.reverse();
         format!("{}::{}", parts.join("::"), name)
     }
+}
+
+/// The `Type::method` qualified name of a C++ out-of-line method definition, or
+/// `None` when the declarator is a plain identifier (a free function).
+fn cpp_method_qn(node: Node, src: &str) -> Option<String> {
+    if node.kind() != "function_definition" {
+        return None;
+    }
+    let id = cpp_declarator_id(node)?;
+    (id.kind() == "qualified_identifier").then(|| node_text(id, src).trim().to_string())
+}
+
+/// The base type name of a Go method's receiver (`(p *Point)` / `(p Point)` →
+/// `Point`).
+fn go_receiver_type(node: Node, src: &str) -> Option<String> {
+    let recv = node.child_by_field_name("receiver")?;
+    let mut c = recv.walk();
+    let param = recv
+        .named_children(&mut c)
+        .find(|n| n.kind() == "parameter_declaration")?;
+    let ty = param.child_by_field_name("type")?;
+    bare_type_name(node_text(ty, src))
+}
+
+/// The dotted package name in effect for `node`'s file (the top-level
+/// `package_declaration`), if any.
+fn java_package(node: Node, src: &str) -> Option<String> {
+    let mut root = node;
+    while let Some(p) = root.parent() {
+        root = p;
+    }
+    let mut c = root.walk();
+    let pkg = root
+        .named_children(&mut c)
+        .find(|n| n.kind() == "package_declaration")?;
+    java_package_of_decl(pkg, src)
 }
 
 fn qual_container_name(node: Node, src: &str, lang: Language) -> Option<String> {
@@ -881,6 +1267,22 @@ fn qual_container_name(node: Node, src: &str, lang: Language) -> Option<String> 
             | "abstract_class_declaration"
             | "enum_declaration"
             | "interface_declaration" => field_text(node, "name", src),
+            _ => None,
+        },
+        // C/C++ qualify only enum members by their enum (`Shape::Circle`);
+        // namespaces are ignored and methods carry their own qualifier.
+        Language::C | Language::Cpp => match node.kind() {
+            "enum_specifier" => field_text(node, "name", src),
+            _ => None,
+        },
+        // Go qualifies nothing by nesting (methods use their receiver).
+        Language::Go => None,
+        // Java qualifies members by their enclosing class/interface/enum (the
+        // package prefix is added separately).
+        Language::Java => match node.kind() {
+            "class_declaration" | "interface_declaration" | "enum_declaration" => {
+                field_text(node, "name", src)
+            }
             _ => None,
         },
     }
@@ -971,6 +1373,30 @@ fn import_name(node: Node, src: &str, lang: Language) -> Option<String> {
             }
             None
         }
+        Language::C | Language::Cpp => {
+            // `#include "geometry.h"` / `#include <math.h>` → the header path.
+            let path = node.child_by_field_name("path")?;
+            let raw = node_text(path, src).trim();
+            Some(
+                raw.trim_matches(|c| c == '"' || c == '<' || c == '>')
+                    .to_string(),
+            )
+        }
+        Language::Go => {
+            // `import "math"` / `import m "math"` → the module path (unquoted).
+            let path = node
+                .child_by_field_name("path")
+                .or_else(|| node.named_child(node.named_child_count().saturating_sub(1)))?;
+            Some(node_text(path, src).trim_matches('"').to_string())
+        }
+        Language::Java => {
+            // `import java.util.List;` → `java.util.List`.
+            let mut c = node.walk();
+            let found = node
+                .named_children(&mut c)
+                .find(|n| matches!(n.kind(), "scoped_identifier" | "identifier"));
+            found.map(|n| node_text(n, src).to_string())
+        }
     }
 }
 
@@ -982,16 +1408,72 @@ fn import_name(node: Node, src: &str, lang: Language) -> Option<String> {
 /// - `import` → the full import statement text;
 /// - `variable` → the assignment tail (`= float`);
 /// - types/members (`class`/`struct`/`enum`/`type_alias`/`enum_member`) → NULL.
-fn signature_for(node: Node, kind: &str, src: &str, _lang: Language) -> Option<String> {
-    match kind {
-        "function" | "method" => callable_signature(node, src),
-        "import" => {
-            let s = node_text(node, src).trim();
-            (!s.is_empty()).then(|| s.to_string())
-        }
-        "variable" => variable_signature(node, src),
-        _ => None,
+fn signature_for(node: Node, kind: &str, src: &str, lang: Language) -> Option<String> {
+    if kind == "import" {
+        let s = node_text(node, src).trim();
+        return (!s.is_empty()).then(|| s.to_string());
     }
+    match lang {
+        // C/C++ record no signature for callables or types.
+        Language::C | Language::Cpp => None,
+        Language::Go => match kind {
+            "function" | "method" => go_signature(node, src),
+            "variable" | "constant" => go_assignment_signature(node, src),
+            _ => None,
+        },
+        Language::Java => match kind {
+            "method" => java_method_signature(node, src),
+            "field" => java_field_signature(node, src),
+            _ => None,
+        },
+        Language::Rust
+        | Language::Python
+        | Language::TypeScript
+        | Language::Tsx
+        | Language::JavaScript => match kind {
+            "function" | "method" => callable_signature(node, src),
+            "variable" => variable_signature(node, src),
+            _ => None,
+        },
+    }
+}
+
+/// Go callable signature: the parameter list through the result type
+/// (`(a, b Scalar) Scalar`), receiver excluded (it is a separate field).
+fn go_signature(node: Node, src: &str) -> Option<String> {
+    let params = node.child_by_field_name("parameters")?;
+    let end = node
+        .child_by_field_name("result")
+        .map(|r| r.end_byte())
+        .unwrap_or_else(|| params.end_byte());
+    let sig = src.get(params.start_byte()..end)?.trim();
+    (!sig.is_empty()).then(|| sig.replace("\r\n", "\n"))
+}
+
+/// The `= value` assignment tail of a Go `var_spec`/`const_spec`, or `None` when
+/// there is no initializer (`KindRectangle` in a `const (…iota…)` block).
+fn go_assignment_signature(node: Node, src: &str) -> Option<String> {
+    let val = node.child_by_field_name("value")?;
+    let txt = node_text(val, src).trim();
+    (!txt.is_empty()).then(|| format!("= {txt}"))
+}
+
+/// Java method/constructor signature: `<return-type> (<params>)`, or just
+/// `(<params>)` for a constructor (no return type).
+fn java_method_signature(node: Node, src: &str) -> Option<String> {
+    let params = node.child_by_field_name("parameters")?;
+    let params_txt = node_text(params, src).trim();
+    match node.child_by_field_name("type") {
+        Some(ret) => Some(format!("{} {}", node_text(ret, src).trim(), params_txt)),
+        None => Some(params_txt.to_string()),
+    }
+}
+
+/// Java field signature: `<type> <name>` (`double UNIT`).
+fn java_field_signature(node: Node, src: &str) -> Option<String> {
+    let ty = node.child_by_field_name("type")?;
+    let name = java_field_name(node, src)?;
+    Some(format!("{} {}", node_text(ty, src).trim(), name))
 }
 
 /// `(params) -> ret` slice from the parameter list's `(` through the end of the
@@ -1039,9 +1521,14 @@ fn docstring_for(node: Node, kind: &str, src: &str, lang: Language) -> Option<St
     }
     match lang {
         Language::Python => python_docstring(node, src),
-        Language::Rust | Language::TypeScript | Language::Tsx | Language::JavaScript => {
-            leading_comment_docstring(node, src, lang)
-        }
+        Language::Rust
+        | Language::TypeScript
+        | Language::Tsx
+        | Language::JavaScript
+        | Language::C
+        | Language::Cpp
+        | Language::Go
+        | Language::Java => leading_comment_docstring(node, src, lang),
     }
 }
 
@@ -1093,7 +1580,10 @@ fn strip_comment_marker(line: &str, lang: Language) -> Option<String> {
         return Some(rest.trim_end_matches("*/").trim().to_string());
     }
     match lang {
-        Language::Rust => {
+        // Rust and C/C++ use `///` doc lines (and Rust's `//!` inner doc, which
+        // must not attach to a following item). We strip them cleanly — CodeGraph
+        // 0.9.7 leaves a stray `/` on these (whitelisted as known-better in P2c).
+        Language::Rust | Language::C | Language::Cpp => {
             if line.starts_with("//!") {
                 return None; // inner/file doc — not this item's docstring
             }
@@ -1135,10 +1625,48 @@ fn apply_flags(rec: &mut NodeRecord, node: Node, src: &str, lang: Language, kind
             rec.is_static = header_has_word(header, "static");
             rec.is_abstract = header_has_word(header, "abstract");
         }
+        // C/C++ carry no visibility/flags in CodeGraph 0.9.7's output.
+        Language::C | Language::Cpp => {}
+        Language::Go => {
+            // A Go identifier is "exported" when it starts uppercase — but 0.9.7
+            // sets the flag only on type/func declarations, not var/const/method.
+            if matches!(kind, "struct" | "interface" | "function" | "type_alias") {
+                rec.is_exported = rec.name.chars().next().is_some_and(|c| c.is_uppercase());
+            }
+        }
+        Language::Java => {
+            if let Some(vis) = java_access_modifier(node) {
+                rec.visibility = Some(vis.to_string());
+            }
+            rec.is_static = java_has_modifier(node, "static");
+            rec.is_abstract = java_has_modifier(node, "abstract");
+        }
     }
     if let Some(tp) = type_parameters(node, src) {
         rec.type_parameters = Some(tp);
     }
+}
+
+/// The access-level keyword (`public`/`private`/`protected`) in a Java
+/// declaration's `modifiers`, if explicitly present.
+fn java_access_modifier(node: Node) -> Option<&'static str> {
+    ["public", "private", "protected"]
+        .into_iter()
+        .find(|&kw| java_has_modifier(node, kw))
+}
+
+/// Whether a Java declaration's leading `modifiers` node contains `keyword`.
+fn java_has_modifier(node: Node, keyword: &str) -> bool {
+    let mut c = node.walk();
+    let Some(mods) = node
+        .named_children(&mut c)
+        .find(|n| n.kind() == "modifiers")
+    else {
+        return false;
+    };
+    let mut mc = mods.walk();
+    let has = mods.children(&mut mc).any(|m| m.kind() == keyword);
+    has
 }
 
 fn header_has_word(header: &str, word: &str) -> bool {
@@ -1255,22 +1783,38 @@ fn ts_language(lang: Language) -> tree_sitter::Language {
         Language::Tsx | Language::JavaScript => {
             tree_sitter::Language::new(tree_sitter_typescript::LANGUAGE_TSX)
         }
+        Language::C => tree_sitter::Language::new(tree_sitter_c::LANGUAGE),
+        Language::Cpp => tree_sitter::Language::new(tree_sitter_cpp::LANGUAGE),
+        Language::Go => tree_sitter::Language::new(tree_sitter_go::LANGUAGE),
+        Language::Java => tree_sitter::Language::new(tree_sitter_java::LANGUAGE),
     }
 }
 
 const RUST_QUERY: &str = include_str!("queries/rust.scm");
 const PYTHON_QUERY: &str = include_str!("queries/python.scm");
 const TYPESCRIPT_QUERY: &str = include_str!("queries/typescript.scm");
+const C_QUERY: &str = include_str!("queries/c.scm");
+const CPP_QUERY: &str = include_str!("queries/cpp.scm");
+const GO_QUERY: &str = include_str!("queries/go.scm");
+const JAVA_QUERY: &str = include_str!("queries/java.scm");
 
 const RUST_REFS_QUERY: &str = include_str!("queries/rust.refs.scm");
 const PYTHON_REFS_QUERY: &str = include_str!("queries/python.refs.scm");
 const TYPESCRIPT_REFS_QUERY: &str = include_str!("queries/typescript.refs.scm");
+const C_REFS_QUERY: &str = include_str!("queries/c.refs.scm");
+const CPP_REFS_QUERY: &str = include_str!("queries/cpp.refs.scm");
+const GO_REFS_QUERY: &str = include_str!("queries/go.refs.scm");
+const JAVA_REFS_QUERY: &str = include_str!("queries/java.refs.scm");
 
 fn query_source(lang: Language) -> &'static str {
     match lang {
         Language::Rust => RUST_QUERY,
         Language::Python => PYTHON_QUERY,
         Language::TypeScript | Language::Tsx | Language::JavaScript => TYPESCRIPT_QUERY,
+        Language::C => C_QUERY,
+        Language::Cpp => CPP_QUERY,
+        Language::Go => GO_QUERY,
+        Language::Java => JAVA_QUERY,
     }
 }
 
@@ -1279,6 +1823,10 @@ fn refs_query_source(lang: Language) -> &'static str {
         Language::Rust => RUST_REFS_QUERY,
         Language::Python => PYTHON_REFS_QUERY,
         Language::TypeScript | Language::Tsx | Language::JavaScript => TYPESCRIPT_REFS_QUERY,
+        Language::C => C_REFS_QUERY,
+        Language::Cpp => CPP_REFS_QUERY,
+        Language::Go => GO_REFS_QUERY,
+        Language::Java => JAVA_REFS_QUERY,
     }
 }
 
@@ -1302,6 +1850,10 @@ fn compiled(lang: Language) -> &'static (tree_sitter::Language, Query) {
         Language::TypeScript => cache!(TS),
         Language::Tsx => cache!(TSX),
         Language::JavaScript => cache!(JS),
+        Language::C => cache!(C),
+        Language::Cpp => cache!(CPP),
+        Language::Go => cache!(GO),
+        Language::Java => cache!(JAVA),
     }
 }
 
@@ -1325,6 +1877,10 @@ fn compiled_refs(lang: Language) -> &'static (tree_sitter::Language, Query) {
         Language::TypeScript => cache!(TS_REFS),
         Language::Tsx => cache!(TSX_REFS),
         Language::JavaScript => cache!(JS_REFS),
+        Language::C => cache!(C_REFS),
+        Language::Cpp => cache!(CPP_REFS),
+        Language::Go => cache!(GO_REFS),
+        Language::Java => cache!(JAVA_REFS),
     }
 }
 
@@ -1565,5 +2121,86 @@ import { hypot } from "./geometry";
         // A blank line between comment and def breaks the block.
         let rs2 = extract_nodes("/// far away\n\npub fn g() {}\n", "a.rs", Language::Rust);
         assert_eq!(find(&rs2, "g").unwrap().docstring, None);
+    }
+
+    // ---- tier-2 (C / C++ / Go / Java) ------------------------------------
+
+    #[test]
+    fn c_defs_typedef_struct_enum_no_globals() {
+        let src = "/** doc. */\ntypedef double Scalar;\nstruct P { double x; };\n\
+                   enum E { A, B };\nconst double UNIT = 1.0;\ndouble f(double a) { return a; }\n";
+        let nodes = extract_nodes(src, "a.c", Language::C);
+        assert_eq!(find(&nodes, "Scalar").unwrap().kind, "type_alias");
+        assert_eq!(find(&nodes, "P").unwrap().kind, "struct");
+        assert_eq!(find(&nodes, "E::A").unwrap().kind, "enum_member");
+        // C: no top-level variable node, no struct-field nodes, function sig NULL.
+        assert!(find(&nodes, "UNIT").is_none());
+        assert!(find(&nodes, "P::x").is_none());
+        assert_eq!(find(&nodes, "f").unwrap().signature, None);
+    }
+
+    #[test]
+    fn cpp_out_of_line_method_and_clean_doc() {
+        let src = "using Scalar = double;\nclass P { public: Scalar m() const; };\n\
+                   /// does it\nScalar P::m() const { return 0; }\n";
+        let nodes = extract_nodes(src, "a.cpp", Language::Cpp);
+        // The in-class declaration is not a node; the out-of-line definition is.
+        let m = find(&nodes, "P::m").unwrap();
+        assert_eq!(m.kind, "method");
+        assert_eq!(m.signature, None);
+        // `///` doc captured cleanly (no stray leading `/`).
+        assert_eq!(m.docstring.as_deref(), Some("does it"));
+        assert_eq!(find(&nodes, "Scalar").unwrap().kind, "type_alias");
+    }
+
+    #[test]
+    fn go_kinds_signatures_and_export_flag() {
+        let src = "package p\n\ntype Scalar = float64\ntype Kind int\n\
+                   type Point struct { X Scalar }\ntype Shape interface { Area() Scalar }\n\
+                   var Unit Scalar = 1.0\n\nfunc Hypot(a, b Scalar) Scalar { return a }\n\
+                   func (p Point) Dist(o Point) Scalar { return Hypot(p.X, o.X) }\n";
+        let nodes = extract_nodes(src, "a.go", Language::Go);
+        // `type X = Y` alias emits no node; `type X int` does (as type_alias).
+        assert!(find(&nodes, "Scalar").is_none());
+        assert_eq!(find(&nodes, "Kind").unwrap().kind, "type_alias");
+        assert_eq!(find(&nodes, "Point").unwrap().kind, "struct");
+        assert_eq!(find(&nodes, "Shape").unwrap().kind, "interface");
+        // Method qualified by its receiver; signature excludes the receiver.
+        let dist = find(&nodes, "Point::Dist").unwrap();
+        assert_eq!(dist.kind, "method");
+        assert_eq!(dist.signature.as_deref(), Some("(o Point) Scalar"));
+        assert_eq!(
+            find(&nodes, "Hypot").unwrap().signature.as_deref(),
+            Some("(a, b Scalar) Scalar")
+        );
+        // is_exported on type/func decls only.
+        assert!(find(&nodes, "Point").unwrap().is_exported);
+        assert!(find(&nodes, "Hypot").unwrap().is_exported);
+        assert!(!find(&nodes, "Unit").unwrap().is_exported);
+        assert!(!dist.is_exported);
+    }
+
+    #[test]
+    fn java_namespace_qn_field_and_method_signatures() {
+        let src = "package fixture;\n\npublic class C {\n  public static final double U = 1.0;\n\
+                   public double m(double a) { return a; }\n  public C(double a) {}\n}\n";
+        let nodes = extract_nodes(src, "C.java", Language::Java);
+        assert_eq!(find(&nodes, "fixture").unwrap().kind, "namespace");
+        let c = find(&nodes, "fixture::C").unwrap();
+        assert_eq!(c.kind, "class");
+        assert_eq!(c.visibility.as_deref(), Some("public"));
+        let u = find(&nodes, "fixture::C::U").unwrap();
+        assert_eq!(u.kind, "field");
+        assert_eq!(u.signature.as_deref(), Some("double U"));
+        assert!(u.is_static);
+        // Method: `<ret> (<params>)`; constructor: `(<params>)` (no return).
+        assert_eq!(
+            find(&nodes, "fixture::C::m").unwrap().signature.as_deref(),
+            Some("double (double a)")
+        );
+        assert_eq!(
+            find(&nodes, "fixture::C::C").unwrap().signature.as_deref(),
+            Some("(double a)")
+        );
     }
 }
