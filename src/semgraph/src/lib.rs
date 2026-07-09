@@ -374,12 +374,19 @@ impl GraphDb {
         while h <= MAX_HOP && hop.len() < cap {
             let mut next = Vec::new();
             for id in self.neighbor_ids(&frontier)? {
+                // Stop the moment the budget is reached: a hyper-central seed can
+                // have far more incident edges than `cap`, and admitting them all
+                // would blow the bound (and, via the `IN (…)` hydration, the
+                // SQLite bind-variable limit). The bound must match the docstring.
+                if hop.len() >= cap {
+                    break;
+                }
                 if !hop.contains_key(&id) {
                     hop.insert(id.clone(), h);
                     next.push(id);
                 }
             }
-            if next.is_empty() {
+            if next.is_empty() || hop.len() >= cap {
                 break;
             }
             frontier = next;
@@ -475,18 +482,25 @@ impl GraphDb {
     }
 
     /// Hydrate a set of node ids into [`GraphNode`]s (order unspecified).
+    ///
+    /// Chunks the `IN (…)` so an arbitrarily large id set can never exceed
+    /// `SQLITE_MAX_VARIABLE_NUMBER` — belt-and-suspenders alongside the caller's
+    /// budget cap.
     fn nodes_by_ids(&self, ids: &[String]) -> Result<Vec<GraphNode>> {
-        if ids.is_empty() {
-            return Ok(Vec::new());
+        // Well under SQLITE_MAX_VARIABLE_NUMBER on both modern (32766) and
+        // legacy (999) SQLite builds.
+        const CHUNK: usize = 900;
+        let mut out = Vec::with_capacity(ids.len());
+        for chunk in ids.chunks(CHUNK) {
+            let ph = placeholders(chunk.len());
+            let sql = format!("SELECT {NODE_COLUMNS} FROM nodes n WHERE n.id IN ({ph})");
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(chunk.iter()), row_to_node)?
+                .filter_map(std::result::Result::ok);
+            out.extend(rows);
         }
-        let ph = placeholders(ids.len());
-        let sql = format!("SELECT {NODE_COLUMNS} FROM nodes n WHERE n.id IN ({ph})");
-        let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt
-            .query_map(rusqlite::params_from_iter(ids.iter()), row_to_node)?
-            .filter_map(std::result::Result::ok)
-            .collect();
-        Ok(rows)
+        Ok(out)
     }
 
     /// Resolve `symbol` to node id(s), preferring an exact `qualified_name`
@@ -978,5 +992,56 @@ mod tests {
         assert!(toks.contains(&"circle".to_string()));
         assert!(toks.contains(&"area".to_string()));
         assert!(!toks.iter().any(|t| t == "the" || t == "how" || t == "does"));
+    }
+
+    #[test]
+    fn context_bounds_a_hyper_central_node_without_erroring() {
+        // A seed whose incident-edge count exceeds SQLITE_MAX_VARIABLE_NUMBER
+        // (32766) must not blow the bind limit: context() has to cap the BFS
+        // frontier at max_nodes, not admit every neighbour then truncate.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("fanout.db");
+        make_empty_v4_db(&path);
+        let fan = 33_000;
+        {
+            let mut conn = Connection::open(&path).unwrap();
+            let tx = conn.transaction().unwrap();
+            tx.execute(
+                "INSERT INTO nodes(id,kind,name,qualified_name,file_path,language,\
+                 start_line,end_line) VALUES('function:center','function','center',\
+                 'center','f.rs','rust',1,2)",
+                [],
+            )
+            .unwrap();
+            {
+                let mut ins_node = tx
+                    .prepare(
+                        "INSERT INTO nodes(id,kind,name,qualified_name,file_path,language,\
+                         start_line,end_line) VALUES(?1,'function',?2,?2,'f.rs','rust',10,11)",
+                    )
+                    .unwrap();
+                let mut ins_edge = tx
+                    .prepare("INSERT INTO edges(source,target,kind) VALUES('function:center',?1,'calls')")
+                    .unwrap();
+                for i in 0..fan {
+                    let leaf = format!("function:leaf{i}");
+                    ins_node
+                        .execute(rusqlite::params![leaf, format!("leaf{i}")])
+                        .unwrap();
+                    ins_edge.execute(rusqlite::params![leaf]).unwrap();
+                }
+            }
+            tx.commit().unwrap();
+        }
+
+        let db = GraphDb::open(&path).unwrap();
+        // Seeds on the central node (LIKE fallback — the temp DB has no FTS
+        // triggers); its 33k-edge fan-out must not error and must respect the cap.
+        let res = db.context("center", 10).unwrap();
+        assert!(res.len() <= 10, "cap not respected: got {}", res.len());
+        assert!(
+            res.iter().any(|n| n.name == "center"),
+            "seed must be present"
+        );
     }
 }

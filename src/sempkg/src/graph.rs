@@ -248,7 +248,9 @@ mod tests {
         assert_eq!(node["kind"], "function");
         assert!(node["qualifiedName"].is_string());
         assert!(node["filePath"].as_str().unwrap().contains("shapes.py"));
-        assert!(node["startLine"].as_u64().unwrap() > 0);
+        assert_eq!(node["startLine"].as_u64().unwrap(), 34);
+        assert_eq!(node["endLine"].as_u64().unwrap(), 36);
+        assert_eq!(node["signature"], "(radius: Scalar) -> Scalar");
     }
 
     #[test]
