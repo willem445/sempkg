@@ -1,4 +1,5 @@
-// Entry point exercising a cross-file call into Shapes.swift.
+// Entry point exercising a cross-file call AND a cross-file construction.
 func summarize(radius: Scalar) -> Scalar {
-    return circleArea(radius: radius)
+    let c = Circle(radius: radius)
+    return circleArea(radius: c.radius)
 }

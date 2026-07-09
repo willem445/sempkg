@@ -136,7 +136,20 @@ pub(crate) struct Extractor<'a> {
     now: i64,
     db_lang: &'static str,
     stored_path: &'a str,
+    /// Current recursion depth (descent calls on the stack). Bounds the walk so
+    /// pathologically nested input cannot overflow a rayon worker's stack.
+    depth: usize,
+    /// Set when [`MAX_DEPTH`] was hit and some nesting was skipped — recorded in
+    /// the file's `errors` column.
+    max_depth_hit: bool,
 }
+
+/// Maximum recursion depth of the tree walk. Real source nests far shallower;
+/// this is a generous backstop against adversarially/degenerately deep input
+/// (e.g. thousands of nested blocks) that would otherwise stack-overflow — an
+/// uncatchable abort of the whole `index_roots` on the rayon worker. On hit, the
+/// deeper subtree is skipped and the file's `errors` column records it.
+const MAX_DEPTH: usize = 512;
 
 /// Named children of `node` as owned `Node<'a>` (tree-lifetime, not cursor-
 /// bound), so they can outlive a local iteration scope. tree-sitter's
@@ -304,11 +317,17 @@ impl<'a> Extractor<'a> {
 
     /// Definition-context descent (CodeGraph's `visitNode` traversal): used at
     /// the file root and inside class/interface/struct/enum bodies.
-    fn descend(&mut self, node: Node<'a>) {
+    pub fn descend(&mut self, node: Node<'a>) {
+        if self.depth >= MAX_DEPTH {
+            self.max_depth_hit = true;
+            return;
+        }
+        self.depth += 1;
         let mut c = node.walk();
         for child in node.named_children(&mut c).collect::<Vec<_>>() {
             self.visit(child);
         }
+        self.depth -= 1;
     }
 
     /// Body-context descent (CodeGraph's `visitFunctionBody`): inside a
@@ -318,10 +337,16 @@ impl<'a> Extractor<'a> {
     /// why a Ruby `foo(...)` inside a body is a `call` (an `importTypes`-shadowed
     /// no-op at statement level) here becomes a resolved call.
     fn descend_body(&mut self, node: Node<'a>) {
+        if self.depth >= MAX_DEPTH {
+            self.max_depth_hit = true;
+            return;
+        }
+        self.depth += 1;
         let mut c = node.walk();
         for child in node.named_children(&mut c).collect::<Vec<_>>() {
             self.visit_body(child);
         }
+        self.depth -= 1;
     }
 
     fn visit_body(&mut self, node: Node<'a>) {
@@ -939,6 +964,8 @@ pub(crate) fn extract(
         now: now_millis,
         db_lang,
         stored_path,
+        depth: 0,
+        max_depth_hit: false,
     };
 
     let root = tree.root_node();
@@ -967,6 +994,19 @@ pub(crate) fn extract(
     }
 
     let node_count = ex.nodes.len() as u64;
+    // Recoverable tree-sitter error recovery (e.g. Kotlin's benign MISSING
+    // automatic-semicolon markers) is NOT reported as a file error: it would
+    // spuriously populate `files.errors` where CodeGraph records none. A hit on
+    // the depth cap IS recorded — the file was indexed but a deeply nested
+    // subtree was skipped, and that is worth surfacing.
+    let errors = if ex.max_depth_hit {
+        serde_json::to_string(&[format!(
+            "max nesting depth {MAX_DEPTH} exceeded; deeper nodes were skipped"
+        )])
+        .ok()
+    } else {
+        None
+    };
     let file_record = file_record(
         stored_path,
         src,
@@ -974,10 +1014,7 @@ pub(crate) fn extract(
         mtime_millis,
         now_millis,
         node_count,
-        // Recoverable tree-sitter error recovery (e.g. Kotlin's benign MISSING
-        // automatic-semicolon markers) is NOT reported as a file error: it would
-        // spuriously populate `files.errors` where CodeGraph records none.
-        None,
+        errors,
     );
 
     FileExtract {
@@ -1155,5 +1192,35 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Pathologically deep nesting must not overflow the walker's stack: the walk
+    /// is bounded at [`MAX_DEPTH`], skips the deeper subtree, and records the cap
+    /// hit in the file's `errors` column. (This recurses through the Ruby `module`
+    /// hook, exercising the hook→`descend` depth-guarded path too.)
+    #[test]
+    fn deeply_nested_input_is_bounded_not_overflow() {
+        let n = MAX_DEPTH * 4;
+        let mut src = String::with_capacity(n * 12);
+        for i in 0..n {
+            src.push_str(&format!("module M{i}\n"));
+        }
+        src.push_str("def leaf; end\n");
+        for _ in 0..n {
+            src.push_str("end\n");
+        }
+        let ex = extract(&src, "deep.rb", Language::Ruby, 0, 0);
+        // Did not overflow; the file is still recorded.
+        assert!(ex.nodes.iter().any(|nn| nn.kind == "file"));
+        // The depth cap was hit and surfaced in `errors`.
+        let errors = ex.file_record.errors.unwrap_or_default();
+        assert!(
+            errors.contains("max nesting depth"),
+            "expected a depth-cap error, got {errors:?}"
+        );
+        // Only the shallow modules (within the cap) were emitted — the walk
+        // stopped rather than running away.
+        let modules = ex.nodes.iter().filter(|nn| nn.kind == "module").count();
+        assert!(modules > 0 && modules < n, "modules emitted: {modules}");
     }
 }

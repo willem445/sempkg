@@ -71,10 +71,9 @@ fn visit_hook<'a>(ex: &mut super::Extractor<'a>, node: Node<'a>) -> bool {
     if let Some(id) = ex.create_node("module", &name, node, None) {
         ex.push_scope(id, "module", &name);
         if let Some(body) = node.child_by_field_name("body") {
-            let mut c = body.walk();
-            for child in body.named_children(&mut c).collect::<Vec<_>>() {
-                ex.visit(child);
-            }
+            // Descend through the depth-guarded walker so deeply nested
+            // `module A; module B; …` cannot overflow the stack.
+            ex.descend(body);
         }
         ex.pop_scope();
     }

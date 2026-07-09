@@ -87,26 +87,46 @@ uses.)
 ### Parity outcome and whitelist
 
 Each language reproduces its golden **exactly** on the graded metrics — **100% of
-nodes** (the `(kind, qualified_name, file_path)` keyset) and **100% of `calls`
-edges** (`source_qn, target_qn, line, col`) — comfortably above the issue's
-≥95%/≥90% gate. Pinned in `tests/tier3_parity.rs`.
+nodes** (the `(kind, qualified_name, file_path)` keyset) and **100% of each edge
+family we emit** (`calls`, `instantiates`, `imports`), graded as bidirectional
+`(source_qn, target_qn, line, col)` multisets (no missing, no spurious) —
+comfortably above the issue's ≥95%/≥90% gate. Pinned in `tests/tier3_parity.rs`,
+which grades all three edge kinds per language.
 
-The **only** golden `calls` edges not reproduced are CodeGraph's **synthesized
-interface→impl** edges (its Phase-5.5 heuristic: `Interface::m → Impl::m`,
-`metadata.synthesizedBy = "interface-impl"`, with a **NULL call-site column**).
-These appear in the Kotlin/Scala/C# goldens. They are a name-based
-implementation-bridging heuristic, not a real call site; replicating it is out of
-scope for the indexer. They are excluded from the graded multiset by their NULL
-column (see `tier3_parity.rs`); the per-language whitelists are otherwise **empty**.
+Whitelisted deltas (the only ones), both disclosed here:
 
-Edge kinds **not** graded by the issue and not reproduced (precision-first, and
+- **Synthesized interface→impl `calls`** (Kotlin/Scala/C# goldens): CodeGraph's
+  Phase-5.5 heuristic emits `Interface::m → Impl::m`,
+  `metadata.synthesizedBy = "interface-impl"`, with a **NULL call-site column**. A
+  name-based implementation-bridging heuristic, not a real call site; replicating
+  it is out of scope for the indexer. Excluded from the graded `calls` multiset by
+  its NULL column.
+- **Kotlin `import` target**: CodeGraph resolves `import a.b.C` to the imported
+  *class* node; we point the `imports` edge at our own `import` node. One
+  whitelisted missing+spurious pair (Kotlin only); every other `imports` edge
+  across all six languages matches exactly.
+
+**Scala emits no `instantiates`** — CodeGraph 0.9.7 has no Scala instantiation
+handling, so `new Circle(...)` produces no edge. The Scala fixture includes a
+`new Circle` construction and the parity test grades `instantiates` as an exact
+**empty** multiset, proving the pack likewise emits none (no spurious edge).
+
+Edge kinds **not** graded by the issue and not emitted (precision-first, and
 consistent with tier-1's `references` handling): `implements`/`extends`
 (inheritance) and `references` (type annotations). CodeGraph emits some of these
-per language; the native tier-3 packs emit `calls`/`instantiates`/`imports` and
-leave inheritance/type-reference edges to a later phase. This does not affect the
-node or `calls` acceptance metrics. `imports` edges are reproduced one-per-import;
-their *target* may differ from 0.9.7 (Kotlin resolves an import to the imported
-class node, we point at the import node) — also un-graded.
+per language; a follow-up will align all languages with tier-1's edge families
+once that hardening lands. This does not affect the node or edge acceptance
+metrics.
+
+### Bounded walk
+
+The recursive walker is depth-capped (`MAX_DEPTH = 512`, a generous backstop):
+pathologically/adversarially deep input (thousands of nested blocks) that would
+otherwise overflow a rayon worker's stack — an uncatchable abort of the whole
+`index_roots` — instead skips the deeper subtree and records the cap hit in the
+file's `errors` column. All recursion (including the Ruby `module` and Scala
+`extension` hooks) routes through the guarded `descend`. Pinned by
+`deeply_nested_input_is_bounded_not_overflow`.
 
 ## Consequences
 

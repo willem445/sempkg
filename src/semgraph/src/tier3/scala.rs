@@ -169,11 +169,10 @@ fn visit_hook<'a>(ex: &mut Extractor<'a>, node: Node<'a>) -> bool {
             true
         }
         "extension_definition" => {
-            // No container node — visit the body's members directly.
+            // No container node — visit the body's members directly, through the
+            // depth-guarded walker.
             if let Some(body) = node.child_by_field_name("body") {
-                for child in named_children_of(body) {
-                    ex.visit(child);
-                }
+                ex.descend(body);
             }
             true
         }

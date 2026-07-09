@@ -7,28 +7,47 @@
 //!
 //! - **nodes** — the `(kind, qualified_name, file_path)` keyset, ≥95% of golden
 //!   (we hold 100% on the fixtures).
-//! - **`calls` edges** — the `(source_qn, target_qn, line, col)` multiset, ≥90%
-//!   of golden (100% on the fixtures), excluding a small, documented per-language
-//!   whitelist of known-better/known-different 0.9.7 emissions (see
-//!   `docs/arch/adr/adr-005-tier3-language-packs.md`).
+//! - **`calls` / `instantiates` / `imports` edges** — each graded as a
+//!   bidirectional `(source_qn, target_qn, line, col)` multiset (no missing, no
+//!   spurious), ≥90% of golden (100% on the fixtures), minus a small, documented
+//!   per-language whitelist (see `docs/arch/adr/adr-005-tier3-language-packs.md`).
 //!
-//! The whitelist is deliberately tiny and each entry is justified in the ADR.
-//! Golden `calls` with a NULL line are CodeGraph's *synthesized* interface→impl
-//! edges (its Phase-5.5 heuristic, `metadata.synthesizedBy = "interface-impl"`),
-//! an advanced feature the native indexer does not replicate; those are excluded
-//! from the graded `calls` multiset for every language.
+//! Whitelisted deltas, all disclosed in ADR-005:
+//! - **Synthesized interface→impl `calls`** (Kotlin/Scala/C#): CodeGraph's
+//!   Phase-5.5 heuristic (`metadata.synthesizedBy = "interface-impl"`) carries a
+//!   NULL call-site column; excluded from the graded `calls` multiset globally.
+//! - **Kotlin `import` target**: CodeGraph resolves `import a.b.C` to the imported
+//!   class node; we point the `imports` edge at our own `import` node. One
+//!   whitelisted missing+spurious pair (Kotlin only).
+//!
+//! Not graded here (ungraded edge families, per ADR-005): `implements`/`extends`
+//! and `references`. Scala emits **no** `instantiates` (0.9.7 has no Scala
+//! instantiation handling); the fixture's `new Circle` is present to prove we
+//! likewise emit none — graded as an exact empty multiset.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use semgraph::{index_roots, IndexOptions};
 
+/// A per-kind whitelist: golden edges we do not reproduce (`missing`) and edges
+/// we emit that the golden lacks (`spurious`), keyed by `(source_qn, target_qn,
+/// line)` (column-agnostic). Empty unless a delta is documented in ADR-005.
+struct Wl {
+    missing: &'static [(&'static str, &'static str, i64)],
+    spurious: &'static [(&'static str, &'static str, i64)],
+}
+
+const EMPTY: Wl = Wl {
+    missing: &[],
+    spurious: &[],
+};
+
 struct Case {
     lang: &'static str,
-    /// Golden `calls` keys we deliberately do not reproduce, as
-    /// `(source_qn, target_qn, line)` — beyond the global NULL-line synthesized
-    /// exclusion. Empty for every current fixture.
-    calls_whitelist: &'static [(&'static str, &'static str, i64)],
+    calls: Wl,
+    instantiates: Wl,
+    imports: Wl,
     /// Golden node keys `(kind, qualified_name)` we deliberately do not
     /// reproduce. Empty for every current fixture.
     node_whitelist: &'static [(&'static str, &'static str)],
@@ -38,32 +57,53 @@ fn cases() -> Vec<Case> {
     vec![
         Case {
             lang: "ruby",
-            calls_whitelist: &[],
+            calls: EMPTY,
+            instantiates: EMPTY,
+            imports: EMPTY,
             node_whitelist: &[],
         },
         Case {
             lang: "php",
-            calls_whitelist: &[],
+            calls: EMPTY,
+            instantiates: EMPTY,
+            imports: EMPTY,
             node_whitelist: &[],
         },
         Case {
             lang: "kotlin",
-            calls_whitelist: &[],
+            calls: EMPTY,
+            instantiates: EMPTY,
+            // CodeGraph resolves `import com.example.geo.Circle` to the Circle
+            // class node; we point at our own import node. Disclosed, ungraded.
+            imports: Wl {
+                missing: &[("com.example.app", "com.example.geo::Circle", 3)],
+                spurious: &[(
+                    "com.example.app",
+                    "com.example.app::com.example.geo.Circle",
+                    3,
+                )],
+            },
             node_whitelist: &[],
         },
         Case {
             lang: "swift",
-            calls_whitelist: &[],
+            calls: EMPTY,
+            instantiates: EMPTY,
+            imports: EMPTY,
             node_whitelist: &[],
         },
         Case {
             lang: "scala",
-            calls_whitelist: &[],
+            calls: EMPTY,
+            instantiates: EMPTY,
+            imports: EMPTY,
             node_whitelist: &[],
         },
         Case {
             lang: "csharp",
-            calls_whitelist: &[],
+            calls: EMPTY,
+            instantiates: EMPTY,
+            imports: EMPTY,
             node_whitelist: &[],
         },
     ]
@@ -74,7 +114,8 @@ fn fixtures_root() -> PathBuf {
 }
 
 type NodeKey = (String, String, String);
-type CallKey = (String, String, i64, i64);
+/// `(source_qn, target_qn, line, col)`.
+type EdgeKey = (String, String, i64, i64);
 
 fn node_keyset(db: &Path) -> BTreeSet<NodeKey> {
     let conn = rusqlite::Connection::open(db).unwrap();
@@ -93,21 +134,24 @@ fn node_keyset(db: &Path) -> BTreeSet<NodeKey> {
     rows.filter_map(|r| r.ok()).collect()
 }
 
-/// `calls` edges keyed by `(source_qn, target_qn, line, col)`. Golden rows with
-/// a NULL line (synthesized interface-impl edges) are excluded.
-fn call_keys(db: &Path) -> Vec<CallKey> {
+/// Edges of `kind` keyed by `(source_qn, target_qn, line, col)`. For `calls`,
+/// rows with a NULL column — CodeGraph's synthesized interface→impl edges — are
+/// excluded from the graded multiset.
+fn edge_keys(db: &Path, kind: &str) -> Vec<EdgeKey> {
     let conn = rusqlite::Connection::open(db).unwrap();
-    let mut stmt = conn
-        .prepare(
-            // Synthesized interface→impl `calls` (CodeGraph's Phase-5.5 heuristic)
-            // carry a NULL call-site column; exclude them from the graded multiset.
-            "SELECT s.qualified_name, t.qualified_name, e.line, e.col \
-             FROM edges e JOIN nodes s ON s.id = e.source JOIN nodes t ON t.id = e.target \
-             WHERE e.kind = 'calls' AND e.line IS NOT NULL AND e.col IS NOT NULL",
-        )
-        .unwrap();
-    let mut v: Vec<CallKey> = stmt
-        .query_map([], |r| {
+    let extra = if kind == "calls" {
+        " AND e.line IS NOT NULL AND e.col IS NOT NULL"
+    } else {
+        ""
+    };
+    let sql = format!(
+        "SELECT s.qualified_name, t.qualified_name, COALESCE(e.line, -1), COALESCE(e.col, -1) \
+         FROM edges e JOIN nodes s ON s.id = e.source JOIN nodes t ON t.id = e.target \
+         WHERE e.kind = ?1{extra}"
+    );
+    let mut stmt = conn.prepare(&sql).unwrap();
+    let mut v: Vec<EdgeKey> = stmt
+        .query_map([kind], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
@@ -120,6 +164,52 @@ fn call_keys(db: &Path) -> Vec<CallKey> {
         .collect();
     v.sort();
     v
+}
+
+fn wl_hit(wl: &[(&str, &str, i64)], k: &EdgeKey) -> bool {
+    wl.iter()
+        .any(|(s, t, l)| *s == k.0 && *t == k.1 && *l == k.2)
+}
+
+/// Grade one edge kind bidirectionally against the golden, honouring the
+/// whitelist. Returns `(reproduced, total, missing, spurious)`.
+fn grade_edges(
+    lang: &str,
+    kind: &str,
+    our_db: &Path,
+    golden_db: &Path,
+    wl: &Wl,
+    failures: &mut Vec<String>,
+) {
+    let ours: Vec<EdgeKey> = edge_keys(our_db, kind)
+        .into_iter()
+        .filter(|k| !wl_hit(wl.spurious, k))
+        .collect();
+    let golden: Vec<EdgeKey> = edge_keys(golden_db, kind)
+        .into_iter()
+        .filter(|k| !wl_hit(wl.missing, k))
+        .collect();
+    let ours_set: BTreeSet<&EdgeKey> = ours.iter().collect();
+    let golden_set: BTreeSet<&EdgeKey> = golden.iter().collect();
+    let missing: Vec<&EdgeKey> = golden.iter().filter(|k| !ours_set.contains(k)).collect();
+    let spurious: Vec<&EdgeKey> = ours.iter().filter(|k| !golden_set.contains(k)).collect();
+    let reproduced = golden.len() - missing.len();
+    let pct = if golden.is_empty() {
+        100.0
+    } else {
+        100.0 * reproduced as f64 / golden.len() as f64
+    };
+    eprintln!(
+        "[{lang}] {kind}: {reproduced}/{} golden reproduced ({pct:.1}%), {} spurious",
+        golden.len(),
+        spurious.len()
+    );
+    if !missing.is_empty() {
+        failures.push(format!("{lang}: missing golden {kind}: {missing:#?}"));
+    }
+    if !spurious.is_empty() {
+        failures.push(format!("{lang}: spurious {kind}: {spurious:#?}"));
+    }
 }
 
 fn build(dir: &Path) -> tempfile::TempDir {
@@ -183,50 +273,31 @@ fn tier3_parity_meets_acceptance() {
             failures.push(format!("{}: spurious nodes: {:#?}", case.lang, extra));
         }
 
-        // ---- calls ----
-        let ours_calls = call_keys(&our_db);
-        let golden_calls: Vec<CallKey> = call_keys(&golden)
-            .into_iter()
-            .filter(|(s, t, l, _)| {
-                !case
-                    .calls_whitelist
-                    .iter()
-                    .any(|(ws, wt, wl)| ws == s && wt == t && wl == l)
-            })
-            .collect();
-        let ours_set: BTreeSet<&CallKey> = ours_calls.iter().collect();
-        let cmissing: Vec<&CallKey> = golden_calls
-            .iter()
-            .filter(|k| !ours_set.contains(k))
-            .collect();
-        let golden_set: BTreeSet<&CallKey> = golden_calls.iter().collect();
-        let cextra: Vec<&CallKey> = ours_calls
-            .iter()
-            .filter(|k| !golden_set.contains(k))
-            .collect();
-        let creprod = golden_calls.len() - cmissing.len();
-        let cpct = if golden_calls.is_empty() {
-            100.0
-        } else {
-            100.0 * creprod as f64 / golden_calls.len() as f64
-        };
-        eprintln!(
-            "[{}] calls: {}/{} golden reproduced ({:.1}%), {} extra",
+        // ---- edges: calls, instantiates, imports (all bidirectional) ----
+        grade_edges(
             case.lang,
-            creprod,
-            golden_calls.len(),
-            cpct,
-            cextra.len()
+            "calls",
+            &our_db,
+            &golden,
+            &case.calls,
+            &mut failures,
         );
-        if !cmissing.is_empty() {
-            failures.push(format!(
-                "{}: missing golden calls: {:#?}",
-                case.lang, cmissing
-            ));
-        }
-        if !cextra.is_empty() {
-            failures.push(format!("{}: spurious calls: {:#?}", case.lang, cextra));
-        }
+        grade_edges(
+            case.lang,
+            "instantiates",
+            &our_db,
+            &golden,
+            &case.instantiates,
+            &mut failures,
+        );
+        grade_edges(
+            case.lang,
+            "imports",
+            &our_db,
+            &golden,
+            &case.imports,
+            &mut failures,
+        );
     }
 
     assert!(ran > 0, "no tier-3 fixtures found");
