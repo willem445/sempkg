@@ -434,6 +434,33 @@ sempkg reranker status
 sempkg reranker test "how to read a CSV" "read_csv opens a file and returns a DataFrame"
 ```
 
+`pull` is idempotent: if the GGUF is already on disk it prints
+`Model already present` and downloads nothing.
+
+#### Authenticating to HuggingFace
+
+The default model repos are public, so `pull` needs no credentials. Supply a
+[HuggingFace access token](https://huggingface.co/settings/tokens) when you need
+one — a gated repo, or to get past HuggingFace rate-limiting anonymous
+downloads:
+
+```powershell
+# Either explicitly...
+sempkg reranker pull --hf-token <YOUR_TOKEN>
+
+# ...or from the environment (also picked up by `embedding pull`
+# and `query-expansion pull`)
+$env:HF_TOKEN = "<YOUR_TOKEN>"
+sempkg reranker pull
+```
+
+`--hf-token` wins when both are set. The token is sent as an `Authorization:
+Bearer` header to `huggingface.co` / `hf.co` and nowhere else — not to a
+`--gguf-url` pointing at another host, and not to the pre-signed CDN that
+HuggingFace redirects the download to (that URL is already entitled by the
+authenticated request that minted it). An empty `HF_TOKEN` is treated as unset,
+so an unpopulated CI secret downloads anonymously rather than failing.
+
 ### Usage
 
 ```powershell
@@ -664,6 +691,8 @@ Local package management:
 Reranker model management:
   reranker pull   [--gguf-url <url>] [--hf-token <tok>]
                                               Download Qwen3-Reranker GGUF
+                                              (--hf-token defaults to $HF_TOKEN;
+                                              no-op if already downloaded)
   reranker status                             Show model path and status
   reranker test   <query> <document>          Score a test (query, doc) pair
 ```

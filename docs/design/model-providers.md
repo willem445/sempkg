@@ -190,7 +190,35 @@ index's recorded model ID.
 `sempkg embedding pull`, `sempkg reranker pull`, and `sempkg query-expansion pull`
 download and cache the local GGUF file.  They are a no-op (with a clear message) when
 `provider` is set to `"openai"` or `"copilot"` — remote providers need no local
-model file.
+model file.  They are also a no-op when the GGUF is already on disk, so re-running a
+`pull` (or restoring `~/.sempkg/models/` from a CI cache) costs nothing.
+
+### HuggingFace authentication
+
+All three `pull` commands take the same optional token: `--hf-token`, falling back to
+the `HF_TOKEN` environment variable.  The explicit flag wins when both are set — this
+is just clap's `env` fallback, not a second auth path.  The default model repos are
+public, so the token is only needed for gated repos or to escape anonymous
+rate-limiting.
+
+Where the token is sent is deliberately narrow, mirroring what `registry.rs` already
+does with GitHub tokens (`github_token_for_url`):
+
+* **Only to `huggingface.co` / `hf.co`, over HTTPS.**  A `--gguf-url` or `model_url`
+  can point anywhere, and a credential must not follow it to an arbitrary mirror.
+* **Not to the CDN.**  An authenticated `…/resolve/…` request answers with a redirect
+  to a *pre-signed* CDN URL (`cdn-lfs.hf.co`, `cas-bridge.xethub.hf.co`).  That URL
+  already carries the entitlement of the request that minted it, so the CDN leg needs
+  no credential — and a bearer token is an extra auth mechanism a pre-signed URL may
+  reject outright.  `reqwest` drops `Authorization` across a host change for exactly
+  this reason; the host allowlist states the intent rather than leaning on that.
+* **Blank means anonymous.**  An absent GitHub Actions secret expands to an empty
+  string, so `HF_TOKEN: ${{ secrets.HF_TOKEN }}` must degrade to an unauthenticated
+  download rather than send `Authorization: Bearer ` and get a 401.  (`github.rs`
+  applies the same empty-is-unset rule to its tokens.)
+
+The header is marked sensitive, so a `{:?}` of the request, its headers, or a reqwest
+error that renders them prints `Sensitive` instead of the token.
 
 ---
 

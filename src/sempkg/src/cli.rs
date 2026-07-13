@@ -536,8 +536,42 @@ pub enum QueryExpansionCommands {
 #[cfg(test)]
 mod tests {
     use super::{Cli, Commands};
-    use clap::Parser;
+    use clap::{CommandFactory, Parser};
     use std::path::PathBuf;
+
+    /// Every `pull` command must accept the HuggingFace token from `HF_TOKEN` as
+    /// well as from `--hf-token`. clap resolves the env var only when the flag is
+    /// absent, which is the precedence we document: explicit flag wins.
+    ///
+    /// Asserted against clap's own arg definition rather than by setting the env
+    /// var, because `set_var` races with the other tests parsing in parallel.
+    #[test]
+    fn pull_commands_read_the_hf_token_from_the_environment() {
+        let cli = Cli::command();
+
+        for (group, sub) in [
+            ("reranker", "pull"),
+            ("embedding", "pull"),
+            ("query-expansion", "pull"),
+        ] {
+            let pull = cli
+                .find_subcommand(group)
+                .unwrap_or_else(|| panic!("`{group}` subcommand"))
+                .find_subcommand(sub)
+                .unwrap_or_else(|| panic!("`{group} {sub}` subcommand"));
+
+            let hf_token = pull
+                .get_arguments()
+                .find(|a| a.get_id() == "hf_token")
+                .unwrap_or_else(|| panic!("`{group} {sub}` should take --hf-token"));
+
+            assert_eq!(
+                hf_token.get_env(),
+                Some(std::ffi::OsStr::new("HF_TOKEN")),
+                "`{group} {sub} --hf-token` should fall back to the HF_TOKEN env var"
+            );
+        }
+    }
 
     #[test]
     fn add_accepts_github_source_url_via_flag_without_spec() {

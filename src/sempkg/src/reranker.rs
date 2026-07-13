@@ -201,8 +201,77 @@ pub fn model_is_present(config: &RerankerConfig) -> bool {
 pub const DEFAULT_GGUF_URL: &str =
     "https://huggingface.co/ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/resolve/main/qwen3-reranker-0.6b-q8_0.gguf";
 
+/// The only hosts a HuggingFace token is ever sent to.
+///
+/// Apex domains only, deliberately. HuggingFace answers an authenticated
+/// `…/resolve/…` request with a redirect to a *pre-signed* CDN URL
+/// (`cdn-lfs.hf.co`, `cas-bridge.xethub.hf.co`, …). That URL already carries the
+/// entitlement of the request that minted it, so the CDN leg needs no credential
+/// — and handing a bearer token to a third-party CDN would be both a leak and,
+/// for a pre-signed URL, an additional auth mechanism the CDN may reject.
+/// `reqwest` drops `Authorization` on a cross-host redirect for exactly this
+/// reason; the allowlist makes the intent explicit for a directly supplied
+/// `--gguf-url` too.
+const HF_TOKEN_HOSTS: &[&str] = &["huggingface.co", "hf.co"];
+
+/// Whether `url` is a HuggingFace endpoint we may authenticate against.
+fn is_hf_token_host(url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    // A bearer token must never travel in the clear.
+    if parsed.scheme() != "https" {
+        return false;
+    }
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    let host = host.to_ascii_lowercase();
+    HF_TOKEN_HOSTS.contains(&host.as_str())
+}
+
+/// Build the `Authorization` header for a HuggingFace download, if one applies.
+///
+/// Returns `None` — an anonymous request, identical to a run with no token at
+/// all — when:
+/// * no token was supplied;
+/// * the token is empty or whitespace (an *absent* GitHub Actions secret expands
+///   to an empty string, so `HF_TOKEN: ${{ secrets.HF_TOKEN }}` must degrade to
+///   anonymous rather than send `Authorization: Bearer `);
+/// * `url` is not a HuggingFace host (see [`HF_TOKEN_HOSTS`]).
+fn hf_auth_header(url: &str, hf_token: Option<&str>) -> Option<reqwest::header::HeaderValue> {
+    let token = hf_token?.trim();
+    if token.is_empty() || !is_hf_token_host(url) {
+        return None;
+    }
+
+    let mut value = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}")).ok()?;
+    // Marks the value sensitive so `{:?}` on the header (or on any HeaderMap /
+    // request that carries it) renders `Sensitive` instead of the token.
+    value.set_sensitive(true);
+    Some(value)
+}
+
+/// Build the GET for a model download, authenticated when `hf_token` applies.
+///
+/// Mirrors [`crate::registry::direct_download_request`]'s shape for GitHub
+/// downloads: the token is resolved per-URL, so a request to a non-HuggingFace
+/// host goes out anonymous.
+fn hf_download_request(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    hf_token: Option<&str>,
+) -> reqwest::blocking::RequestBuilder {
+    let mut req = client.get(url);
+    if let Some(auth) = hf_auth_header(url, hf_token) {
+        req = req.header(reqwest::header::AUTHORIZATION, auth);
+    }
+    req
+}
+
 /// Download a file with a simple progress indicator and save it to `dest`.
-/// Pass an optional HuggingFace bearer token for gated repositories.
+/// Pass an optional HuggingFace bearer token for gated repositories; it is only
+/// sent to HuggingFace itself, and only when non-empty.
 pub fn download_file(url: &str, dest: &Path, hf_token: Option<&str>) -> Result<()> {
     use std::io::Write;
     use std::time::Duration;
@@ -227,10 +296,7 @@ pub fn download_file(url: &str, dest: &Path, hf_token: Option<&str>) -> Result<(
 
     let max_attempts = 3u32;
     for attempt in 1..=max_attempts {
-        let mut req = client.get(url);
-        if let Some(tok) = hf_token {
-            req = req.bearer_auth(tok);
-        }
+        let req = hf_download_request(&client, url, hf_token);
 
         let resp = req
             .send()
@@ -771,6 +837,143 @@ pub fn print_status(config: &RerankerConfig) {
             "NOTE: This binary was compiled WITHOUT the `reranker` feature. \
              Reranking is disabled at runtime even if the model is present. \
              Rebuild with `cargo build --features reranker` to enable it."
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TOKEN: &str = "hf_secretTokenValue";
+
+    /// A URL no request may ever reach. Port 1 on loopback refuses instantly, so
+    /// a `pull_model` that wrongly downloads fails loudly instead of quietly
+    /// reaching the network.
+    const UNREACHABLE_URL: &str = "http://127.0.0.1:1/never-fetched.gguf";
+
+    /// The `Authorization` header that would actually go on the wire for `url`.
+    /// Builds the real request (offline — `build()` sends nothing).
+    fn auth_header_on_the_wire(url: &str, token: Option<&str>) -> Option<String> {
+        let client = reqwest::blocking::Client::new();
+        let request = hf_download_request(&client, url, token)
+            .build()
+            .expect("request should build");
+
+        request
+            .headers()
+            .get(reqwest::header::AUTHORIZATION)
+            .map(|v| v.to_str().expect("header is ascii").to_string())
+    }
+
+    #[test]
+    fn sends_bearer_token_to_huggingface() {
+        assert_eq!(
+            auth_header_on_the_wire(DEFAULT_GGUF_URL, Some(TOKEN)).as_deref(),
+            Some("Bearer hf_secretTokenValue")
+        );
+        // `hf.co` is the short form of the same endpoint.
+        assert_eq!(
+            auth_header_on_the_wire("https://hf.co/ggml-org/x/resolve/main/m.gguf", Some(TOKEN))
+                .as_deref(),
+            Some("Bearer hf_secretTokenValue")
+        );
+    }
+
+    #[test]
+    fn no_token_means_no_header() {
+        assert_eq!(auth_header_on_the_wire(DEFAULT_GGUF_URL, None), None);
+    }
+
+    /// An absent GitHub Actions secret expands to an empty string, so
+    /// `HF_TOKEN: ${{ secrets.HF_TOKEN }}` reaches us as an empty value. That
+    /// must behave exactly like an unset token, not send `Authorization: Bearer `.
+    #[test]
+    fn blank_token_degrades_to_anonymous() {
+        assert_eq!(auth_header_on_the_wire(DEFAULT_GGUF_URL, Some("")), None);
+        assert_eq!(
+            auth_header_on_the_wire(DEFAULT_GGUF_URL, Some("   \t\n")),
+            None
+        );
+    }
+
+    /// The token belongs to HuggingFace and nobody else — not a user-supplied
+    /// `--gguf-url` mirror, not the pre-signed CDN a resolve URL redirects to,
+    /// and not a lookalike host that merely ends in the right letters.
+    #[test]
+    fn token_is_never_sent_off_huggingface() {
+        for url in [
+            "https://example.com/models/m.gguf",
+            "https://cas-bridge.xethub.hf.co/xet-bridge-us/abc?X-Amz-Signature=deadbeef",
+            "https://cdn-lfs.huggingface.co/repos/abc/m.gguf",
+            "https://huggingface.co.attacker.example/m.gguf",
+            "https://nothuggingface.co/m.gguf",
+            // Never put a bearer token on the wire in the clear.
+            "http://huggingface.co/ggml-org/x/resolve/main/m.gguf",
+        ] {
+            assert_eq!(
+                auth_header_on_the_wire(url, Some(TOKEN)),
+                None,
+                "leaked token to {url}"
+            );
+        }
+
+        // A URL we cannot even parse is certainly not HuggingFace.
+        assert!(hf_auth_header("not a url at all", Some(TOKEN)).is_none());
+    }
+
+    /// The token must not surface in logs, nor in an error message that renders
+    /// the request or its headers.
+    #[test]
+    fn token_is_redacted_from_debug_output() {
+        let client = reqwest::blocking::Client::new();
+        let request = hf_download_request(&client, DEFAULT_GGUF_URL, Some(TOKEN))
+            .build()
+            .expect("request should build");
+
+        assert!(
+            request
+                .headers()
+                .contains_key(reqwest::header::AUTHORIZATION),
+            "precondition: this request is the authenticated one"
+        );
+
+        for rendered in [
+            format!("{request:?}"),
+            format!("{:?}", request.headers()),
+            format!("{:?}", request.headers()[reqwest::header::AUTHORIZATION]),
+        ] {
+            assert!(
+                !rendered.contains(TOKEN),
+                "token leaked into debug output: {rendered}"
+            );
+        }
+    }
+
+    /// `sempkg reranker pull` must no-op when the GGUF is already on disk — that
+    /// is what makes a CI model cache hit skip the download entirely. Point it at
+    /// a URL that would fail if it were ever fetched.
+    #[test]
+    fn pull_model_skips_download_when_model_is_present() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let model_path = dir.path().join("qwen3-reranker-0.6b-q8_0.gguf");
+        std::fs::write(&model_path, b"cached gguf bytes").expect("write model");
+
+        let config = RerankerConfig {
+            model: Some(model_path.to_string_lossy().to_string()),
+            ..Default::default()
+        };
+
+        pull_model(&config, None, Some(UNREACHABLE_URL)).expect("pull must no-op, not download");
+
+        assert_eq!(
+            std::fs::read(&model_path).expect("read model"),
+            b"cached gguf bytes",
+            "the cached model was overwritten by a re-download"
         );
     }
 }
