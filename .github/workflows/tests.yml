@@ -279,11 +279,18 @@ jobs:
           echo "source: $url"
           echo "cache key: sempkg-models-ubuntu-$file-$digest"
 
+      # Restore and save are split on purpose. `actions/cache`'s combined form
+      # saves in a post step gated on `success()`, so any later failure in this
+      # long job (a bundle install flaking, a functional test going red) would
+      # throw the 600 MB model away and re-download it next run — the exact cost
+      # this cache exists to avoid. Saving right after the model is verified
+      # decouples it from the rest of the job.
+      #
       # No restore-keys: a prefix match would restore a *different* model, which
       # the pull would then ignore and re-download anyway.
-      - name: Cache HuggingFace models
+      - name: Restore cached HuggingFace models
         id: model-cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: ~/.sempkg/models
           key: ${{ steps.model-key.outputs.key }}
@@ -312,6 +319,14 @@ jobs:
           fi
         env:
           SEMPKG_WORKSPACE: /tmp/sempkg-test-workspace
+
+      # Only after the model is verified present — never cache a bad download.
+      - name: Save HuggingFace models to cache
+        if: steps.model-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.sempkg/models
+          key: ${{ steps.model-key.outputs.key }}
 
       - name: Install codegraph bundle (fresh build with new sembundle)
         run: |
