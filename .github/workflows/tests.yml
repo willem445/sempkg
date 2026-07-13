@@ -142,8 +142,11 @@ jobs:
       - name: Test sembundle
         run: cargo test --manifest-path src/sembundle/Cargo.toml
 
+      # Mirror the feature set the release CPU artifacts ship with, so what CI
+      # compiles and tests is what users actually run. (`--all-features` is not
+      # usable here: the GPU backends pull in mutually exclusive vendor SDKs.)
       - name: Test sempkg
-        run: cargo test --manifest-path src/sempkg/Cargo.toml --features reranker
+        run: cargo test --manifest-path src/sempkg/Cargo.toml --features reranker,embeddings
 
   functional-tests:
     name: Functional MCP tests (ubuntu)
@@ -219,7 +222,7 @@ jobs:
           exit 1
 
       - name: Build sempkg release binary
-        run: cargo build --release --manifest-path src/sempkg/Cargo.toml --features reranker
+        run: cargo build --release --manifest-path src/sempkg/Cargo.toml --features reranker,embeddings
 
       # ---- Install the test bundle ----
 

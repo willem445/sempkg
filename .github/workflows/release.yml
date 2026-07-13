@@ -41,21 +41,27 @@ jobs:
             ext: ""
 
           # ── sempkg ────────────────────────────────────────────────────────
+          # `features` is matrix-driven so every sempkg artifact ships the full
+          # local-inference set (reranker + embeddings + query expansion). The
+          # sembundle rows leave it empty — that crate has no optional features.
           - binary: sempkg
             manifest: src/sempkg/Cargo.toml
             os: windows-latest
             target: x86_64-pc-windows-msvc
             ext: .exe
+            features: reranker,embeddings
           - binary: sempkg
             manifest: src/sempkg/Cargo.toml
             os: macos-latest
             target: aarch64-apple-darwin
             ext: ""
+            features: reranker,embeddings
           - binary: sempkg
             manifest: src/sempkg/Cargo.toml
             os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             ext: ""
+            features: reranker,embeddings
 
     steps:
       - uses: actions/checkout@v7
@@ -144,8 +150,8 @@ jobs:
       - name: Build
         shell: bash
         run: |
-          if [ "${{ matrix.binary }}" = "sempkg" ]; then
-            cargo build --release --manifest-path ${{ matrix.manifest }} --target ${{ matrix.target }} --features reranker
+          if [ -n "${{ matrix.features }}" ]; then
+            cargo build --release --manifest-path ${{ matrix.manifest }} --target ${{ matrix.target }} --features ${{ matrix.features }}
           else
             cargo build --release --manifest-path ${{ matrix.manifest }} --target ${{ matrix.target }}
           fi
