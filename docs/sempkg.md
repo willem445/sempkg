@@ -170,9 +170,15 @@ cargo build --release --features embeddings,reranker,vulkan
 ```
 
 With a GPU backend compiled in, `gpu = "auto"` offloads automatically — no config
-change needed. `sempkg embedding status` (and the reranker / query-expansion
-`status` commands) report the resolved thread count and which GPU backend, if
-any, was compiled in.
+change needed. `sempkg status` reports which backend the running binary was built
+with (as do `sempkg embedding status` and the reranker / query-expansion `status`
+commands, alongside the resolved thread count).
+
+Pre-built GPU binaries ship with every release, so most users never build one:
+see [GPU acceleration (CUDA)](gpu-cuda.md) for NVIDIA (Turing and newer) and
+[GPU acceleration (Vulkan)](gpu-vulkan.md) for AMD, Intel, and pre-Turing NVIDIA
+cards. The macOS artifact is built with `metal`, so Apple Silicon offloads out of
+the box.
 
 Download the models, then build the vector indexes for installed bundles and
 local packages:

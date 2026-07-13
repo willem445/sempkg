@@ -50,12 +50,16 @@ jobs:
             target: x86_64-pc-windows-msvc
             ext: .exe
             features: reranker,embeddings
+          # Every aarch64-apple-darwin machine has a Metal GPU and the macos-14+
+          # runners ship the Metal toolchain with Xcode, so the one macOS
+          # artifact is GPU-capable — no separate variant. `gpu = "auto"` still
+          # degrades to CPU wherever offload is unavailable.
           - binary: sempkg
             manifest: src/sempkg/Cargo.toml
             os: macos-latest
             target: aarch64-apple-darwin
             ext: ""
-            features: reranker,embeddings
+            features: reranker,embeddings,metal
           - binary: sempkg
             manifest: src/sempkg/Cargo.toml
             os: ubuntu-22.04
@@ -327,6 +331,139 @@ jobs:
           path: ${{ env.ARTIFACT }}
           retention-days: 1
 
+  # ── sempkg (Vulkan / vendor-neutral GPU) ────────────────────────────────────
+  # The CUDA artifacts target Turing (sm_75) and newer, so Maxwell/Pascal cards
+  # — and every AMD/Intel GPU — have no GPU build. Vulkan is the vendor-neutral
+  # fallback accel.rs already documents. Unlike CUDA there is nothing to bundle:
+  # the loader (`vulkan-1.dll` / `libvulkan.so.1`) ships with the GPU driver on
+  # Windows and comes from the distro (`libvulkan1`) on Linux. See
+  # docs/gpu-vulkan.md.
+  build-vulkan:
+    name: Build sempkg (Vulkan) — ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    env:
+      CARGO_INCREMENTAL: 0
+      RUSTFLAGS: -C debuginfo=0
+      # Pinned so a broken upstream SDK release can't silently break a tag build.
+      VULKAN_VERSION: 1.4.313.2
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            ext: .exe
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            ext: ""
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Free disk space (Ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          df -h
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/share/dotnet
+          sudo apt-get clean
+          df -h
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+          key: ${{ matrix.target }}-vulkan
+
+      # The ggml Vulkan backend compiles its shaders at build time, so the SDK
+      # (headers, loader import library, and the glslc compiler) must be present
+      # — a GPU is only needed at *run* time. Both installs come straight from
+      # LunarG, the upstream Vulkan SDK publisher, so no third-party action is
+      # involved.
+      - name: Install Vulkan SDK (Linux — LunarG apt repository)
+        if: runner.os == 'Linux'
+        run: |
+          wget -qO- https://packages.lunarg.com/lunarg-signing-key-pub.asc \
+            | sudo tee /etc/apt/trusted.gpg.d/lunarg.asc > /dev/null
+          sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-jammy.list \
+            https://packages.lunarg.com/vulkan/lunarg-vulkan-jammy.list
+          sudo apt-get update -q
+          sudo apt-get install -y vulkan-sdk
+
+      - name: Install Vulkan SDK (Windows — LunarG installer)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $installer = "$env:RUNNER_TEMP\VulkanSDK-Installer.exe"
+          curl.exe -o $installer -L "https://sdk.lunarg.com/sdk/download/$env:VULKAN_VERSION/windows/vulkansdk-windows-X64-$env:VULKAN_VERSION.exe"
+          & $installer --accept-licenses --default-answer --confirm-command install
+          # llama-cpp-sys reads VULKAN_SDK to find Lib\vulkan-1.lib; glslc lives in Bin.
+          "VULKAN_SDK=C:\VulkanSDK\$env:VULKAN_VERSION" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "C:\VulkanSDK\$env:VULKAN_VERSION\Bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Install build dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y cmake clang libclang-dev llvm-dev
+
+      - name: Install LLVM (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install llvm --no-progress -y
+
+      - name: Resolve LIBCLANG_PATH (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          echo "LIBCLANG_PATH=$(llvm-config --libdir)" >> "$GITHUB_ENV"
+
+      - name: Resolve LIBCLANG_PATH (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          "LIBCLANG_PATH=C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Install NASM (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/setup-nasm@v1
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build (Vulkan)
+        shell: bash
+        run: |
+          cargo build --release \
+            --manifest-path src/sempkg/Cargo.toml \
+            --target ${{ matrix.target }} \
+            --features reranker,embeddings,vulkan
+
+      # Nothing to bundle: the Vulkan loader ships with the driver (Windows) or
+      # the distro's libvulkan1 (Linux), so both platforms get a single binary.
+      - name: Stage artifact
+        shell: bash
+        run: |
+          artifact="sempkg-${{ matrix.target }}-vulkan${{ matrix.ext }}"
+          cp "target/${{ matrix.target }}/release/sempkg${{ matrix.ext }}" "$artifact"
+          echo "ARTIFACT=$artifact" >> "$GITHUB_ENV"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: sempkg-${{ matrix.target }}-vulkan
+          path: ${{ env.ARTIFACT }}
+          retention-days: 1
+
   bundle-sempkg:
     name: Build and sign sempkg SemBundle
     needs: build
@@ -428,7 +565,7 @@ jobs:
 
   release:
     name: Publish GitHub Release
-    needs: [build, build-cuda, bundle-sempkg]
+    needs: [build, build-cuda, build-vulkan, bundle-sempkg]
     # Only publish a GitHub Release for real tag pushes; manual
     # (workflow_dispatch) runs stop after building artifacts.
     if: startsWith(github.ref, 'refs/tags/v')
