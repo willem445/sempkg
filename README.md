@@ -184,6 +184,20 @@ my-workspace/
 That keeps semantic indexes scoped to the current repository, just like other
 workspace-local tooling and dependency metadata.
 
+### Check your installation
+
+```powershell
+sempkg status            # diagnostics: version, build features, GPU backend, models, stores, CodeGraph
+sempkg status --json     # the same report, machine-readable
+sempkg status my-sdk     # status of one installed bundle or registered package
+```
+
+Bare `sempkg status` is the report to paste into a bug report. It shows which
+cargo features the binary was built with and whether it has a GPU backend —
+GPU offload is a *build-time* capability, so `gpu = "auto"` runs on the CPU
+unless the binary itself was compiled for CUDA, Vulkan, ROCm, or Metal. See the
+[sempkg User Guide](docs/sempkg.md#installation-diagnostics) for the full output.
+
 ### GitHub authentication (private / enterprise)
 
 When using private repositories or restricted GitHub hosts (GitHub Enterprise),
