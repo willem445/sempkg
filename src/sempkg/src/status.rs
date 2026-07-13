@@ -427,9 +427,30 @@ pub fn run(workspace: Option<&Path>, json: bool) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// What this pins, and what it cannot.
+    ///
+    /// `reranker` and `embeddings` are checked in **both** directions, and CI
+    /// exercises both: the plain `cargo test` run compiles with neither, the
+    /// `--features reranker,embeddings` run with both. So a dropped, misnamed,
+    /// or unconditionally-pushed entry for those two fails here.
+    ///
+    /// The GPU rows (cuda/vulkan/rocm/metal) can only be exercised *negatively*.
+    /// No test job builds a GPU backend — each needs a vendor SDK, and
+    /// `--all-features` is unbuildable because those SDKs conflict — so their
+    /// `cfg!` is false in every test binary. The assertion below therefore pins
+    /// only that a GPU backend is never *claimed* by a build that lacks it
+    /// (reporting `cuda` on a CPU build would be a lie a bug report acts on),
+    /// and cannot catch a GPU row wrongly omitted from the list. That direction
+    /// is covered outside the test suite: the release GPU artifacts are built
+    /// with these features, and `gpu build` in the same report is derived
+    /// independently by `accel::gpu_build_status()`, so a missing row shows up
+    /// as a report that claims a GPU backend while listing no GPU feature.
     #[test]
     fn features_match_compiled_cfg() {
+        const KNOWN: [&str; 6] = ["reranker", "embeddings", "cuda", "vulkan", "rocm", "metal"];
+
         let features = build_features();
+
         assert_eq!(
             features.iter().any(|f| f == "reranker"),
             cfg!(feature = "reranker"),
@@ -439,7 +460,33 @@ mod tests {
             features.iter().any(|f| f == "embeddings"),
             cfg!(feature = "embeddings")
         );
-        assert_eq!(features.iter().any(|f| f == "cuda"), cfg!(feature = "cuda"));
+
+        for f in &features {
+            assert!(KNOWN.contains(&f.as_str()), "unknown feature reported: {f}");
+        }
+        assert_eq!(
+            features.len(),
+            features
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            "features must not repeat: {features:?}"
+        );
+
+        // Negative direction only — see the doc comment above.
+        for (name, enabled) in [
+            ("cuda", cfg!(feature = "cuda")),
+            ("vulkan", cfg!(feature = "vulkan")),
+            ("rocm", cfg!(feature = "rocm")),
+            ("metal", cfg!(feature = "metal")),
+        ] {
+            if !enabled {
+                assert!(
+                    !features.iter().any(|f| f == name),
+                    "`{name}` reported on a build compiled without it"
+                );
+            }
+        }
     }
 
     #[test]

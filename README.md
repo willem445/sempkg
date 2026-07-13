@@ -134,7 +134,7 @@ curl -fsSL https://raw.githubusercontent.com/willem445/sempkg/main/uninstall.sh 
 irm https://raw.githubusercontent.com/willem445/sempkg/main/uninstall.ps1 | iex
 ```
 
-By default this removes only the installed binaries (plus, on Windows, the CUDA runtime DLLs the GPU installer unpacked next to them, and the `PATH` entry if the directory is now empty). Your data is left alone. Add `--purge` (`-Purge` on Windows) to also delete the global data directory `~/.sempkg` — global bundles, the downloaded GGUF models (several GB), and the local-package registry. Both scripts accept the same `--only` / `--dir` flags as the installers and are safe to re-run.
+By default this removes only the installed binaries (plus, on Windows, the CUDA runtime DLLs the GPU installer unpacked next to them, and the `PATH` entry if the directory is now empty). Your data is left alone. Add `--purge` (`-Purge` on Windows) to also delete the global data directory `~/.sempkg` — global bundles, the downloaded GGUF models (several GB), and the local-package registry. Both scripts take the same selection flags as their installer (`--only` / `--dir` for `uninstall.sh`, `-Only` / `-InstallDir` for `uninstall.ps1`) and are safe to re-run.
 
 Everything else is yours to remove, because it belongs to your projects rather than to the installation:
 

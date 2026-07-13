@@ -19,7 +19,11 @@
 set -eu
 
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.local/bin}"
-DATA_DIR="${SEMPKG_HOME:-$HOME/.sempkg}"
+# Exactly the directory sempkg itself uses (home_dir()/.sempkg — see store.rs and
+# embedding.rs). Deliberately NOT overridable: `--purge` is an `rm -rf`, and an
+# env var that the application does not honour could only ever point it at the
+# wrong directory — deleting something else while sempkg's real data survives.
+DATA_DIR="$HOME/.sempkg"
 PURGE=0
 ONLY=""  # empty = both binaries
 

@@ -345,6 +345,8 @@ jobs:
       CARGO_INCREMENTAL: 0
       RUSTFLAGS: -C debuginfo=0
       # Pinned so a broken upstream SDK release can't silently break a tag build.
+      # Used by BOTH rows: the Windows installer URL takes it verbatim, the Linux
+      # job strips the build number to select LunarG's per-version apt repository.
       VULKAN_VERSION: 1.4.313.2
     strategy:
       fail-fast: false
@@ -393,13 +395,20 @@ jobs:
       # — a GPU is only needed at *run* time. Both installs come straight from
       # LunarG, the upstream Vulkan SDK publisher, so no third-party action is
       # involved.
+      # Pinned to the same SDK release as the Windows job: LunarG publishes a
+      # per-version apt repository, so `vulkan-sdk` here resolves to that release
+      # rather than "whatever is latest today". The apt repo is versioned
+      # major.minor.patch (1.4.313), while the Windows installer URL carries the
+      # full build number (1.4.313.2) — hence the trailing component is stripped.
       - name: Install Vulkan SDK (Linux — LunarG apt repository)
         if: runner.os == 'Linux'
         run: |
+          set -eu
+          sdk_series="${VULKAN_VERSION%.*}"   # 1.4.313.2 -> 1.4.313
           wget -qO- https://packages.lunarg.com/lunarg-signing-key-pub.asc \
             | sudo tee /etc/apt/trusted.gpg.d/lunarg.asc > /dev/null
-          sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-jammy.list \
-            https://packages.lunarg.com/vulkan/lunarg-vulkan-jammy.list
+          sudo wget -qO "/etc/apt/sources.list.d/lunarg-vulkan-${sdk_series}-jammy.list" \
+            "https://packages.lunarg.com/vulkan/${sdk_series}/lunarg-vulkan-${sdk_series}-jammy.list"
           sudo apt-get update -q
           sudo apt-get install -y vulkan-sdk
 
