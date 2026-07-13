@@ -437,29 +437,28 @@ sempkg reranker test "how to read a CSV" "read_csv opens a file and returns a Da
 `pull` is idempotent: if the GGUF is already on disk it prints
 `Model already present` and downloads nothing.
 
-#### Authenticating to HuggingFace
+#### Downloads are anonymous
 
-The default model repos are public, so `pull` needs no credentials. Supply a
-[HuggingFace access token](https://huggingface.co/settings/tokens) when you need
-one — a gated repo, or to get past HuggingFace rate-limiting anonymous
-downloads:
+sempkg sends **no credentials** when it downloads a model. The default model repos
+are public, and sempkg deliberately does not take on the risk of handling your
+HuggingFace token — there is no `--hf-token` flag and no `HF_TOKEN` environment
+variable. The trade-off is that sempkg cannot fetch a *gated* model; use
+`--gguf-url` with a public GGUF, or place the file by hand (below).
 
-```powershell
-# Either explicitly...
-sempkg reranker pull --hf-token <YOUR_TOKEN>
+> **Changed:** `--hf-token` was removed from `reranker pull`, `embedding pull`, and
+> `query-expansion pull`. If you passed it, drop the flag — the default models are
+> public and download fine without it.
 
-# ...or from the environment (also picked up by `embedding pull`
-# and `query-expansion pull`)
-$env:HF_TOKEN = "<YOUR_TOKEN>"
-sempkg reranker pull
-```
+#### When a download fails
 
-`--hf-token` wins when both are set. The token is sent as an `Authorization:
-Bearer` header to `huggingface.co` / `hf.co` and nowhere else — not to a
-`--gguf-url` pointing at another host, and not to the pre-signed CDN that
-HuggingFace redirects the download to (that URL is already entitled by the
-authenticated request that minted it). An empty `HF_TOKEN` is treated as unset,
-so an unpopulated CI secret downloads anonymously rather than failing.
+A failed pull is usually HuggingFace being unavailable or rate-limiting rather than
+a problem with your setup, and it is not something sempkg can authenticate its way
+around. So it tells you how to finish the job yourself: the failure prints the model
+URL and the **exact path** to save the file to.
+
+Fetch it by any other means (a browser, `curl`, another machine), drop it at that
+path, and re-run — `pull` sees the file and skips the download entirely. The same
+applies to `embedding pull` and `query-expansion pull`.
 
 ### Usage
 
@@ -689,10 +688,8 @@ Local package management:
   pkg lance-index <name> [--pattern <glob>]   Build/update LanceDB doc index
 
 Reranker model management:
-  reranker pull   [--gguf-url <url>] [--hf-token <tok>]
-                                              Download Qwen3-Reranker GGUF
-                                              (--hf-token defaults to $HF_TOKEN;
-                                              no-op if already downloaded)
+  reranker pull   [--gguf-url <url>]           Download Qwen3-Reranker GGUF
+                                              (anonymous; no-op if already present)
   reranker status                             Show model path and status
   reranker test   <query> <document>          Score a test (query, doc) pair
 ```

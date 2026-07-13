@@ -23,11 +23,11 @@
 /// stub so the rest of the codebase doesn't need `#[cfg]` guards.
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::providers::{Embed, OpenAiProviderConfig, ProviderKind};
-use crate::reranker::{download_file, expand_tilde};
+use crate::reranker::{download_file, expand_tilde, manual_placement_notice};
 
 // ---------------------------------------------------------------------------
 // Model registry
@@ -270,11 +270,10 @@ pub fn model_is_present(config: &EmbeddingConfig) -> bool {
 }
 
 /// Download `model`'s GGUF into `dest`. `gguf_url` overrides the model's default
-/// source; `hf_token` is forwarded as a `Bearer` header for gated repos.
+/// source. The download is anonymous; sempkg sends no HuggingFace credential (#106).
 pub fn pull_model(
     model: EmbeddingModel,
     dest: &std::path::Path,
-    hf_token: Option<&str>,
     gguf_url: Option<&str>,
 ) -> Result<()> {
     let source_url = gguf_url.unwrap_or_else(|| model.gguf_url());
@@ -283,7 +282,8 @@ pub fn pull_model(
         println!("Embedding model already present: {}", dest.display());
     } else {
         println!("Downloading {}  →  {}", source_url, dest.display());
-        download_file(source_url, dest, hf_token)?;
+        download_file(source_url, dest)
+            .with_context(|| manual_placement_notice(source_url, dest))?;
         println!("  ✓ {} saved.", model.display_name());
     }
 
@@ -666,6 +666,44 @@ pub fn print_status(config: &EmbeddingConfig) {
             "NOTE: This binary was compiled WITHOUT the `embeddings` feature. \
              Vector search is disabled at runtime even if the model is present. \
              Rebuild with `cargo build --features embeddings` to enable it."
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A failed embedding pull must tell the user where to place the file by hand
+    /// — same contract as the reranker and query-expansion pulls (#106). Loopback
+    /// port 1 refuses on connect, so this touches no network.
+    #[test]
+    fn failed_pull_says_where_to_put_the_model_by_hand() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let model_path = dir.path().join(EmbeddingModel::DEFAULT.default_filename());
+
+        let err = pull_model(
+            EmbeddingModel::DEFAULT,
+            &model_path,
+            Some("http://127.0.0.1:1/never-fetched.gguf"),
+        )
+        .expect_err("an unreachable URL must fail the pull");
+        let rendered = format!("{err:?}");
+
+        assert!(
+            rendered.contains("http://127.0.0.1:1/never-fetched.gguf"),
+            "failure must name the model URL to fetch:
+{rendered}"
+        );
+        assert!(
+            rendered.contains(&model_path.display().to_string()),
+            "failure must name the exact placement path:
+{rendered}"
+        );
+        assert!(
+            rendered.contains("next run"),
+            "failure must say the file is picked up on the next run:
+{rendered}"
         );
     }
 }

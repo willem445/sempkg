@@ -157,12 +157,6 @@ jobs:
       (github.event_name == 'pull_request' && github.base_ref == 'main')
     env:
       GITHUB_TOKEN: ${{ github.token }}
-      # Optional. An absent repo secret expands to the empty string, which sempkg
-      # treats exactly like an unset token — the model pull stays anonymous, i.e.
-      # unchanged from before this variable existed. When the secret *is* present,
-      # the HuggingFace request is authenticated, which is what keeps the pull
-      # working while HF 403s anonymous large-file (Xet CDN) downloads. See #106.
-      HF_TOKEN: ${{ secrets.HF_TOKEN }}
 
     steps:
       - name: Checkout code

@@ -193,32 +193,42 @@ download and cache the local GGUF file.  They are a no-op (with a clear message)
 model file.  They are also a no-op when the GGUF is already on disk, so re-running a
 `pull` (or restoring `~/.sempkg/models/` from a CI cache) costs nothing.
 
-### HuggingFace authentication
+### Model downloads are anonymous — by decision
 
-All three `pull` commands take the same optional token: `--hf-token`, falling back to
-the `HF_TOKEN` environment variable.  The explicit flag wins when both are set — this
-is just clap's `env` fallback, not a second auth path.  The default model repos are
-public, so the token is only needed for gated repos or to escape anonymous
-rate-limiting.
+**sempkg sends no credential when it downloads a model, and has no way to be given
+one** (#106).  `download_file` builds a plain `GET`; there is no token parameter, no
+`Authorization` header, no `HF_TOKEN` environment variable, and no `--hf-token` flag.
 
-Where the token is sent is deliberately narrow, mirroring what `registry.rs` already
-does with GitHub tokens (`github_token_for_url`):
+The reasoning is a deliberate trade, not an oversight.  The default model repos are
+public, so a token buys nothing in the common case — while accepting one means owning
+the whole problem of handling a user secret safely: keeping it out of logs, out of
+error messages that render URLs and headers, off redirect hops to third-party CDNs,
+and out of requests to whatever host `--gguf-url` happens to point at.  That is a
+standing liability in exchange for a rare convenience, so the project declines it.
+The cost is real and accepted: **sempkg cannot download a gated model**, and cannot
+authenticate its way past a HuggingFace rate limit.  The answer to both is manual
+placement (below).
 
-* **Only to `huggingface.co` / `hf.co`, over HTTPS.**  A `--gguf-url` or `model_url`
-  can point anywhere, and a credential must not follow it to an arbitrary mirror.
-* **Not to the CDN.**  An authenticated `…/resolve/…` request answers with a redirect
-  to a *pre-signed* CDN URL (`cdn-lfs.hf.co`, `cas-bridge.xethub.hf.co`).  That URL
-  already carries the entitlement of the request that minted it, so the CDN leg needs
-  no credential — and a bearer token is an extra auth mechanism a pre-signed URL may
-  reject outright.  `reqwest` drops `Authorization` across a host change for exactly
-  this reason; the host allowlist states the intent rather than leaning on that.
-* **Blank means anonymous.**  An absent GitHub Actions secret expands to an empty
-  string, so `HF_TOKEN: ${{ secrets.HF_TOKEN }}` must degrade to an unauthenticated
-  download rather than send `Authorization: Bearer ` and get a 401.  (`github.rs`
-  applies the same empty-is-unset rule to its tokens.)
+> **Contract change.**  `--hf-token` used to exist on all three `pull` commands (and
+> accepted `HF_TOKEN` from the environment).  It was **removed**, not deprecated —
+> the flag is gone and passing it is now an error.  Scripts that passed a token must
+> drop the flag; since the default repos are public, nothing else changes for them.
+> `cli::tests::pull_commands_accept_no_token_at_all` pins this so the flag cannot
+> drift back in.
 
-The header is marked sensitive, so a `{:?}` of the request, its headers, or a reqwest
-error that renders them prints `Sensitive` instead of the token.
+Note this is only about *model downloads*.  Remote inference providers
+(`provider = "openai"`) still authenticate with their own API key, and `registry.rs`
+still uses GitHub tokens for bundle downloads.  Those are separate, opt-in code paths.
+
+### Failed downloads point at manual placement
+
+Since sempkg cannot authenticate its way past an outage or a rate limit, a failed
+download is often not retryable in the moment — so the failure has to leave the user
+able to finish the job themselves.  Every `pull` path fails with the same notice
+(`reranker::manual_placement_notice`): the model URL to fetch, the *exact* path to
+save it to, and the fact that the next run picks the file up instead of re-downloading
+it.  That escape hatch only works if we say precisely where the file goes, so the
+message spells it out rather than making the user derive it from config.
 
 ---
 

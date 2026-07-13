@@ -458,11 +458,6 @@ pub enum RerankerCommands {
         /// Override the GGUF download URL.
         #[arg(long)]
         gguf_url: Option<String>,
-
-        /// HuggingFace access token for downloading gated models.
-        /// Can also be supplied via the HF_TOKEN environment variable.
-        #[arg(long, env = "HF_TOKEN")]
-        hf_token: Option<String>,
     },
 
     /// Show local model status (present / missing, configured paths, build flags).
@@ -494,11 +489,6 @@ pub enum EmbeddingCommands {
         /// Override the GGUF download URL.
         #[arg(long)]
         gguf_url: Option<String>,
-
-        /// HuggingFace access token for downloading gated models.
-        /// Can also be supplied via the HF_TOKEN environment variable.
-        #[arg(long, env = "HF_TOKEN")]
-        hf_token: Option<String>,
     },
 
     /// Show embedding model status (present / missing, configured paths, build flags).
@@ -516,11 +506,6 @@ pub enum QueryExpansionCommands {
         /// Override the GGUF download URL.
         #[arg(long)]
         gguf_url: Option<String>,
-
-        /// HuggingFace access token for downloading gated models.
-        /// Can also be supplied via the HF_TOKEN environment variable.
-        #[arg(long, env = "HF_TOKEN")]
-        hf_token: Option<String>,
     },
 
     /// Show query-expansion model status.
@@ -539,14 +524,15 @@ mod tests {
     use clap::{CommandFactory, Parser};
     use std::path::PathBuf;
 
-    /// Every `pull` command must accept the HuggingFace token from `HF_TOKEN` as
-    /// well as from `--hf-token`. clap resolves the env var only when the flag is
-    /// absent, which is the precedence we document: explicit flag wins.
+    /// Model downloads are anonymous-only (#106): sempkg does not want to carry the
+    /// risk of handling a user's HuggingFace credential. No `pull` command may take
+    /// a token — not as a flag, and not from the environment. This pins the contract
+    /// against a well-meaning re-introduction.
     ///
-    /// Asserted against clap's own arg definition rather than by setting the env
+    /// Asserted against clap's own arg definitions rather than by setting an env
     /// var, because `set_var` races with the other tests parsing in parallel.
     #[test]
-    fn pull_commands_read_the_hf_token_from_the_environment() {
+    fn pull_commands_accept_no_token_at_all() {
         let cli = Cli::command();
 
         for (group, sub) in [
@@ -560,16 +546,18 @@ mod tests {
                 .find_subcommand(sub)
                 .unwrap_or_else(|| panic!("`{group} {sub}` subcommand"));
 
-            let hf_token = pull
-                .get_arguments()
-                .find(|a| a.get_id() == "hf_token")
-                .unwrap_or_else(|| panic!("`{group} {sub}` should take --hf-token"));
-
-            assert_eq!(
-                hf_token.get_env(),
-                Some(std::ffi::OsStr::new("HF_TOKEN")),
-                "`{group} {sub} --hf-token` should fall back to the HF_TOKEN env var"
-            );
+            for arg in pull.get_arguments() {
+                let id = arg.get_id().as_str();
+                assert!(
+                    !id.contains("token"),
+                    "`{group} {sub}` must take no token argument, found `--{id}`"
+                );
+                assert_eq!(
+                    arg.get_env(),
+                    None,
+                    "`{group} {sub} --{id}` must not read a value from the environment"
+                );
+            }
         }
     }
 
