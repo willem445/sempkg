@@ -122,6 +122,30 @@ cargo install --path src/sembundle
 cargo install --path src/sempkg
 ```
 
+### Uninstall
+
+**Linux / macOS:**
+```sh
+curl -fsSL https://raw.githubusercontent.com/willem445/sempkg/main/uninstall.sh | sh
+```
+
+**Windows (PowerShell):**
+```powershell
+irm https://raw.githubusercontent.com/willem445/sempkg/main/uninstall.ps1 | iex
+```
+
+By default this removes only the installed binaries (plus, on Windows, the CUDA runtime DLLs the GPU installer unpacked next to them, and the `PATH` entry if the directory is now empty). Your data is left alone. Add `--purge` (`-Purge` on Windows) to also delete the global data directory `~/.sempkg` — global bundles, the downloaded GGUF models (several GB), and the local-package registry. Both scripts accept the same `--only` / `--dir` flags as the installers and are safe to re-run.
+
+Everything else is yours to remove, because it belongs to your projects rather than to the installation:
+
+| Left behind | What it is | Remove with |
+|-------------|------------|-------------|
+| `~/.sempkg/` | Global bundles, GGUF models, local-package registry | `--purge`, or delete the directory |
+| `<project>/.sempkg/`, `sempkg.toml`, `sempkg.lock` | Per-project workspace state | Delete them in each project |
+| `<project>/.codegraph/` | CodeGraph index of your own repo | Delete it in each project |
+| CodeGraph CLI | Shared npm package | `npm uninstall -g @colbymchenry/codegraph` |
+| MCP entries | e.g. `.vscode/mcp.json` pointing at `sempkg` | Edit the config |
+
 ---
 
 ## Quick Start
