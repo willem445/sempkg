@@ -383,6 +383,10 @@ jobs:
           # Visual Studio generator would carry a CMakeCache.txt that a Ninja
           # configure refuses ("generator mismatch").
           key: ${{ matrix.target }}-vulkan-v2
+          # The Windows row builds into a short out-of-tree CARGO_TARGET_DIR (see
+          # the path-length step below), so there is no in-workspace target/ to
+          # cache there. The registry/index cache still applies on both rows.
+          cache-targets: ${{ runner.os != 'Windows' }}
 
       # The ggml Vulkan backend compiles its shaders at build time, so the SDK
       # (headers, loader import library, and the glslc compiler) must be present
@@ -422,17 +426,32 @@ jobs:
         run: |
           choco install llvm --no-progress -y
 
-      # Build ggml with Ninja instead of the Visual Studio generator on Windows.
-      # ggml compiles its Vulkan shaders with `vulkan-shaders-gen`, a host tool
-      # built as a CMake ExternalProject. Under the VS generator that project's
-      # configure runs *inside* an MSBuild custom-build step, and the nested
-      # MSBuild inherits a broken environment: its try-compile fails with
-      # "C1083: Cannot open compiler generated file: ''" and MSBuild reports
-      # "The system cannot find the batch label specified - VCEnd". Ninja runs
-      # the nested configure as a plain cmake call in the same environment, so
-      # the sub-project builds. Scoped to this job — the CUDA and CPU Windows
-      # builds have no ExternalProject and keep the default generator.
-      - name: Install Ninja and select it as the CMake generator (Windows)
+      # Two Windows-only settings, both needed to build ggml's Vulkan backend.
+      #
+      # 1. CARGO_TARGET_DIR — ggml compiles its Vulkan shaders with
+      #    `vulkan-shaders-gen`, a host tool built as a CMake ExternalProject.
+      #    Its build tree nests deeply (…/build/llama-cpp-sys-2-<hash>/out/build/
+      #    ggml/src/ggml-vulkan/vulkan-shaders-gen-prefix/src/…-build/CMakeFiles/
+      #    CMakeScratch/TryCompile-xxxxxx/…), and under the default
+      #    D:\a\sempkg\sempkg\target root the object paths reach 252 characters —
+      #    past the 250-char limit CMake enforces (CMAKE_OBJECT_PATH_MAX), after
+      #    which cl.exe fails with "C1083: Cannot open compiler generated file:
+      #    ''". llama-cpp-sys documents this ("crates that depend on
+      #    llama-cpp-rs w/ vulkan easily exceed the default PATH_MAX on
+      #    windows"); its own workaround only covers MSBuild's FileTracker, not
+      #    the path length. A short root buys back 20 characters, and building
+      #    for the host triple (no --target, see the Build step) another 23.
+      #
+      # 2. CMAKE_GENERATOR=Ninja — under the Visual Studio generator the
+      #    ExternalProject's configure runs inside an MSBuild custom-build step,
+      #    whose nested MSBuild inherits a broken environment ("The system
+      #    cannot find the batch label specified - VCEnd") and runs the
+      #    ExternalProject steps out of order. Ninja invokes that configure as a
+      #    plain cmake call in the same environment.
+      #
+      # Both are scoped to this job: the CUDA and CPU Windows builds have no
+      # ExternalProject, so they keep the default generator and target dir.
+      - name: Install Ninja and shorten the CMake build path (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
@@ -440,7 +459,8 @@ jobs:
             choco install ninja --no-progress -y
           }
           ninja --version
-          "CMAKE_GENERATOR=Ninja" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "CMAKE_GENERATOR=Ninja"  | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "CARGO_TARGET_DIR=C:/vk" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Resolve LIBCLANG_PATH (Linux)
         if: runner.os == 'Linux'
@@ -463,21 +483,38 @@ jobs:
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
+      # On Windows this builds for the host triple (which *is* matrix.target) with
+      # no --target flag: that drops the `x86_64-pc-windows-msvc/` path segment
+      # and, with the short CARGO_TARGET_DIR above, brings ggml's deepest
+      # Vulkan object path from 252 characters down to ~209 — comfortably under
+      # the 250-char limit rather than a couple of characters below it.
       - name: Build (Vulkan)
         shell: bash
         run: |
-          cargo build --release \
-            --manifest-path src/sempkg/Cargo.toml \
-            --target ${{ matrix.target }} \
-            --features reranker,embeddings,vulkan
+          set -eu
+          tdir="${CARGO_TARGET_DIR:-target}"
+
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cargo build --release \
+              --manifest-path src/sempkg/Cargo.toml \
+              --features reranker,embeddings,vulkan
+            echo "SEMPKG_BIN=${tdir}/release/sempkg${{ matrix.ext }}" >> "$GITHUB_ENV"
+          else
+            cargo build --release \
+              --manifest-path src/sempkg/Cargo.toml \
+              --target ${{ matrix.target }} \
+              --features reranker,embeddings,vulkan
+            echo "SEMPKG_BIN=${tdir}/${{ matrix.target }}/release/sempkg${{ matrix.ext }}" >> "$GITHUB_ENV"
+          fi
 
       # Nothing to bundle: the Vulkan loader ships with the driver (Windows) or
       # the distro's libvulkan1 (Linux), so both platforms get a single binary.
       - name: Stage artifact
         shell: bash
         run: |
+          set -eu
           artifact="sempkg-${{ matrix.target }}-vulkan${{ matrix.ext }}"
-          cp "target/${{ matrix.target }}/release/sempkg${{ matrix.ext }}" "$artifact"
+          cp "${SEMPKG_BIN}" "$artifact"
           echo "ARTIFACT=$artifact" >> "$GITHUB_ENV"
 
       - name: Upload artifact
