@@ -16,11 +16,11 @@
 /// so the caller transparently falls back to searching the original query only.
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::providers::{Expand, OpenAiProviderConfig, ProviderKind};
-use crate::reranker::{download_file, expand_tilde};
+use crate::reranker::{download_file, expand_tilde, manual_placement_notice};
 
 // ---------------------------------------------------------------------------
 // Variant routing
@@ -208,11 +208,8 @@ pub const DEFAULT_GGUF_URL: &str =
     "https://huggingface.co/tobil/qmd-query-expansion-1.7B-gguf/resolve/main/qmd-query-expansion-1.7B-q4_k_m.gguf";
 
 /// Pull the GGUF model into `~/.sempkg/models/`.
-pub fn pull_model(
-    config: &QueryExpansionConfig,
-    hf_token: Option<&str>,
-    gguf_url: Option<&str>,
-) -> Result<()> {
+/// The download is anonymous; sempkg sends no HuggingFace credential (#106).
+pub fn pull_model(config: &QueryExpansionConfig, gguf_url: Option<&str>) -> Result<()> {
     let model_path = config.resolved_model_path();
     // Priority: CLI --gguf-url flag > toml model_url > built-in default
     let source_url = gguf_url
@@ -226,7 +223,8 @@ pub fn pull_model(
         );
     } else {
         println!("Downloading {}  →  {}", source_url, model_path.display());
-        download_file(source_url, &model_path, hf_token)?;
+        download_file(source_url, &model_path)
+            .with_context(|| manual_placement_notice(source_url, &model_path))?;
         println!("  ✓ query-expansion model saved.");
     }
 
@@ -808,5 +806,39 @@ mod tests {
         let v = parse_variants(raw, "how to do this", 10);
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].text, "tokio async runtime");
+    }
+
+    /// A failed query-expansion pull must tell the user where to place the file by
+    /// hand — same contract as the reranker and embedding pulls (#106). Loopback
+    /// port 1 refuses on connect, so this touches no network.
+    #[test]
+    fn failed_pull_says_where_to_put_the_model_by_hand() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let model_path = dir.path().join("qmd-query-expansion-1.7b-q4_k_m.gguf");
+
+        let config = QueryExpansionConfig {
+            model: Some(model_path.to_string_lossy().to_string()),
+            ..Default::default()
+        };
+
+        let err = pull_model(&config, Some("http://127.0.0.1:1/never-fetched.gguf"))
+            .expect_err("an unreachable URL must fail the pull");
+        let rendered = format!("{err:?}");
+
+        assert!(
+            rendered.contains("http://127.0.0.1:1/never-fetched.gguf"),
+            "failure must name the model URL to fetch:
+{rendered}"
+        );
+        assert!(
+            rendered.contains(&model_path.display().to_string()),
+            "failure must name the exact placement path:
+{rendered}"
+        );
+        assert!(
+            rendered.contains("next run"),
+            "failure must say the file is picked up on the next run:
+{rendered}"
+        );
     }
 }

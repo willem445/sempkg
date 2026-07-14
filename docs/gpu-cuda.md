@@ -36,7 +36,7 @@ cannot legally be redistributed, so it is never bundled.
 - **GPU:** Turing (compute capability 7.5) or newer — i.e. GeForce RTX 20xx and
   up, plus the equivalent Quadro/data-center parts. CUDA 13 dropped
   Maxwell, Pascal, and Volta, so GTX 9xx/10xx and Titan V cards are **not**
-  supported by this build; use the `vulkan` backend for those (see below).
+  supported by this build; use the [Vulkan build](gpu-vulkan.md) for those.
   Architectures without pre-built SASS (anything past RTX 40xx) are covered by
   JIT-compiled PTX, so a short one-time compile pause may occur on first run.
 

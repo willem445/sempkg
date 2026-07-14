@@ -171,9 +171,15 @@ cargo build --release --features embeddings,reranker,vulkan
 ```
 
 With a GPU backend compiled in, `gpu = "auto"` offloads automatically — no config
-change needed. `sempkg embedding status` (and the reranker / query-expansion
-`status` commands) report the resolved thread count and which GPU backend, if
-any, was compiled in.
+change needed. `sempkg status` reports which backend the running binary was built
+with (as do `sempkg embedding status` and the reranker / query-expansion `status`
+commands, alongside the resolved thread count).
+
+Pre-built GPU binaries ship with every release, so most users never build one:
+see [GPU acceleration (CUDA)](gpu-cuda.md) for NVIDIA (Turing and newer) and
+[GPU acceleration (Vulkan)](gpu-vulkan.md) for AMD, Intel, and pre-Turing NVIDIA
+cards. The macOS artifact is built with `metal`, so Apple Silicon offloads out of
+the box.
 
 Download the models, then build the vector indexes for installed bundles and
 local packages:
@@ -333,6 +339,54 @@ The trailing `# ...` is the optional bundle description recorded with
 sempkg status aws-sdk
 ```
 
+### Installation diagnostics
+
+Run `sempkg status` with no name to get a report on the installation itself.
+This is what to paste into a bug report — it answers, in one place, which
+build you are running and why local inference behaves the way it does:
+
+```powershell
+sempkg status
+```
+
+```
+sempkg 0.6.1
+  commit      : 1f3c9a0…            # the release commit; "unknown" for local builds
+  os / arch   : windows / x86_64
+  features    : reranker, embeddings
+  gpu build   : CPU-only — no GPU backend compiled in (…)
+  cpu threads : 32
+
+[embedding]                          # …and [reranker], [query_expansion]
+  enabled     : true
+  provider    : local
+  model       : embeddinggemma-300m (dim 768)
+  gpu         : auto
+  cpu threads : 32
+  model file  : C:\Users\me\.sempkg\models\embeddinggemma-300m-qat-Q8_0.gguf
+  model state : ✓ present (313.4 MB)
+
+[workspace]                          # sempkg.toml / sempkg.lock / installed bundles
+[global]                             # ~/.sempkg: bundles, downloaded models, packages
+[codegraph]                          # native indexer version (always built-in)
+```
+
+The `features` and `gpu build` lines are the ones most bug reports turn on:
+GPU offload is a **build-time** capability, so `gpu = "auto"` silently runs on
+the CPU unless the binary itself was compiled with a GPU backend
+(see [GPU acceleration (CUDA)](gpu-cuda.md) and [GPU acceleration (Vulkan)](gpu-vulkan.md)).
+
+Add `--json` for the same report as machine-readable JSON (useful for agents
+and issue templates):
+
+```powershell
+sempkg status --json
+```
+
+`--json` describes the installation, so it cannot be combined with a package
+name — `sempkg status <name> --json` is rejected rather than silently ignoring
+one of the two.
+
 ---
 
 ## Indexing the Current Workspace
@@ -434,6 +488,32 @@ sempkg reranker pull
 sempkg reranker status
 sempkg reranker test "how to read a CSV" "read_csv opens a file and returns a DataFrame"
 ```
+
+`pull` is idempotent: if the GGUF is already on disk it prints
+`Model already present` and downloads nothing.
+
+#### Downloads are anonymous
+
+sempkg sends **no credentials** when it downloads a model. The default model repos
+are public, and sempkg deliberately does not take on the risk of handling your
+HuggingFace token — there is no `--hf-token` flag and no `HF_TOKEN` environment
+variable. The trade-off is that sempkg cannot fetch a *gated* model; use
+`--gguf-url` with a public GGUF, or place the file by hand (below).
+
+> **Changed:** `--hf-token` was removed from `reranker pull`, `embedding pull`, and
+> `query-expansion pull`. If you passed it, drop the flag — the default models are
+> public and download fine without it.
+
+#### When a download fails
+
+A failed pull is usually HuggingFace being unavailable or rate-limiting rather than
+a problem with your setup, and it is not something sempkg can authenticate its way
+around. So it tells you how to finish the job yourself: the failure prints the model
+URL and the **exact path** to save the file to.
+
+Fetch it by any other means (a browser, `curl`, another machine), drop it at that
+path, and re-run — `pull` sees the file and skips the download entirely. The same
+applies to `embedding pull` and `query-expansion pull`.
 
 ### Usage
 
@@ -627,6 +707,8 @@ Workspace / bundle management:
                        --url <url>            (direct GitHub release URL)
                        [--global]
                        [--verify-key <pem>]
+  status                                      Installation diagnostics report
+         [--json]                             (machine-readable form)
   status <name>                               Show bundle/package status
   repair                                      Recreate missing .codegraph views
 
@@ -663,8 +745,8 @@ Local package management:
   pkg lance-index <name> [--pattern <glob>]   Build/update LanceDB doc index
 
 Reranker model management:
-  reranker pull   [--gguf-url <url>] [--hf-token <tok>]
-                                              Download Qwen3-Reranker GGUF
+  reranker pull   [--gguf-url <url>]           Download Qwen3-Reranker GGUF
+                                              (anonymous; no-op if already present)
   reranker status                             Show model path and status
   reranker test   <query> <document>          Score a test (query, doc) pair
 ```

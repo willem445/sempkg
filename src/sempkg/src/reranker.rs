@@ -201,9 +201,54 @@ pub fn model_is_present(config: &RerankerConfig) -> bool {
 pub const DEFAULT_GGUF_URL: &str =
     "https://huggingface.co/ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/resolve/main/qwen3-reranker-0.6b-q8_0.gguf";
 
+/// Build the `GET` for a model download.
+///
+/// It carries **no credential**, and there is no parameter through which one could
+/// be supplied — see the module docs and `docs/design/model-providers.md` (#106).
+/// This exists as a named seam so that fact is directly testable, the same way
+/// [`crate::registry::direct_download_request`] makes GitHub's auth testable.
+fn model_download_request(
+    client: &reqwest::blocking::Client,
+    url: &str,
+) -> reqwest::blocking::RequestBuilder {
+    client.get(url)
+}
+
+/// What to tell a user whose download came back `401 Unauthorized`.
+///
+/// sempkg sends no credentials, so a 401 is not something the user can fix by
+/// supplying one — the URL simply isn't reachable anonymously. Say that, and point
+/// at the two things that do work.
+fn unauthorized_notice(url: &str, dest: &Path) -> String {
+    format!(
+        "HTTP 401 Unauthorized for {url}\n\n\
+         This URL requires authentication, but sempkg downloads models anonymously \
+         and sends no credentials.\n\n\
+         Point `--gguf-url` at a public GGUF, or download the file yourself and save \
+         it to:\n\
+         \n    {dest}\n\n\
+         sempkg picks it up on the next run.",
+        dest = dest.display()
+    )
+}
+
+/// Base delay between download retries; the nth retry waits `n × RETRY_BACKOFF`.
+///
+/// Zero under `cfg(test)`. The offline failure-path tests point `download_file` at a
+/// refused port, so every attempt fails instantly and the only thing the backoff
+/// buys is seconds of sleeping in the test suite. The retry *count* is unchanged, so
+/// the tests still exercise the real retry loop.
+#[cfg(not(test))]
+const RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
+#[cfg(test)]
+const RETRY_BACKOFF: std::time::Duration = std::time::Duration::ZERO;
+
 /// Download a file with a simple progress indicator and save it to `dest`.
-/// Pass an optional HuggingFace bearer token for gated repositories.
-pub fn download_file(url: &str, dest: &Path, hf_token: Option<&str>) -> Result<()> {
+///
+/// The request is **anonymous** and sempkg carries no credential for it: the model
+/// repos are public, and the project deliberately does not take on the risk of
+/// handling a user's HuggingFace token (#106).
+pub fn download_file(url: &str, dest: &Path) -> Result<()> {
     use std::io::Write;
     use std::time::Duration;
 
@@ -227,10 +272,7 @@ pub fn download_file(url: &str, dest: &Path, hf_token: Option<&str>) -> Result<(
 
     let max_attempts = 3u32;
     for attempt in 1..=max_attempts {
-        let mut req = client.get(url);
-        if let Some(tok) = hf_token {
-            req = req.bearer_auth(tok);
-        }
+        let req = model_download_request(&client, url);
 
         let resp = req
             .send()
@@ -240,7 +282,7 @@ pub fn download_file(url: &str, dest: &Path, hf_token: Option<&str>) -> Result<(
             Ok(r) => r,
             Err(e) if attempt < max_attempts => {
                 println!("  download attempt {attempt}/{max_attempts} failed: {e}; retrying...");
-                std::thread::sleep(Duration::from_secs(attempt as u64 * 2));
+                std::thread::sleep(RETRY_BACKOFF * attempt);
                 continue;
             }
             Err(e) => {
@@ -249,25 +291,14 @@ pub fn download_file(url: &str, dest: &Path, hf_token: Option<&str>) -> Result<(
         };
 
         if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
-            anyhow::bail!(
-                "HTTP 401 Unauthorized for {url}\n\n\
-                 The requested URL requires authentication.\n\
-                 Create a HuggingFace access token at https://huggingface.co/settings/tokens\n\
-                 then re-run with your token:\n\
-                 \n\
-                     sempkg reranker pull --hf-token <YOUR_TOKEN>\n\
-                 \n\
-                 Or set the environment variable and re-run:\n\
-                 \n\
-                     $env:HF_TOKEN = \"<YOUR_TOKEN>\"; sempkg reranker pull"
-            );
+            anyhow::bail!(unauthorized_notice(url, dest));
         }
 
         let mut resp = match resp.error_for_status() {
             Ok(r) => r,
             Err(e) if attempt < max_attempts => {
                 println!("  download attempt {attempt}/{max_attempts} failed: {e}; retrying...");
-                std::thread::sleep(Duration::from_secs(attempt as u64 * 2));
+                std::thread::sleep(RETRY_BACKOFF * attempt);
                 continue;
             }
             Err(e) => return Err(e).with_context(|| format!("HTTP error for {url}")),
@@ -285,6 +316,25 @@ pub fn download_file(url: &str, dest: &Path, hf_token: Option<&str>) -> Result<(
             Ok(n) => {
                 file.flush()
                     .with_context(|| format!("flushing {}", tmp_dest.display()))?;
+                // Close the handle before any rename/remove — Windows refuses both
+                // while the file is still open.
+                drop(file);
+
+                // A short body must never be renamed into place. hyper already errors
+                // on a response that undershoots its Content-Length, so this only bites
+                // on a chunked/length-less response that ends cleanly early — but the
+                // result would be a truncated GGUF sitting at the model path, which CI
+                // then caches under a key claiming it is the real thing. Cheap to rule
+                // out; expensive to debug.
+                if let Some(expected) = total {
+                    if n != expected {
+                        let _ = std::fs::remove_file(&tmp_dest);
+                        anyhow::bail!(
+                            "truncated download for {url}: expected {expected} bytes, got {n}"
+                        );
+                    }
+                }
+
                 std::fs::rename(&tmp_dest, dest).with_context(|| {
                     format!("moving {} to {}", tmp_dest.display(), dest.display())
                 })?;
@@ -299,7 +349,7 @@ pub fn download_file(url: &str, dest: &Path, hf_token: Option<&str>) -> Result<(
             Err(e) if attempt < max_attempts => {
                 let _ = std::fs::remove_file(&tmp_dest);
                 println!("  download attempt {attempt}/{max_attempts} failed: {e}; retrying...");
-                std::thread::sleep(Duration::from_secs(attempt as u64 * 2));
+                std::thread::sleep(RETRY_BACKOFF * attempt);
             }
             Err(e) => {
                 let _ = std::fs::remove_file(&tmp_dest);
@@ -311,16 +361,38 @@ pub fn download_file(url: &str, dest: &Path, hf_token: Option<&str>) -> Result<(
     anyhow::bail!("download failed for {url}")
 }
 
+/// What to tell a user whose model download just failed.
+///
+/// sempkg downloads anonymously, so an outage or a rate-limit on HuggingFace's
+/// side is not something a retry can fix and not something sempkg can
+/// authenticate its way around. The fallback that always works is to fetch the
+/// file by any other means and drop it where sempkg looks — which only helps if
+/// we say *exactly* where that is, so this spells out both the URL and the
+/// destination path rather than making the user go find them.
+///
+/// Shared by every `pull` path (reranker, embedding, query expansion): the advice
+/// is identical and only the URL and destination differ.
+pub fn manual_placement_notice(url: &str, dest: &Path) -> String {
+    format!(
+        "Could not download the model from {url}\n\n\
+         sempkg downloads models anonymously, so this is usually HuggingFace being \
+         unavailable or rate-limiting rather than anything wrong with your setup.\n\n\
+         You can place the file by hand instead — download it from:\n\
+         \n    {url}\n\n\
+         and save it to exactly this path:\n\
+         \n    {dest}\n\n\
+         sempkg picks it up on the next run: `pull` sees the file and skips the \
+         download entirely.",
+        dest = dest.display()
+    )
+}
+
 /// Pull the GGUF model into `~/.sempkg/models/` (or the directory implied
 /// by `config`). The tokenizer is embedded inside the GGUF — no separate
 /// tokenizer.json download is needed when using llama-cpp-2.
 ///
-/// `hf_token` is forwarded as a `Bearer` authorisation header for gated repos.
-pub fn pull_model(
-    config: &RerankerConfig,
-    hf_token: Option<&str>,
-    gguf_url: Option<&str>,
-) -> Result<()> {
+/// The download is anonymous; sempkg sends no HuggingFace credential (#106).
+pub fn pull_model(config: &RerankerConfig, gguf_url: Option<&str>) -> Result<()> {
     let model_path = config.resolved_model_path();
     // Priority: CLI --gguf-url flag > toml model_url > built-in default
     let source_url = gguf_url
@@ -331,8 +403,8 @@ pub fn pull_model(
         println!("Model already present: {}", model_path.display());
     } else {
         println!("Downloading {}  →  {}", source_url, model_path.display());
-        download_file(source_url, &model_path, hf_token)
-            .context("Failed to download GGUF model")?;
+        download_file(source_url, &model_path)
+            .with_context(|| manual_placement_notice(source_url, &model_path))?;
         println!("  ✓ model saved.");
     }
 
@@ -771,6 +843,158 @@ pub fn print_status(config: &RerankerConfig) {
             "NOTE: This binary was compiled WITHOUT the `reranker` feature. \
              Reranking is disabled at runtime even if the model is present. \
              Rebuild with `cargo build --features reranker` to enable it."
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A URL no request may ever reach. Port 1 on loopback refuses instantly, so
+    /// a `pull_model` that wrongly downloads fails loudly instead of quietly
+    /// reaching the network.
+    const UNREACHABLE_URL: &str = "http://127.0.0.1:1/never-fetched.gguf";
+
+    fn config_for(model_path: &Path) -> RerankerConfig {
+        RerankerConfig {
+            model: Some(model_path.to_string_lossy().to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// Both user-facing notices are multi-line string literals held together by
+    /// `\n\` continuations. Drop one and the source indentation leaks into the
+    /// message as long runs of spaces mid-sentence — exactly what shipped in the 401
+    /// message and got caught in review.
+    ///
+    /// The notices use one deliberate layout: a 4-space indent to offset a URL or a
+    /// path onto its own line. Every other line is prose and must carry no
+    /// indentation and no interior run of spaces.
+    #[test]
+    fn user_facing_notices_are_not_mangled_by_source_indentation() {
+        let dest = Path::new("/home/u/.sempkg/models/qwen3-reranker-0.6b-q8_0.gguf");
+
+        for notice in [
+            unauthorized_notice(DEFAULT_GGUF_URL, dest),
+            manual_placement_notice(DEFAULT_GGUF_URL, dest),
+        ] {
+            for line in notice.lines() {
+                // A deliberately offset value: exactly four spaces, then the value.
+                let body = match line.strip_prefix("    ") {
+                    Some(value) if !value.starts_with(' ') => value,
+                    Some(_) => panic!("over-indented line: {line:?}\n\nin:\n{notice}"),
+                    None => {
+                        assert!(
+                            !line.starts_with(' '),
+                            "prose line carries leaked source indentation: {line:?}\
+                             \n\nin:\n{notice}"
+                        );
+                        line
+                    }
+                };
+
+                assert!(
+                    !body.contains("  "),
+                    "line has a run of spaces mid-sentence: {line:?}\n\nin:\n{notice}"
+                );
+            }
+        }
+    }
+
+    /// A 401 must not tell the user to go find a token — sempkg has no way to send
+    /// one. It should point at the two things that actually work.
+    #[test]
+    fn unauthorized_notice_offers_no_token() {
+        let dest = Path::new("/models/m.gguf");
+        let notice = unauthorized_notice(DEFAULT_GGUF_URL, dest).to_lowercase();
+
+        assert!(
+            !notice.contains("token"),
+            "401 notice must not offer a token"
+        );
+        assert!(!notice.contains("hf_token"));
+        assert!(notice.contains("anonymously"));
+        assert!(notice.contains("--gguf-url"));
+        assert!(notice.contains("/models/m.gguf"));
+    }
+
+    /// The download is anonymous: sempkg holds no HuggingFace credential, so the
+    /// request it puts on the wire must carry no `Authorization` header — for the
+    /// default model repo and for any `--gguf-url` a user points it at (#106).
+    /// `build()` sends nothing, so this touches no network.
+    #[test]
+    fn model_downloads_are_anonymous() {
+        let client = reqwest::blocking::Client::new();
+
+        for url in [
+            DEFAULT_GGUF_URL,
+            "https://huggingface.co/some/gated-repo/resolve/main/m.gguf",
+            "https://mirror.example.com/m.gguf",
+        ] {
+            let request = model_download_request(&client, url)
+                .build()
+                .expect("request should build");
+
+            assert!(
+                request
+                    .headers()
+                    .get(reqwest::header::AUTHORIZATION)
+                    .is_none(),
+                "model download to {url} must not be authenticated"
+            );
+        }
+    }
+
+    /// `sempkg reranker pull` must no-op when the GGUF is already on disk — that
+    /// is what makes a CI model cache hit skip the download entirely. Point it at
+    /// a URL that would fail if it were ever fetched.
+    #[test]
+    fn pull_model_skips_download_when_model_is_present() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let model_path = dir.path().join("qwen3-reranker-0.6b-q8_0.gguf");
+        std::fs::write(&model_path, b"cached gguf bytes").expect("write model");
+
+        pull_model(&config_for(&model_path), Some(UNREACHABLE_URL))
+            .expect("pull must no-op, not download");
+
+        assert_eq!(
+            std::fs::read(&model_path).expect("read model"),
+            b"cached gguf bytes",
+            "the cached model was overwritten by a re-download"
+        );
+    }
+
+    /// A failed pull must leave the user able to finish the job by hand: it has to
+    /// name the URL to fetch, the exact path to save it to, and say that the next
+    /// run will pick it up. No network — the URL refuses on connect.
+    #[test]
+    fn failed_pull_says_where_to_put_the_model_by_hand() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let model_path = dir.path().join("qwen3-reranker-0.6b-q8_0.gguf");
+
+        let err = pull_model(&config_for(&model_path), Some(UNREACHABLE_URL))
+            .expect_err("an unreachable URL must fail the pull");
+        let rendered = format!("{err:?}");
+
+        assert!(
+            rendered.contains(UNREACHABLE_URL),
+            "failure must name the model URL to fetch:
+{rendered}"
+        );
+        assert!(
+            rendered.contains(&model_path.display().to_string()),
+            "failure must name the exact placement path:
+{rendered}"
+        );
+        assert!(
+            rendered.contains("next run"),
+            "failure must say the file is picked up on the next run:
+{rendered}"
         );
     }
 }

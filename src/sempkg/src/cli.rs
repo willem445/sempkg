@@ -207,10 +207,19 @@ pub enum Commands {
         verify_key: Option<PathBuf>,
     },
 
-    /// Show status of an installed bundle or registered package.
+    /// Show a diagnostic report for this sempkg installation, or the status of
+    /// one installed bundle / registered package.
+    ///
+    /// With no NAME, prints version, build features, GPU backend, model, store,
+    /// and CodeGraph diagnostics — the information a bug report needs.
+    /// With a NAME, prints the status of that bundle or registered package.
     Status {
-        /// Package/bundle name.
-        name: String,
+        /// Package/bundle name. Omit for the installation-wide diagnostic report.
+        name: Option<String>,
+
+        /// Print the diagnostic report as JSON. Only valid without a NAME.
+        #[arg(long, conflicts_with = "name")]
+        json: bool,
     },
 
     /// Uninstall a bundle (remove from local or global store).
@@ -458,11 +467,6 @@ pub enum RerankerCommands {
         /// Override the GGUF download URL.
         #[arg(long)]
         gguf_url: Option<String>,
-
-        /// HuggingFace access token for downloading gated models.
-        /// Can also be supplied via the HF_TOKEN environment variable.
-        #[arg(long, env = "HF_TOKEN")]
-        hf_token: Option<String>,
     },
 
     /// Show local model status (present / missing, configured paths, build flags).
@@ -494,11 +498,6 @@ pub enum EmbeddingCommands {
         /// Override the GGUF download URL.
         #[arg(long)]
         gguf_url: Option<String>,
-
-        /// HuggingFace access token for downloading gated models.
-        /// Can also be supplied via the HF_TOKEN environment variable.
-        #[arg(long, env = "HF_TOKEN")]
-        hf_token: Option<String>,
     },
 
     /// Show embedding model status (present / missing, configured paths, build flags).
@@ -516,11 +515,6 @@ pub enum QueryExpansionCommands {
         /// Override the GGUF download URL.
         #[arg(long)]
         gguf_url: Option<String>,
-
-        /// HuggingFace access token for downloading gated models.
-        /// Can also be supplied via the HF_TOKEN environment variable.
-        #[arg(long, env = "HF_TOKEN")]
-        hf_token: Option<String>,
     },
 
     /// Show query-expansion model status.
@@ -536,8 +530,45 @@ pub enum QueryExpansionCommands {
 #[cfg(test)]
 mod tests {
     use super::{Cli, Commands};
-    use clap::Parser;
+    use clap::{CommandFactory, Parser};
     use std::path::PathBuf;
+
+    /// Model downloads are anonymous-only (#106): sempkg does not want to carry the
+    /// risk of handling a user's HuggingFace credential. No `pull` command may take
+    /// a token — not as a flag, and not from the environment. This pins the contract
+    /// against a well-meaning re-introduction.
+    ///
+    /// Asserted against clap's own arg definitions rather than by setting an env
+    /// var, because `set_var` races with the other tests parsing in parallel.
+    #[test]
+    fn pull_commands_accept_no_token_at_all() {
+        let cli = Cli::command();
+
+        for (group, sub) in [
+            ("reranker", "pull"),
+            ("embedding", "pull"),
+            ("query-expansion", "pull"),
+        ] {
+            let pull = cli
+                .find_subcommand(group)
+                .unwrap_or_else(|| panic!("`{group}` subcommand"))
+                .find_subcommand(sub)
+                .unwrap_or_else(|| panic!("`{group} {sub}` subcommand"));
+
+            for arg in pull.get_arguments() {
+                let id = arg.get_id().as_str();
+                assert!(
+                    !id.contains("token"),
+                    "`{group} {sub}` must take no token argument, found `--{id}`"
+                );
+                assert_eq!(
+                    arg.get_env(),
+                    None,
+                    "`{group} {sub} --{id}` must not read a value from the environment"
+                );
+            }
+        }
+    }
 
     #[test]
     fn add_accepts_github_source_url_via_flag_without_spec() {
@@ -625,5 +656,64 @@ mod tests {
         let cli = Cli::try_parse_from(["sempkg", "refresh"]).expect("refresh should parse");
 
         assert!(matches!(cli.command, Commands::Refresh));
+    }
+
+    /// Bare `sempkg status` is the diagnostic report. On the old CLI (NAME
+    /// required) clap rejected it outright, so this is the parse that had to
+    /// start working.
+    #[test]
+    fn status_without_name_parses() {
+        let cli = Cli::try_parse_from(["sempkg", "status"])
+            .expect("bare `sempkg status` should parse as the diagnostic report");
+
+        assert!(matches!(cli.command, Commands::Status { .. }));
+    }
+
+    #[test]
+    fn status_without_name_has_no_package_and_no_json() {
+        let cli = Cli::try_parse_from(["sempkg", "status"]).expect("bare status should parse");
+
+        match cli.command {
+            Commands::Status { name, json } => {
+                assert_eq!(name, None);
+                assert!(!json);
+            }
+            _ => panic!("expected status command"),
+        }
+    }
+
+    #[test]
+    fn status_json_flag_parses() {
+        let cli = Cli::try_parse_from(["sempkg", "status", "--json"])
+            .expect("`sempkg status --json` should parse");
+
+        assert!(matches!(cli.command, Commands::Status { .. }));
+    }
+
+    /// Regression pin: `sempkg status <name>` keeps its existing meaning — the
+    /// name is still accepted positionally and reaches the same code path.
+    #[test]
+    fn status_with_name_parses() {
+        let cli = Cli::try_parse_from(["sempkg", "status", "aws-sdk"])
+            .expect("`sempkg status <name>` should keep parsing");
+
+        match cli.command {
+            Commands::Status { name, json } => {
+                assert_eq!(name.as_deref(), Some("aws-sdk"));
+                assert!(!json);
+            }
+            _ => panic!("expected status command"),
+        }
+    }
+
+    /// `--json` only renders the installation report; asking for JSON *and* a
+    /// package name is rejected rather than silently ignoring one of them.
+    #[test]
+    fn status_name_with_json_is_rejected() {
+        let err = Cli::try_parse_from(["sempkg", "status", "aws-sdk", "--json"])
+            .err()
+            .expect("`status <name> --json` should be rejected");
+
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 }
