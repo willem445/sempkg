@@ -28,7 +28,7 @@ thiserror = "2"
 tempfile = "3"
 which = "8"
 reqwest = { version = "0.13" }
-ed25519-dalek = { version = "2", features = ["pkcs8", "pem"] }
+ed25519-dalek = { version = "3", features = ["pkcs8", "pem"] }
 lancedb = "0.31"
 arrow-array = "58"
 arrow-schema = "58"
