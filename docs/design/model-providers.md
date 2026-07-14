@@ -190,7 +190,45 @@ index's recorded model ID.
 `sempkg embedding pull`, `sempkg reranker pull`, and `sempkg query-expansion pull`
 download and cache the local GGUF file.  They are a no-op (with a clear message) when
 `provider` is set to `"openai"` or `"copilot"` — remote providers need no local
-model file.
+model file.  They are also a no-op when the GGUF is already on disk, so re-running a
+`pull` (or restoring `~/.sempkg/models/` from a CI cache) costs nothing.
+
+### Model downloads are anonymous — by decision
+
+**sempkg sends no credential when it downloads a model, and has no way to be given
+one** (#106).  `download_file` builds a plain `GET`; there is no token parameter, no
+`Authorization` header, no `HF_TOKEN` environment variable, and no `--hf-token` flag.
+
+The reasoning is a deliberate trade, not an oversight.  The default model repos are
+public, so a token buys nothing in the common case — while accepting one means owning
+the whole problem of handling a user secret safely: keeping it out of logs, out of
+error messages that render URLs and headers, off redirect hops to third-party CDNs,
+and out of requests to whatever host `--gguf-url` happens to point at.  That is a
+standing liability in exchange for a rare convenience, so the project declines it.
+The cost is real and accepted: **sempkg cannot download a gated model**, and cannot
+authenticate its way past a HuggingFace rate limit.  The answer to both is manual
+placement (below).
+
+> **Contract change.**  `--hf-token` used to exist on all three `pull` commands (and
+> accepted `HF_TOKEN` from the environment).  It was **removed**, not deprecated —
+> the flag is gone and passing it is now an error.  Scripts that passed a token must
+> drop the flag; since the default repos are public, nothing else changes for them.
+> `cli::tests::pull_commands_accept_no_token_at_all` pins this so the flag cannot
+> drift back in.
+
+Note this is only about *model downloads*.  Remote inference providers
+(`provider = "openai"`) still authenticate with their own API key, and `registry.rs`
+still uses GitHub tokens for bundle downloads.  Those are separate, opt-in code paths.
+
+### Failed downloads point at manual placement
+
+Since sempkg cannot authenticate its way past an outage or a rate limit, a failed
+download is often not retryable in the moment — so the failure has to leave the user
+able to finish the job themselves.  Every `pull` path fails with the same notice
+(`reranker::manual_placement_notice`): the model URL to fetch, the *exact* path to
+save it to, and the fact that the next run picks the file up instead of re-downloading
+it.  That escape hatch only works if we say precisely where the file goes, so the
+message spells it out rather than making the user derive it from config.
 
 ---
 

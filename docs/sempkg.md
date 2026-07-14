@@ -488,6 +488,32 @@ sempkg reranker status
 sempkg reranker test "how to read a CSV" "read_csv opens a file and returns a DataFrame"
 ```
 
+`pull` is idempotent: if the GGUF is already on disk it prints
+`Model already present` and downloads nothing.
+
+#### Downloads are anonymous
+
+sempkg sends **no credentials** when it downloads a model. The default model repos
+are public, and sempkg deliberately does not take on the risk of handling your
+HuggingFace token — there is no `--hf-token` flag and no `HF_TOKEN` environment
+variable. The trade-off is that sempkg cannot fetch a *gated* model; use
+`--gguf-url` with a public GGUF, or place the file by hand (below).
+
+> **Changed:** `--hf-token` was removed from `reranker pull`, `embedding pull`, and
+> `query-expansion pull`. If you passed it, drop the flag — the default models are
+> public and download fine without it.
+
+#### When a download fails
+
+A failed pull is usually HuggingFace being unavailable or rate-limiting rather than
+a problem with your setup, and it is not something sempkg can authenticate its way
+around. So it tells you how to finish the job yourself: the failure prints the model
+URL and the **exact path** to save the file to.
+
+Fetch it by any other means (a browser, `curl`, another machine), drop it at that
+path, and re-run — `pull` sees the file and skips the download entirely. The same
+applies to `embedding pull` and `query-expansion pull`.
+
 ### Usage
 
 ```powershell
@@ -718,8 +744,8 @@ Local package management:
   pkg lance-index <name> [--pattern <glob>]   Build/update LanceDB doc index
 
 Reranker model management:
-  reranker pull   [--gguf-url <url>] [--hf-token <tok>]
-                                              Download Qwen3-Reranker GGUF
+  reranker pull   [--gguf-url <url>]           Download Qwen3-Reranker GGUF
+                                              (anonymous; no-op if already present)
   reranker status                             Show model path and status
   reranker test   <query> <document>          Score a test (query, doc) pair
 ```

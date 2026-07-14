@@ -467,11 +467,6 @@ pub enum RerankerCommands {
         /// Override the GGUF download URL.
         #[arg(long)]
         gguf_url: Option<String>,
-
-        /// HuggingFace access token for downloading gated models.
-        /// Can also be supplied via the HF_TOKEN environment variable.
-        #[arg(long, env = "HF_TOKEN")]
-        hf_token: Option<String>,
     },
 
     /// Show local model status (present / missing, configured paths, build flags).
@@ -503,11 +498,6 @@ pub enum EmbeddingCommands {
         /// Override the GGUF download URL.
         #[arg(long)]
         gguf_url: Option<String>,
-
-        /// HuggingFace access token for downloading gated models.
-        /// Can also be supplied via the HF_TOKEN environment variable.
-        #[arg(long, env = "HF_TOKEN")]
-        hf_token: Option<String>,
     },
 
     /// Show embedding model status (present / missing, configured paths, build flags).
@@ -525,11 +515,6 @@ pub enum QueryExpansionCommands {
         /// Override the GGUF download URL.
         #[arg(long)]
         gguf_url: Option<String>,
-
-        /// HuggingFace access token for downloading gated models.
-        /// Can also be supplied via the HF_TOKEN environment variable.
-        #[arg(long, env = "HF_TOKEN")]
-        hf_token: Option<String>,
     },
 
     /// Show query-expansion model status.
@@ -545,8 +530,45 @@ pub enum QueryExpansionCommands {
 #[cfg(test)]
 mod tests {
     use super::{Cli, Commands};
-    use clap::Parser;
+    use clap::{CommandFactory, Parser};
     use std::path::PathBuf;
+
+    /// Model downloads are anonymous-only (#106): sempkg does not want to carry the
+    /// risk of handling a user's HuggingFace credential. No `pull` command may take
+    /// a token — not as a flag, and not from the environment. This pins the contract
+    /// against a well-meaning re-introduction.
+    ///
+    /// Asserted against clap's own arg definitions rather than by setting an env
+    /// var, because `set_var` races with the other tests parsing in parallel.
+    #[test]
+    fn pull_commands_accept_no_token_at_all() {
+        let cli = Cli::command();
+
+        for (group, sub) in [
+            ("reranker", "pull"),
+            ("embedding", "pull"),
+            ("query-expansion", "pull"),
+        ] {
+            let pull = cli
+                .find_subcommand(group)
+                .unwrap_or_else(|| panic!("`{group}` subcommand"))
+                .find_subcommand(sub)
+                .unwrap_or_else(|| panic!("`{group} {sub}` subcommand"));
+
+            for arg in pull.get_arguments() {
+                let id = arg.get_id().as_str();
+                assert!(
+                    !id.contains("token"),
+                    "`{group} {sub}` must take no token argument, found `--{id}`"
+                );
+                assert_eq!(
+                    arg.get_env(),
+                    None,
+                    "`{group} {sub} --{id}` must not read a value from the environment"
+                );
+            }
+        }
+    }
 
     #[test]
     fn add_accepts_github_source_url_via_flag_without_spec() {

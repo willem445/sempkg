@@ -279,16 +279,90 @@ jobs:
           output_n = 5
           EOF
 
+      # ---- Reranker model (cached across runs) ----
+      #
+      # The GGUF is ~600 MB and was re-pulled from HuggingFace on every run, so a
+      # HuggingFace outage failed this job for reasons unrelated to the change
+      # under test (#106). Cache it on the exact model the pull produces: the key
+      # carries both the destination filename and a digest of the source URL, so
+      # bumping either (a new model, a new quant, a new repo) misses the cache and
+      # re-downloads, while an unrelated edit to reranker.rs does not.
+      - name: Derive reranker model cache key
+        id: model-key
+        shell: bash
+        run: |
+          src=src/sempkg/src/reranker.rs
+          # Both greps are anchored to the exact declaration the code reads, so an
+          # unrelated URL or `.join("….gguf")` added elsewhere in the file (a doc
+          # example, a test fixture) cannot silently hijack the key. A silently
+          # changed key is only one redundant 600 MB re-download, but it is silent.
+          #
+          # DEFAULT_GGUF_URL — where the model is fetched from.
+          url=$(grep -A2 'pub const DEFAULT_GGUF_URL' "$src" \
+                | grep -oE 'https://[^"]+\.gguf' | head -n1)
+          # default_model_path() — what the pull writes into ~/.sempkg/models/.
+          file=$(grep -A3 'pub fn default_model_path' "$src" \
+                 | grep -oE '\.join\("[^"]+\.gguf"\)' | head -n1 \
+                 | sed -E 's/^\.join\("(.*)"\)$/\1/')
+          if [ -z "$url" ] || [ -z "$file" ]; then
+            echo "could not derive the default reranker GGUF url/filename from $src" >&2
+            exit 1
+          fi
+          digest=$(printf '%s' "$url" | sha256sum | cut -c1-12)
+          echo "file=$file" >> "$GITHUB_OUTPUT"
+          echo "key=sempkg-models-ubuntu-$file-$digest" >> "$GITHUB_OUTPUT"
+          echo "model: $file"
+          echo "source: $url"
+          echo "cache key: sempkg-models-ubuntu-$file-$digest"
+
+      # Restore and save are split on purpose. `actions/cache`'s combined form
+      # saves in a post step gated on `success()`, so any later failure in this
+      # long job (a bundle install flaking, a functional test going red) would
+      # throw the 600 MB model away and re-download it next run — the exact cost
+      # this cache exists to avoid. Saving right after the model is verified
+      # decouples it from the rest of the job.
+      #
+      # No restore-keys: a prefix match would restore a *different* model, which
+      # the pull would then ignore and re-download anyway.
+      - name: Restore cached HuggingFace models
+        id: model-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.sempkg/models
+          key: ${{ steps.model-key.outputs.key }}
+
+      # `sempkg reranker pull` already no-ops when the GGUF is on disk (pinned by
+      # reranker::tests::pull_model_skips_download_when_model_is_present), but
+      # skipping the step outright means a cache hit makes no HuggingFace request
+      # at all — which is the point when HuggingFace is the thing that is down.
       - name: Download Qwen3-Reranker GGUF model from HuggingFace
+        if: steps.model-cache.outputs.cache-hit != 'true'
         run: ./target/release/sempkg reranker pull --workspace /tmp/sempkg-test-workspace
         env:
           SEMPKG_WORKSPACE: /tmp/sempkg-test-workspace
         timeout-minutes: 10
 
       - name: Verify reranker is configured and model is present
-        run: ./target/release/sempkg reranker status --workspace /tmp/sempkg-test-workspace
+        run: |
+          ./target/release/sempkg reranker status --workspace /tmp/sempkg-test-workspace
+          # `reranker status` exits 0 even when the model is missing, so assert on
+          # the file itself — otherwise a stale or empty cache entry would sail
+          # past this step and fail much later, inside the functional tests.
+          model="$HOME/.sempkg/models/${{ steps.model-key.outputs.file }}"
+          if [ ! -s "$model" ]; then
+            echo "reranker model missing or empty after pull/cache restore: $model" >&2
+            exit 1
+          fi
         env:
           SEMPKG_WORKSPACE: /tmp/sempkg-test-workspace
+
+      # Only after the model is verified present — never cache a bad download.
+      - name: Save HuggingFace models to cache
+        if: steps.model-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.sempkg/models
+          key: ${{ steps.model-key.outputs.key }}
 
       - name: Install codegraph bundle (fresh build with new sembundle)
         run: |

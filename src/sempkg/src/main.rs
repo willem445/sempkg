@@ -1134,7 +1134,7 @@ fn run_reranker(cmd: RerankerCommands, workspace: Option<&Path>) -> Result<()> {
         .unwrap_or_default();
 
     match cmd {
-        RerankerCommands::Pull { gguf_url, hf_token } => {
+        RerankerCommands::Pull { gguf_url } => {
             if cfg.provider != providers::ProviderKind::Local {
                 anyhow::bail!(
                     "`sempkg reranker pull` only applies to `provider = \"local\"`. \
@@ -1142,11 +1142,10 @@ fn run_reranker(cmd: RerankerCommands, workspace: Option<&Path>) -> Result<()> {
                 );
             }
             let pull_cfg = cfg.clone();
-            let token = hf_token.as_deref();
             let source_url = gguf_url.as_deref();
 
             println!("Pulling Qwen3-Reranker-0.6B GGUF model...");
-            reranker::pull_model(&pull_cfg, token, source_url)?;
+            reranker::pull_model(&pull_cfg, source_url)?;
 
             println!();
             println!(
@@ -1217,11 +1216,7 @@ fn run_embedding(cmd: EmbeddingCommands, workspace: Option<&Path>) -> Result<()>
     let cfg = load_embedding_cfg(workspace);
 
     match cmd {
-        EmbeddingCommands::Pull {
-            model,
-            gguf_url,
-            hf_token,
-        } => {
+        EmbeddingCommands::Pull { model, gguf_url } => {
             if cfg.provider != providers::ProviderKind::Local {
                 anyhow::bail!(
                     "`sempkg embedding pull` only applies to `provider = \"local\"`. \
@@ -1244,7 +1239,7 @@ fn run_embedding(cmd: EmbeddingCommands, workspace: Option<&Path>) -> Result<()>
             };
 
             println!("Pulling {} GGUF model...", selected.display_name());
-            embedding::pull_model(selected, &dest, hf_token.as_deref(), gguf_url.as_deref())?;
+            embedding::pull_model(selected, &dest, gguf_url.as_deref())?;
             println!();
 
             // If the pulled model differs from the configured one, tell the user
@@ -1275,7 +1270,7 @@ fn run_query_expansion(cmd: QueryExpansionCommands, workspace: Option<&Path>) ->
     let cfg = load_query_expansion_cfg(workspace);
 
     match cmd {
-        QueryExpansionCommands::Pull { gguf_url, hf_token } => {
+        QueryExpansionCommands::Pull { gguf_url } => {
             if cfg.provider != providers::ProviderKind::Local {
                 anyhow::bail!(
                     "`sempkg query-expansion pull` only applies to `provider = \"local\"`. \
@@ -1283,7 +1278,7 @@ fn run_query_expansion(cmd: QueryExpansionCommands, workspace: Option<&Path>) ->
                 );
             }
             println!("Pulling query-expansion GGUF model...");
-            query_expansion::pull_model(&cfg, hf_token.as_deref(), gguf_url.as_deref())?;
+            query_expansion::pull_model(&cfg, gguf_url.as_deref())?;
             println!();
             println!("Model ready. The MCP `query` tool will expand queries automatically.");
             Ok(())
