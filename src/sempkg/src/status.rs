@@ -429,10 +429,11 @@ mod tests {
 
     /// What this pins, and what it cannot.
     ///
-    /// `reranker` and `embeddings` are checked in **both** directions, and CI
-    /// exercises both: the plain `cargo test` run compiles with neither, the
-    /// `--features reranker,embeddings` run with both. So a dropped, misnamed,
-    /// or unconditionally-pushed entry for those two fails here.
+    /// `reranker` and `embeddings` are checked in **both** directions, but CI
+    /// only builds sempkg tests with `--features reranker,embeddings` (mirroring
+    /// the release CPU artifacts), so CI catches a dropped or misnamed entry for
+    /// those two; the other direction — an entry pushed unconditionally — only
+    /// fires in a featureless local `cargo test`.
     ///
     /// The GPU rows (cuda/vulkan/rocm/metal) can only be exercised *negatively*.
     /// No test job builds a GPU backend — each needs a vendor SDK, and
