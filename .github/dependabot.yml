@@ -16,6 +16,16 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    groups:
+      # arrow-array/arrow-schema must move in lockstep with each other and with
+      # lancedb: lancedb pins `arrow ^58`, so an arrow bump ahead of lancedb puts
+      # two arrow versions in the tree and breaks the build. Grouping them into a
+      # single PR keeps them coordinated (and easy to close together while
+      # lancedb still trails the latest arrow).
+      arrow-lance:
+        patterns:
+          - "arrow*"
+          - "lance*"
 
   - package-ecosystem: "github-actions"
     directory: "/"
