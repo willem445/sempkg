@@ -156,6 +156,17 @@ Get-PSDrive C | Select-Object @{n='FreeGB';e={[math]::Round($_.Free/1GB,1)}}
 See the `rust-checks` skill for the day-to-day cheat sheet version of this
 policy, and the `run-tests` skill for Python test specifics.
 
+### Why `.claude/settings.json` still allowlists cargo commands
+
+`.claude/settings.json` allowlists `cargo build`/`test`/`clippy` (and more)
+so they run without a permission prompt — that allowlist does not scope by
+agent role, because `settings.json` has no mechanism to. This is deliberate,
+not an oversight: the permission layer answers *"does this command need a
+human prompt?"*, not *"is this agent allowed to run it?"*. Workers need those
+commands unprompted to do their job. The "reviewers do not compile" rule
+above is the actual authority on who may run them — it's enforced in prose,
+by the reviewer reading and following it, not by the permission allowlist.
+
 ## MCP (sempkg semantic search)
 The sempkg MCP server is configured in `.mcp.json`. It exposes version-accurate semantic indexes for installed packages declared in `sempkg.toml`.
 

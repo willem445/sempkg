@@ -4,6 +4,10 @@
 # Signing keys — private key must never be committed
 keys/private.pem
 
+# Shared cargo target dir for the loomux agent working group — never committed,
+# never cleaned by an individual agent (see CLAUDE.md's Build & test policy)
+.loomux-target/
+
 # Claude Code: personal/local settings and per-agent worktree state
 .claude/settings.local.json
 .claude/worktrees/
