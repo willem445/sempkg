@@ -142,8 +142,46 @@ jobs:
       - name: Test sembundle
         run: cargo test --manifest-path src/sembundle/Cargo.toml
 
+      # Mirror the feature set the release CPU artifacts ship with, so what CI
+      # compiles and tests is what users actually run. (`--all-features` is not
+      # usable here: the GPU backends pull in mutually exclusive vendor SDKs.)
       - name: Test sempkg
-        run: cargo test --manifest-path src/sempkg/Cargo.toml --features reranker
+        run: cargo test --manifest-path src/sempkg/Cargo.toml --features reranker,embeddings
+
+  # The uninstall scripts delete files and (on Windows) edit the user PATH, so
+  # they are exercised end-to-end rather than reviewed by eye. Both harnesses run
+  # entirely inside a throwaway sandbox — a fake HOME/USERPROFILE, a fake install
+  # dir, a victim dir, a canary dir and a fake user workspace — and assert what
+  # must be removed *and* what must survive. The Windows harness additionally
+  # snapshots the real user PATH (raw value + REG_EXPAND_SZ kind), runs against a
+  # hostile probe value, and restores it in a `finally`, asserting the restore.
+  #
+  # Note: the harnesses seed the pre-uninstall state directly instead of running
+  # the installer. install.ps1 has a known pre-existing PATH-append bug (#107), so
+  # an install -> uninstall round trip would currently fail on the *installer's*
+  # corruption rather than on uninstall's behaviour. A full round trip is worth
+  # adding once #107 lands.
+  uninstall-scripts:
+    name: Uninstall scripts — ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Smoke-test uninstall.sh
+        if: runner.os == 'Linux'
+        shell: bash
+        run: sh tests/uninstall/smoke.sh
+
+      - name: Smoke-test uninstall.ps1
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: pwsh -File tests/uninstall/smoke.ps1
 
   functional-tests:
     name: Functional MCP tests (ubuntu)
@@ -219,7 +257,7 @@ jobs:
           exit 1
 
       - name: Build sempkg release binary
-        run: cargo build --release --manifest-path src/sempkg/Cargo.toml --features reranker
+        run: cargo build --release --manifest-path src/sempkg/Cargo.toml --features reranker,embeddings
 
       # ---- Install the test bundle ----
 

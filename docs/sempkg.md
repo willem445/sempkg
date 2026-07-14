@@ -170,9 +170,15 @@ cargo build --release --features embeddings,reranker,vulkan
 ```
 
 With a GPU backend compiled in, `gpu = "auto"` offloads automatically — no config
-change needed. `sempkg embedding status` (and the reranker / query-expansion
-`status` commands) report the resolved thread count and which GPU backend, if
-any, was compiled in.
+change needed. `sempkg status` reports which backend the running binary was built
+with (as do `sempkg embedding status` and the reranker / query-expansion `status`
+commands, alongside the resolved thread count).
+
+Pre-built GPU binaries ship with every release, so most users never build one:
+see [GPU acceleration (CUDA)](gpu-cuda.md) for NVIDIA (Turing and newer) and
+[GPU acceleration (Vulkan)](gpu-vulkan.md) for AMD, Intel, and pre-Turing NVIDIA
+cards. The macOS artifact is built with `metal`, so Apple Silicon offloads out of
+the box.
 
 Download the models, then build the vector indexes for installed bundles and
 local packages:
@@ -331,6 +337,54 @@ The trailing `# ...` is the optional bundle description recorded with
 ```powershell
 sempkg status aws-sdk
 ```
+
+### Installation diagnostics
+
+Run `sempkg status` with no name to get a report on the installation itself.
+This is what to paste into a bug report — it answers, in one place, which
+build you are running and why local inference behaves the way it does:
+
+```powershell
+sempkg status
+```
+
+```
+sempkg 0.6.1
+  commit      : 1f3c9a0…            # the release commit; "unknown" for local builds
+  os / arch   : windows / x86_64
+  features    : reranker, embeddings
+  gpu build   : CPU-only — no GPU backend compiled in (…)
+  cpu threads : 32
+
+[embedding]                          # …and [reranker], [query_expansion]
+  enabled     : true
+  provider    : local
+  model       : embeddinggemma-300m (dim 768)
+  gpu         : auto
+  cpu threads : 32
+  model file  : C:\Users\me\.sempkg\models\embeddinggemma-300m-qat-Q8_0.gguf
+  model state : ✓ present (313.4 MB)
+
+[workspace]                          # sempkg.toml / sempkg.lock / installed bundles
+[global]                             # ~/.sempkg: bundles, downloaded models, packages
+[codegraph]                          # on PATH? which version?
+```
+
+The `features` and `gpu build` lines are the ones most bug reports turn on:
+GPU offload is a **build-time** capability, so `gpu = "auto"` silently runs on
+the CPU unless the binary itself was compiled with a GPU backend
+(see [GPU acceleration (CUDA)](gpu-cuda.md) and [GPU acceleration (Vulkan)](gpu-vulkan.md)).
+
+Add `--json` for the same report as machine-readable JSON (useful for agents
+and issue templates):
+
+```powershell
+sempkg status --json
+```
+
+`--json` describes the installation, so it cannot be combined with a package
+name — `sempkg status <name> --json` is rejected rather than silently ignoring
+one of the two.
 
 ---
 
@@ -652,6 +706,8 @@ Workspace / bundle management:
                        --url <url>            (direct GitHub release URL)
                        [--global]
                        [--verify-key <pem>]
+  status                                      Installation diagnostics report
+         [--json]                             (machine-readable form)
   status <name>                               Show bundle/package status
   repair                                      Recreate missing .codegraph views
 

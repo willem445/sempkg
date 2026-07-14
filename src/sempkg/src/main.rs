@@ -14,6 +14,7 @@ mod providers;
 mod query_expansion;
 mod registry;
 mod reranker;
+mod status;
 mod store;
 mod verify;
 
@@ -659,9 +660,14 @@ fn run(cmd: Commands, workspace: Option<&Path>) -> Result<()> {
         }
 
         // -----------------------------------------------------------------------
-        // Status
+        // Status — installation diagnostics (no NAME) or one bundle / package
         // -----------------------------------------------------------------------
-        Commands::Status { name } => {
+        Commands::Status { name: None, json } => status::run(workspace, json),
+
+        Commands::Status {
+            name: Some(name),
+            json: _,
+        } => {
             let reg = PackageRegistry::load()?;
             if let Some(pkg) = reg.get(&name) {
                 println!("Package: {} (local)", pkg.name);

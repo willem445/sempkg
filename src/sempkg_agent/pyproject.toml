@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "sempkg-agent"
-version = "0.6.0"
+version = "0.6.1"
 
 description = "Grounded code-intelligence agent server over sempkg bundles (A2A / MCP / REST)"
 readme = "README.md"

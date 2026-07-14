@@ -207,10 +207,19 @@ pub enum Commands {
         verify_key: Option<PathBuf>,
     },
 
-    /// Show status of an installed bundle or registered package.
+    /// Show a diagnostic report for this sempkg installation, or the status of
+    /// one installed bundle / registered package.
+    ///
+    /// With no NAME, prints version, build features, GPU backend, model, store,
+    /// and CodeGraph diagnostics — the information a bug report needs.
+    /// With a NAME, prints the status of that bundle or registered package.
     Status {
-        /// Package/bundle name.
-        name: String,
+        /// Package/bundle name. Omit for the installation-wide diagnostic report.
+        name: Option<String>,
+
+        /// Print the diagnostic report as JSON. Only valid without a NAME.
+        #[arg(long, conflicts_with = "name")]
+        json: bool,
     },
 
     /// Uninstall a bundle (remove from local or global store).
@@ -647,5 +656,64 @@ mod tests {
         let cli = Cli::try_parse_from(["sempkg", "refresh"]).expect("refresh should parse");
 
         assert!(matches!(cli.command, Commands::Refresh));
+    }
+
+    /// Bare `sempkg status` is the diagnostic report. On the old CLI (NAME
+    /// required) clap rejected it outright, so this is the parse that had to
+    /// start working.
+    #[test]
+    fn status_without_name_parses() {
+        let cli = Cli::try_parse_from(["sempkg", "status"])
+            .expect("bare `sempkg status` should parse as the diagnostic report");
+
+        assert!(matches!(cli.command, Commands::Status { .. }));
+    }
+
+    #[test]
+    fn status_without_name_has_no_package_and_no_json() {
+        let cli = Cli::try_parse_from(["sempkg", "status"]).expect("bare status should parse");
+
+        match cli.command {
+            Commands::Status { name, json } => {
+                assert_eq!(name, None);
+                assert!(!json);
+            }
+            _ => panic!("expected status command"),
+        }
+    }
+
+    #[test]
+    fn status_json_flag_parses() {
+        let cli = Cli::try_parse_from(["sempkg", "status", "--json"])
+            .expect("`sempkg status --json` should parse");
+
+        assert!(matches!(cli.command, Commands::Status { .. }));
+    }
+
+    /// Regression pin: `sempkg status <name>` keeps its existing meaning — the
+    /// name is still accepted positionally and reaches the same code path.
+    #[test]
+    fn status_with_name_parses() {
+        let cli = Cli::try_parse_from(["sempkg", "status", "aws-sdk"])
+            .expect("`sempkg status <name>` should keep parsing");
+
+        match cli.command {
+            Commands::Status { name, json } => {
+                assert_eq!(name.as_deref(), Some("aws-sdk"));
+                assert!(!json);
+            }
+            _ => panic!("expected status command"),
+        }
+    }
+
+    /// `--json` only renders the installation report; asking for JSON *and* a
+    /// package name is rejected rather than silently ignoring one of them.
+    #[test]
+    fn status_name_with_json_is_rejected() {
+        let err = Cli::try_parse_from(["sempkg", "status", "aws-sdk", "--json"])
+            .err()
+            .expect("`status <name> --json` should be rejected");
+
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 }

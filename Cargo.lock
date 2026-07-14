@@ -5437,7 +5437,7 @@ dependencies = [
 
 [[package]]
 name = "sembundle"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -5465,7 +5465,7 @@ dependencies = [
 
 [[package]]
 name = "sempkg"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "arrow-array",

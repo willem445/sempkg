@@ -122,6 +122,30 @@ cargo install --path src/sembundle
 cargo install --path src/sempkg
 ```
 
+### Uninstall
+
+**Linux / macOS:**
+```sh
+curl -fsSL https://raw.githubusercontent.com/willem445/sempkg/main/uninstall.sh | sh
+```
+
+**Windows (PowerShell):**
+```powershell
+irm https://raw.githubusercontent.com/willem445/sempkg/main/uninstall.ps1 | iex
+```
+
+By default this removes only the installed binaries (plus, on Windows, the CUDA runtime DLLs the GPU installer unpacked next to them, and the `PATH` entry if the directory is now empty). Your data is left alone. Add `--purge` (`-Purge` on Windows) to also delete the global data directory `~/.sempkg` — global bundles, the downloaded GGUF models (several GB), and the local-package registry. Both scripts take the same selection flags as their installer (`--only` / `--dir` for `uninstall.sh`, `-Only` / `-InstallDir` for `uninstall.ps1`) and are safe to re-run.
+
+Everything else is yours to remove, because it belongs to your projects rather than to the installation:
+
+| Left behind | What it is | Remove with |
+|-------------|------------|-------------|
+| `~/.sempkg/` | Global bundles, GGUF models, local-package registry | `--purge`, or delete the directory |
+| `<project>/.sempkg/`, `sempkg.toml`, `sempkg.lock` | Per-project workspace state | Delete them in each project |
+| `<project>/.codegraph/` | CodeGraph index of your own repo | Delete it in each project |
+| CodeGraph CLI | Shared npm package | `npm uninstall -g @colbymchenry/codegraph` |
+| MCP entries | e.g. `.vscode/mcp.json` pointing at `sempkg` | Edit the config |
+
 ---
 
 ## Quick Start
@@ -184,6 +208,20 @@ my-workspace/
 That keeps semantic indexes scoped to the current repository, just like other
 workspace-local tooling and dependency metadata.
 
+### Check your installation
+
+```powershell
+sempkg status            # diagnostics: version, build features, GPU backend, models, stores, CodeGraph
+sempkg status --json     # the same report, machine-readable
+sempkg status my-sdk     # status of one installed bundle or registered package
+```
+
+Bare `sempkg status` is the report to paste into a bug report. It shows which
+cargo features the binary was built with and whether it has a GPU backend —
+GPU offload is a *build-time* capability, so `gpu = "auto"` runs on the CPU
+unless the binary itself was compiled for CUDA, Vulkan, ROCm, or Metal. See the
+[sempkg User Guide](docs/sempkg.md#installation-diagnostics) for the full output.
+
 ### GitHub authentication (private / enterprise)
 
 When using private repositories or restricted GitHub hosts (GitHub Enterprise),
@@ -214,6 +252,8 @@ sempkg add https://github.company.com/org/repo/releases/tag/v3.0.3 --full
 - [sembundle User Guide](docs/sembundle.md) — bundle creation, signing, publishing, and distribution
 - [SemBundle Format Specification](docs/sembundle-spec.md) — `.sembundle` archive format
 - [Registry Server Guide](docs/registry-server.md) — self-hosting the bundle registry
+- [GPU acceleration (CUDA)](docs/gpu-cuda.md) — NVIDIA builds: what they need, how to build one
+- [GPU acceleration (Vulkan)](docs/gpu-vulkan.md) — vendor-neutral builds for AMD, Intel, and pre-Turing NVIDIA cards
 - [ADR-001: LanceDB Documentation Index](docs/adr-001-lancedb-doc-index.md)
 - [Vision & Roadmap](docs/vision-roadmap.md)
 
