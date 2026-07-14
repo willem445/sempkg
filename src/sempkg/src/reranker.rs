@@ -214,6 +214,35 @@ fn model_download_request(
     client.get(url)
 }
 
+/// What to tell a user whose download came back `401 Unauthorized`.
+///
+/// sempkg sends no credentials, so a 401 is not something the user can fix by
+/// supplying one — the URL simply isn't reachable anonymously. Say that, and point
+/// at the two things that do work.
+fn unauthorized_notice(url: &str, dest: &Path) -> String {
+    format!(
+        "HTTP 401 Unauthorized for {url}\n\n\
+         This URL requires authentication, but sempkg downloads models anonymously \
+         and sends no credentials.\n\n\
+         Point `--gguf-url` at a public GGUF, or download the file yourself and save \
+         it to:\n\
+         \n    {dest}\n\n\
+         sempkg picks it up on the next run.",
+        dest = dest.display()
+    )
+}
+
+/// Base delay between download retries; the nth retry waits `n × RETRY_BACKOFF`.
+///
+/// Zero under `cfg(test)`. The offline failure-path tests point `download_file` at a
+/// refused port, so every attempt fails instantly and the only thing the backoff
+/// buys is seconds of sleeping in the test suite. The retry *count* is unchanged, so
+/// the tests still exercise the real retry loop.
+#[cfg(not(test))]
+const RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
+#[cfg(test)]
+const RETRY_BACKOFF: std::time::Duration = std::time::Duration::ZERO;
+
 /// Download a file with a simple progress indicator and save it to `dest`.
 ///
 /// The request is **anonymous** and sempkg carries no credential for it: the model
@@ -253,7 +282,7 @@ pub fn download_file(url: &str, dest: &Path) -> Result<()> {
             Ok(r) => r,
             Err(e) if attempt < max_attempts => {
                 println!("  download attempt {attempt}/{max_attempts} failed: {e}; retrying...");
-                std::thread::sleep(Duration::from_secs(attempt as u64 * 2));
+                std::thread::sleep(RETRY_BACKOFF * attempt);
                 continue;
             }
             Err(e) => {
@@ -262,19 +291,14 @@ pub fn download_file(url: &str, dest: &Path) -> Result<()> {
         };
 
         if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
-            anyhow::bail!(
-                "HTTP 401 Unauthorized for {url}
-
-                 This URL requires authentication, and sempkg downloads models                  anonymously — it does not send credentials.
-                 Point `--gguf-url` at a public GGUF, or download the file yourself                  and place it where sempkg expects it."
-            );
+            anyhow::bail!(unauthorized_notice(url, dest));
         }
 
         let mut resp = match resp.error_for_status() {
             Ok(r) => r,
             Err(e) if attempt < max_attempts => {
                 println!("  download attempt {attempt}/{max_attempts} failed: {e}; retrying...");
-                std::thread::sleep(Duration::from_secs(attempt as u64 * 2));
+                std::thread::sleep(RETRY_BACKOFF * attempt);
                 continue;
             }
             Err(e) => return Err(e).with_context(|| format!("HTTP error for {url}")),
@@ -292,6 +316,25 @@ pub fn download_file(url: &str, dest: &Path) -> Result<()> {
             Ok(n) => {
                 file.flush()
                     .with_context(|| format!("flushing {}", tmp_dest.display()))?;
+                // Close the handle before any rename/remove — Windows refuses both
+                // while the file is still open.
+                drop(file);
+
+                // A short body must never be renamed into place. hyper already errors
+                // on a response that undershoots its Content-Length, so this only bites
+                // on a chunked/length-less response that ends cleanly early — but the
+                // result would be a truncated GGUF sitting at the model path, which CI
+                // then caches under a key claiming it is the real thing. Cheap to rule
+                // out; expensive to debug.
+                if let Some(expected) = total {
+                    if n != expected {
+                        let _ = std::fs::remove_file(&tmp_dest);
+                        anyhow::bail!(
+                            "truncated download for {url}: expected {expected} bytes, got {n}"
+                        );
+                    }
+                }
+
                 std::fs::rename(&tmp_dest, dest).with_context(|| {
                     format!("moving {} to {}", tmp_dest.display(), dest.display())
                 })?;
@@ -306,7 +349,7 @@ pub fn download_file(url: &str, dest: &Path) -> Result<()> {
             Err(e) if attempt < max_attempts => {
                 let _ = std::fs::remove_file(&tmp_dest);
                 println!("  download attempt {attempt}/{max_attempts} failed: {e}; retrying...");
-                std::thread::sleep(Duration::from_secs(attempt as u64 * 2));
+                std::thread::sleep(RETRY_BACKOFF * attempt);
             }
             Err(e) => {
                 let _ = std::fs::remove_file(&tmp_dest);
@@ -822,6 +865,62 @@ mod tests {
             model: Some(model_path.to_string_lossy().to_string()),
             ..Default::default()
         }
+    }
+
+    /// Both user-facing notices are multi-line string literals held together by
+    /// `\n\` continuations. Drop one and the source indentation leaks into the
+    /// message as long runs of spaces mid-sentence — exactly what shipped in the 401
+    /// message and got caught in review.
+    ///
+    /// The notices use one deliberate layout: a 4-space indent to offset a URL or a
+    /// path onto its own line. Every other line is prose and must carry no
+    /// indentation and no interior run of spaces.
+    #[test]
+    fn user_facing_notices_are_not_mangled_by_source_indentation() {
+        let dest = Path::new("/home/u/.sempkg/models/qwen3-reranker-0.6b-q8_0.gguf");
+
+        for notice in [
+            unauthorized_notice(DEFAULT_GGUF_URL, dest),
+            manual_placement_notice(DEFAULT_GGUF_URL, dest),
+        ] {
+            for line in notice.lines() {
+                // A deliberately offset value: exactly four spaces, then the value.
+                let body = match line.strip_prefix("    ") {
+                    Some(value) if !value.starts_with(' ') => value,
+                    Some(_) => panic!("over-indented line: {line:?}\n\nin:\n{notice}"),
+                    None => {
+                        assert!(
+                            !line.starts_with(' '),
+                            "prose line carries leaked source indentation: {line:?}\
+                             \n\nin:\n{notice}"
+                        );
+                        line
+                    }
+                };
+
+                assert!(
+                    !body.contains("  "),
+                    "line has a run of spaces mid-sentence: {line:?}\n\nin:\n{notice}"
+                );
+            }
+        }
+    }
+
+    /// A 401 must not tell the user to go find a token — sempkg has no way to send
+    /// one. It should point at the two things that actually work.
+    #[test]
+    fn unauthorized_notice_offers_no_token() {
+        let dest = Path::new("/models/m.gguf");
+        let notice = unauthorized_notice(DEFAULT_GGUF_URL, dest).to_lowercase();
+
+        assert!(
+            !notice.contains("token"),
+            "401 notice must not offer a token"
+        );
+        assert!(!notice.contains("hf_token"));
+        assert!(notice.contains("anonymously"));
+        assert!(notice.contains("--gguf-url"));
+        assert!(notice.contains("/models/m.gguf"));
     }
 
     /// The download is anonymous: sempkg holds no HuggingFace credential, so the

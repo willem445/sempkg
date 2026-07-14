@@ -254,11 +254,15 @@ jobs:
         shell: bash
         run: |
           src=src/sempkg/src/reranker.rs
+          # Both greps are anchored to the exact declaration the code reads, so an
+          # unrelated URL or `.join("….gguf")` added elsewhere in the file (a doc
+          # example, a test fixture) cannot silently hijack the key. A silently
+          # changed key is only one redundant 600 MB re-download, but it is silent.
+          #
           # DEFAULT_GGUF_URL — where the model is fetched from.
-          url=$(grep -oE 'https://huggingface\.co/[^"]+\.gguf' "$src" | head -n1)
+          url=$(grep -A2 'pub const DEFAULT_GGUF_URL' "$src" \
+                | grep -oE 'https://[^"]+\.gguf' | head -n1)
           # default_model_path() — what the pull writes into ~/.sempkg/models/.
-          # Anchored to that fn so an unrelated `.join("….gguf")` elsewhere in the
-          # file (a test fixture, say) cannot silently hijack the key.
           file=$(grep -A3 'pub fn default_model_path' "$src" \
                  | grep -oE '\.join\("[^"]+\.gguf"\)' | head -n1 \
                  | sed -E 's/^\.join\("(.*)"\)$/\1/')
