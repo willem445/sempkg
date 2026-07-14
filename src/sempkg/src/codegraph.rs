@@ -234,6 +234,14 @@ pub fn files(project_path: &Path, filter: Option<&str>, limit: usize) -> Result<
     Ok(out)
 }
 
+/// Path to the codegraph CLI, or `None` when it is not on `PATH`.
+///
+/// `sempkg status` reports this: a missing codegraph is the single most common
+/// cause of "queries return nothing" bug reports.
+pub fn exe_on_path() -> Option<String> {
+    codegraph_exe().ok()
+}
+
 /// Query the installed codegraph version string.
 ///
 /// Returns `"unknown"` on failure so callers never need to abort.

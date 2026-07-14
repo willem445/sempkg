@@ -41,21 +41,31 @@ jobs:
             ext: ""
 
           # ── sempkg ────────────────────────────────────────────────────────
+          # `features` is matrix-driven so every sempkg artifact ships the full
+          # local-inference set (reranker + embeddings + query expansion). The
+          # sembundle rows leave it empty — that crate has no optional features.
           - binary: sempkg
             manifest: src/sempkg/Cargo.toml
             os: windows-latest
             target: x86_64-pc-windows-msvc
             ext: .exe
+            features: reranker,embeddings
+          # Every aarch64-apple-darwin machine has a Metal GPU and the macos-14+
+          # runners ship the Metal toolchain with Xcode, so the one macOS
+          # artifact is GPU-capable — no separate variant. `gpu = "auto"` still
+          # degrades to CPU wherever offload is unavailable.
           - binary: sempkg
             manifest: src/sempkg/Cargo.toml
             os: macos-latest
             target: aarch64-apple-darwin
             ext: ""
+            features: reranker,embeddings,metal
           - binary: sempkg
             manifest: src/sempkg/Cargo.toml
             os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             ext: ""
+            features: reranker,embeddings
 
     steps:
       - uses: actions/checkout@v7
@@ -144,8 +154,8 @@ jobs:
       - name: Build
         shell: bash
         run: |
-          if [ "${{ matrix.binary }}" = "sempkg" ]; then
-            cargo build --release --manifest-path ${{ matrix.manifest }} --target ${{ matrix.target }} --features reranker
+          if [ -n "${{ matrix.features }}" ]; then
+            cargo build --release --manifest-path ${{ matrix.manifest }} --target ${{ matrix.target }} --features ${{ matrix.features }}
           else
             cargo build --release --manifest-path ${{ matrix.manifest }} --target ${{ matrix.target }}
           fi
@@ -321,6 +331,208 @@ jobs:
           path: ${{ env.ARTIFACT }}
           retention-days: 1
 
+  # ── sempkg (Vulkan / vendor-neutral GPU) ────────────────────────────────────
+  # The CUDA artifacts target Turing (sm_75) and newer, so Maxwell/Pascal cards
+  # — and every AMD/Intel GPU — have no GPU build. Vulkan is the vendor-neutral
+  # fallback accel.rs already documents. Unlike CUDA there is nothing to bundle:
+  # the loader (`vulkan-1.dll` / `libvulkan.so.1`) ships with the GPU driver on
+  # Windows and comes from the distro (`libvulkan1`) on Linux. See
+  # docs/gpu-vulkan.md.
+  build-vulkan:
+    name: Build sempkg (Vulkan) — ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    env:
+      CARGO_INCREMENTAL: 0
+      RUSTFLAGS: -C debuginfo=0
+      # Pinned so a broken upstream SDK release can't silently break a tag build.
+      # Used by BOTH rows: the Windows installer URL takes it verbatim, the Linux
+      # job strips the build number to select LunarG's per-version apt repository.
+      VULKAN_VERSION: 1.4.313.2
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            ext: .exe
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            ext: ""
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Free disk space (Ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          df -h
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/share/dotnet
+          sudo apt-get clean
+          df -h
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+          # Bumped to -v2 with the Ninja switch: a target/ cached from the
+          # Visual Studio generator would carry a CMakeCache.txt that a Ninja
+          # configure refuses ("generator mismatch").
+          key: ${{ matrix.target }}-vulkan-v2
+          # The Windows row builds into a short out-of-tree CARGO_TARGET_DIR (see
+          # the path-length step below), so there is no in-workspace target/ to
+          # cache there. The registry/index cache still applies on both rows.
+          cache-targets: ${{ runner.os != 'Windows' }}
+
+      # The ggml Vulkan backend compiles its shaders at build time, so the SDK
+      # (headers, loader import library, and the glslc compiler) must be present
+      # — a GPU is only needed at *run* time. Both installs come straight from
+      # LunarG, the upstream Vulkan SDK publisher, so no third-party action is
+      # involved.
+      # Pinned to the same SDK release as the Windows job: LunarG publishes a
+      # per-version apt repository, so `vulkan-sdk` here resolves to that release
+      # rather than "whatever is latest today". The apt repo is versioned
+      # major.minor.patch (1.4.313), while the Windows installer URL carries the
+      # full build number (1.4.313.2) — hence the trailing component is stripped.
+      - name: Install Vulkan SDK (Linux — LunarG apt repository)
+        if: runner.os == 'Linux'
+        run: |
+          set -eu
+          sdk_series="${VULKAN_VERSION%.*}"   # 1.4.313.2 -> 1.4.313
+          wget -qO- https://packages.lunarg.com/lunarg-signing-key-pub.asc \
+            | sudo tee /etc/apt/trusted.gpg.d/lunarg.asc > /dev/null
+          sudo wget -qO "/etc/apt/sources.list.d/lunarg-vulkan-${sdk_series}-jammy.list" \
+            "https://packages.lunarg.com/vulkan/${sdk_series}/lunarg-vulkan-${sdk_series}-jammy.list"
+          sudo apt-get update -q
+          sudo apt-get install -y vulkan-sdk
+
+      - name: Install Vulkan SDK (Windows — LunarG installer)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $installer = "$env:RUNNER_TEMP\VulkanSDK-Installer.exe"
+          curl.exe -o $installer -L "https://sdk.lunarg.com/sdk/download/$env:VULKAN_VERSION/windows/vulkansdk-windows-X64-$env:VULKAN_VERSION.exe"
+          & $installer --accept-licenses --default-answer --confirm-command install
+          # llama-cpp-sys reads VULKAN_SDK to find Lib\vulkan-1.lib; glslc lives in Bin.
+          "VULKAN_SDK=C:\VulkanSDK\$env:VULKAN_VERSION" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "C:\VulkanSDK\$env:VULKAN_VERSION\Bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Install build dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y cmake clang libclang-dev llvm-dev
+
+      - name: Install LLVM (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install llvm --no-progress -y
+
+      # Two Windows-only settings, both needed to build ggml's Vulkan backend.
+      #
+      # 1. CARGO_TARGET_DIR — ggml compiles its Vulkan shaders with
+      #    `vulkan-shaders-gen`, a host tool built as a CMake ExternalProject.
+      #    Its build tree nests deeply (…/build/llama-cpp-sys-2-<hash>/out/build/
+      #    ggml/src/ggml-vulkan/vulkan-shaders-gen-prefix/src/…-build/CMakeFiles/
+      #    CMakeScratch/TryCompile-xxxxxx/…), and under the default
+      #    D:\a\sempkg\sempkg\target root the object paths reach 252 characters —
+      #    past the 250-char limit CMake enforces (CMAKE_OBJECT_PATH_MAX), after
+      #    which cl.exe fails with "C1083: Cannot open compiler generated file:
+      #    ''". llama-cpp-sys documents this ("crates that depend on
+      #    llama-cpp-rs w/ vulkan easily exceed the default PATH_MAX on
+      #    windows"); its own workaround only covers MSBuild's FileTracker, not
+      #    the path length. A short root buys back 20 characters, and building
+      #    for the host triple (no --target, see the Build step) another 23.
+      #
+      # 2. CMAKE_GENERATOR=Ninja — under the Visual Studio generator the
+      #    ExternalProject's configure runs inside an MSBuild custom-build step,
+      #    whose nested MSBuild inherits a broken environment ("The system
+      #    cannot find the batch label specified - VCEnd") and runs the
+      #    ExternalProject steps out of order. Ninja invokes that configure as a
+      #    plain cmake call in the same environment.
+      #
+      # Both are scoped to this job: the CUDA and CPU Windows builds have no
+      # ExternalProject, so they keep the default generator and target dir.
+      - name: Install Ninja and shorten the CMake build path (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) {
+            choco install ninja --no-progress -y
+          }
+          ninja --version
+          "CMAKE_GENERATOR=Ninja"  | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "CARGO_TARGET_DIR=C:/vk" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Resolve LIBCLANG_PATH (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          echo "LIBCLANG_PATH=$(llvm-config --libdir)" >> "$GITHUB_ENV"
+
+      - name: Resolve LIBCLANG_PATH (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          "LIBCLANG_PATH=C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Install NASM (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/setup-nasm@v1
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # On Windows this builds for the host triple (which *is* matrix.target) with
+      # no --target flag: that drops the `x86_64-pc-windows-msvc/` path segment
+      # and, with the short CARGO_TARGET_DIR above, brings ggml's deepest
+      # Vulkan object path from 252 characters down to ~209 — comfortably under
+      # the 250-char limit rather than a couple of characters below it.
+      - name: Build (Vulkan)
+        shell: bash
+        run: |
+          set -eu
+          tdir="${CARGO_TARGET_DIR:-target}"
+
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cargo build --release \
+              --manifest-path src/sempkg/Cargo.toml \
+              --features reranker,embeddings,vulkan
+            echo "SEMPKG_BIN=${tdir}/release/sempkg${{ matrix.ext }}" >> "$GITHUB_ENV"
+          else
+            cargo build --release \
+              --manifest-path src/sempkg/Cargo.toml \
+              --target ${{ matrix.target }} \
+              --features reranker,embeddings,vulkan
+            echo "SEMPKG_BIN=${tdir}/${{ matrix.target }}/release/sempkg${{ matrix.ext }}" >> "$GITHUB_ENV"
+          fi
+
+      # Nothing to bundle: the Vulkan loader ships with the driver (Windows) or
+      # the distro's libvulkan1 (Linux), so both platforms get a single binary.
+      - name: Stage artifact
+        shell: bash
+        run: |
+          set -eu
+          artifact="sempkg-${{ matrix.target }}-vulkan${{ matrix.ext }}"
+          cp "${SEMPKG_BIN}" "$artifact"
+          echo "ARTIFACT=$artifact" >> "$GITHUB_ENV"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: sempkg-${{ matrix.target }}-vulkan
+          path: ${{ env.ARTIFACT }}
+          retention-days: 1
+
   bundle-sempkg:
     name: Build and sign sempkg SemBundle
     needs: build
@@ -422,7 +634,7 @@ jobs:
 
   release:
     name: Publish GitHub Release
-    needs: [build, build-cuda, bundle-sempkg]
+    needs: [build, build-cuda, build-vulkan, bundle-sempkg]
     # Only publish a GitHub Release for real tag pushes; manual
     # (workflow_dispatch) runs stop after building artifacts.
     if: startsWith(github.ref, 'refs/tags/v')
