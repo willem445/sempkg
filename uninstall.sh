@@ -96,8 +96,7 @@ fi
 echo ""
 echo "Not removed (delete these yourself if you want them gone):"
 echo "  • <project>/.sempkg/, sempkg.toml, sempkg.lock — per-project workspace state"
-echo "  • <project>/.codegraph/ — CodeGraph indexes of your own repositories"
-echo "  • The CodeGraph CLI:  npm uninstall -g @colbymchenry/codegraph"
+echo "  • <project>/.codegraph/ — native codegraph indexes of your own repositories"
 echo "  • MCP server entries pointing at sempkg (e.g. .vscode/mcp.json)"
 
 # ── PATH note ─────────────────────────────────────────────────────────────────

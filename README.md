@@ -142,8 +142,7 @@ Everything else is yours to remove, because it belongs to your projects rather t
 |-------------|------------|-------------|
 | `~/.sempkg/` | Global bundles, GGUF models, local-package registry | `--purge`, or delete the directory |
 | `<project>/.sempkg/`, `sempkg.toml`, `sempkg.lock` | Per-project workspace state | Delete them in each project |
-| `<project>/.codegraph/` | CodeGraph index of your own repo | Delete it in each project |
-| CodeGraph CLI | Shared npm package | `npm uninstall -g @colbymchenry/codegraph` |
+| `<project>/.codegraph/` | Native codegraph index of your own repo | Delete it in each project |
 | MCP entries | e.g. `.vscode/mcp.json` pointing at `sempkg` | Edit the config |
 
 ---
@@ -263,9 +262,11 @@ sempkg add https://github.company.com/org/repo/releases/tag/v3.0.3 --full
 
 | Requirement | Notes |
 |-------------|-------|
-| [CodeGraph](https://github.com/colbymchenry/codegraph) | Must be on `PATH`. Install with `npm install -g @colbymchenry/codegraph`. |
 | Rust toolchain | Required only when building `sempkg` and `sembundle` from source. Not needed when using the install scripts. |
 | Python 3.11+ | Required only for `sempkg-registry`. |
+
+Indexing is fully native (built-in `semgraph` indexer) — there is **no**
+CodeGraph/Node dependency for building or querying bundles.
 
 ---
 

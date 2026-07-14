@@ -1,11 +1,11 @@
-//! Build pipeline: run codegraph and LanceDB against source / docs directories,
-//! then pack the results into a `.sembundle` archive.
+//! Build pipeline: index source directories with the native `semgraph` indexer
+//! and build LanceDB indexes over source / docs directories, then pack the
+//! results into a `.sembundle` archive.
 //!
 //! This is the implementation behind the `SemBundle build` subcommand.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::sync::Arc;
 
 use arrow_array::{RecordBatch, StringArray, UInt32Array};
@@ -35,9 +35,9 @@ pub struct BuildOptions {
     /// Where to write the finished `.sembundle`. Defaults to `./<name>-<version>.sembundle`.
     pub output_path: Option<PathBuf>,
 
-    // --- CodeGraph inputs ---
-    /// Source directories to index with `codegraph init --index`.
-    /// At least one is required.
+    // --- Source inputs ---
+    /// Source directories to index with the native `semgraph` indexer. All roots
+    /// are indexed into one graph (issue #79). At least one is required.
     pub source_dirs: Vec<PathBuf>,
 
     // --- Lance inputs (optional) ---
@@ -77,9 +77,9 @@ pub fn build(opts: BuildOptions) -> Result<PathBuf, PackError> {
     let cg_out = work.path().join("codegraph-out");
     std::fs::create_dir_all(&cg_out)?;
 
-    // Step 1: index source directories with codegraph.
-    eprintln!("[sembundle] Running codegraph ...");
-    run_codegraph(&opts.source_dirs, &cg_out, &opts.exclude_dirs)?;
+    // Step 1: index source directories with the native semgraph indexer.
+    eprintln!("[sembundle] Indexing source directories (native semgraph) ...");
+    run_semgraph(&opts.source_dirs, &cg_out, &opts.exclude_dirs)?;
 
     // Step 2: index docs directories with LanceDB (optional, best-effort).
     // When no documents match the glob pattern we log a warning and continue
@@ -168,8 +168,32 @@ pub fn build(opts: BuildOptions) -> Result<PathBuf, PackError> {
 }
 
 // ---------------------------------------------------------------------------
-// CodeGraph step
+// Graph index step (native semgraph)
 // ---------------------------------------------------------------------------
+
+/// Free-form `manifest.codegraph_version` value for bundles built by the native
+/// indexer: `"sempkg-native/<semgraph crate version>"`.
+///
+/// The spec (`docs/sembundle-spec.md` §4.2) treats `codegraph_version` as an
+/// opaque string; nothing validates its format, and the Phase-1 reader serves
+/// both CodeGraph-0.9.7-built and native-built graphs interchangeably.
+pub fn native_codegraph_version() -> String {
+    format!("sempkg-native/{}", semgraph::VERSION)
+}
+
+/// The subset of `source_dirs` that survive whole-directory exclusion.
+///
+/// This is the exact roots list handed to [`semgraph::index_roots`], and it
+/// must also be the roots list passed to [`semgraph::resolve_stored_path`] when
+/// mapping a stored `file_path` back to disk — namespaces are derived from the
+/// root set, so the two must agree.
+fn included_roots(source_dirs: &[PathBuf], exclude_dirs: &[PathBuf]) -> Vec<PathBuf> {
+    source_dirs
+        .iter()
+        .filter(|sd| exclude_dirs.is_empty() || !is_excluded(sd, sd, exclude_dirs))
+        .cloned()
+        .collect()
+}
 
 /// Returns `true` if `path` should be excluded based on `exclude_dirs`.
 ///
@@ -187,79 +211,91 @@ fn is_excluded(path: &Path, base_dir: &Path, exclude_dirs: &[PathBuf]) -> bool {
     })
 }
 
-/// Returns `true` when `dot_cg` is an actual initialized CodeGraph index.
+/// Index every source root into a single schema-v4 `graph/codegraph.db` using
+/// the native `semgraph` indexer (no external CodeGraph/Node dependency).
 ///
-/// CodeGraph keys initialization off its database file, not the `.codegraph/`
-/// directory. A directory that exists but contains only a tracked `.gitignore`
-/// (no database) is not initialized, so this checks for a `*.db` database file.
-fn codegraph_initialized(dot_cg: &Path) -> bool {
-    if dot_cg.join("codegraph.db").is_file() {
-        return true;
-    }
-    std::fs::read_dir(dot_cg)
-        .map(|entries| {
-            entries.flatten().any(|entry| {
-                let path = entry.path();
-                path.is_file() && path.extension().map(|ext| ext == "db").unwrap_or(false)
-            })
-        })
-        .unwrap_or(false)
-}
-
-fn run_codegraph(
+/// All roots are indexed into **one** database — multiple `-s`/`--source-dir`
+/// directories no longer overwrite each other (issue #79). semgraph namespaces
+/// each root's file paths so same-basename roots stay distinct; the reader and
+/// the code-index extractor reverse that mapping via
+/// [`semgraph::resolve_stored_path`].
+fn run_semgraph(
     source_dirs: &[PathBuf],
     out_dir: &Path,
     exclude_dirs: &[PathBuf],
 ) -> Result<(), PackError> {
-    let exe = find_tool("codegraph")?;
     let graph_dir = out_dir.join("graph");
     std::fs::create_dir_all(&graph_dir)?;
 
-    for source_dir in source_dirs {
-        // Skip source_dirs that are themselves excluded.
-        if !exclude_dirs.is_empty() && is_excluded(source_dir, source_dir, exclude_dirs) {
+    // Skip source_dirs that are themselves excluded (absolute exclude prefixes).
+    let roots = included_roots(source_dirs, exclude_dirs);
+    for sd in source_dirs {
+        if !roots.iter().any(|r| r == sd) {
             eprintln!(
-                "[sembundle]   codegraph: skipping excluded dir {} ...",
-                source_dir.display()
+                "[sembundle]   semgraph: skipping excluded dir {} ...",
+                sd.display()
             );
-            continue;
-        }
-        eprintln!(
-            "[sembundle]   codegraph: indexing {} ...",
-            source_dir.display()
-        );
-        // `codegraph init --index` only indexes during first-time initialization.
-        // If the project is already initialized, `init` bails out with "Already
-        // initialized" and performs no indexing, leaving the bundle with a stale
-        // (or empty) graph. Detect that case and run a forced full re-index
-        // instead, so every build produces a fresh, complete index.
-        //
-        // Initialization is keyed off CodeGraph's database file, not the
-        // `.codegraph/` directory itself: a directory containing only a tracked
-        // `.gitignore` (no database) is *not* an initialized index, and running
-        // `index --force` against it fails with "CodeGraph not initialized".
-        // Only treat the project as initialized when an actual `*.db` database
-        // is present; otherwise run `init --index` to create a fresh index.
-        let src_str = source_dir.to_string_lossy();
-        let dot_cg = source_dir.join(".codegraph");
-        let args: Vec<&str> = if codegraph_initialized(&dot_cg) {
-            vec!["index", "--force", src_str.as_ref()]
-        } else {
-            vec!["init", "--index", src_str.as_ref()]
-        };
-        invoke(&exe, &args, None, None, true)?;
-
-        if dot_cg.is_dir() {
-            copy_dir_into(&dot_cg, &graph_dir)?;
         }
     }
 
+    if roots.is_empty() {
+        return Err(PackError::InvalidField {
+            field: "source_dirs".to_string(),
+            reason: "every source directory was excluded — nothing to index".to_string(),
+        });
+    }
+
+    // A missing/typo'd `--source-dir` must be a hard error, not a silent empty
+    // graph: `semgraph::index_roots` would just walk nothing and succeed, and if
+    // it were the only root the build would produce a valid-but-empty bundle
+    // (the old CodeGraph path errored here). Only non-excluded roots are checked
+    // — an excluded root is skipped on purpose above.
+    for root in &roots {
+        if !root.is_dir() {
+            return Err(PackError::InvalidField {
+                field: "source_dirs".to_string(),
+                reason: format!("source directory does not exist: {}", root.display()),
+            });
+        }
+    }
+
+    // Translate sembundle's exclude_dirs into semgraph's absolute-prefix form.
+    // Absolute entries are used as-is; a relative entry `ex` is expanded to
+    // `<root>/<ex>` for every root, matching the old per-root exclusion rule.
+    let mut sg_excludes: Vec<PathBuf> = Vec::new();
+    for ex in exclude_dirs {
+        if ex.is_absolute() {
+            sg_excludes.push(ex.clone());
+        } else {
+            for root in &roots {
+                sg_excludes.push(root.join(ex));
+            }
+        }
+    }
+    let options = semgraph::IndexOptions {
+        exclude_dirs: sg_excludes,
+    };
+
+    for root in &roots {
+        eprintln!("[sembundle]   semgraph: indexing {} ...", root.display());
+    }
+
+    let db_path = graph_dir.join("codegraph.db");
+    let stats = semgraph::index_roots(&roots, &db_path, &options)?;
+    eprintln!(
+        "[sembundle]   semgraph: {} files, {} nodes, {} edges.",
+        stats.file_count, stats.node_count, stats.edge_count
+    );
+
+    // A required `embeddings/` directory (spec §8). The native indexer does not
+    // emit embedding vectors; a manifest of what was indexed keeps the required
+    // directory non-empty and records the roots for provenance.
     let emb_dir = out_dir.join("embeddings");
     std::fs::create_dir_all(&emb_dir)?;
     std::fs::write(
         emb_dir.join("source-index.json"),
         serde_json::to_vec_pretty(&json!({
-            "format": "codegraph-source-index",
+            "format": "sempkg-native-source-index",
             "source_dirs": source_dirs
                 .iter()
                 .map(|p| p.to_string_lossy().into_owned())
@@ -267,17 +303,12 @@ fn run_codegraph(
         }))?,
     )?;
 
+    // A required `config.json` (spec §6). The native indexer takes no external
+    // configuration file, so an empty JSON object satisfies the "valid JSON
+    // object" minimum.
     let config_dst = out_dir.join("config.json");
     if !config_dst.exists() {
-        let cg_config = source_dirs
-            .first()
-            .map(|d| d.join(".codegraph").join("config.json"))
-            .filter(|p| p.is_file());
-        if let Some(src) = cg_config {
-            std::fs::copy(&src, &config_dst)?;
-        } else {
-            std::fs::write(&config_dst, b"{}")?;
-        }
+        std::fs::write(&config_dst, b"{}")?;
     }
 
     Ok(())
@@ -631,6 +662,10 @@ fn extract_chunks_from_codegraph_db(
         .filter_map(|r| r.ok())
         .collect();
 
+    // The effective roots used to build the DB — the exact list needed to
+    // reverse namespaced stored paths back to disk (see `included_roots`).
+    let roots = included_roots(source_dirs, exclude_dirs);
+
     // Group nodes by file_path so each source file is read exactly once.
     let mut by_file: HashMap<String, Vec<usize>> = HashMap::new();
     for (i, row) in rows.iter().enumerate() {
@@ -640,20 +675,20 @@ fn extract_chunks_from_codegraph_db(
     let mut chunks: Vec<SymbolChunk> = Vec::with_capacity(rows.len());
 
     'file: for (file_path, indices) in &by_file {
-        // Resolve the relative path against each source_dir in order.
-        let mut resolved: Option<(PathBuf, &PathBuf)> = None;
-        for sd in source_dirs {
-            // file_path uses forward slashes; Path::join handles them on all platforms.
-            let candidate = sd.join(Path::new(file_path));
-            if candidate.exists() {
-                resolved = Some((candidate, sd));
-                break;
+        // Reverse semgraph's namespaced stored path (`<ns>/<relative>`) back to
+        // the owning root + relative path. Single-root/CodeGraph-built bundles
+        // store non-namespaced paths and resolve to `(0, file_path)` unchanged,
+        // so old bundles keep working.
+        let (full_path, base_dir) = match semgraph::resolve_stored_path(&roots, file_path) {
+            Some((idx, rel)) => {
+                let base = &roots[idx];
+                (base.join(rel), base)
             }
-        }
-        let (full_path, base_dir) = match resolved {
-            Some(p) => p,
             None => continue 'file,
         };
+        if !full_path.exists() {
+            continue 'file;
+        }
 
         if !exclude_dirs.is_empty() && is_excluded(&full_path, base_dir, exclude_dirs) {
             continue 'file;
@@ -1353,92 +1388,6 @@ fn chunk_text(text: &str, max_chars: usize) -> Vec<DocChunk> {
 }
 
 // ---------------------------------------------------------------------------
-// Tool helpers
-// ---------------------------------------------------------------------------
-
-fn find_tool(name: &str) -> Result<PathBuf, PackError> {
-    which::which(name).map_err(|_| PackError::ToolNotFound(name.to_string()))
-}
-
-fn build_command(exe: &Path, args: &[&str]) -> Command {
-    #[cfg(windows)]
-    {
-        let ext = exe
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        if ext == "cmd" || ext == "bat" {
-            let mut cmd = Command::new("cmd");
-            cmd.arg("/C").arg(exe).args(args);
-            return cmd;
-        }
-    }
-    let mut cmd = Command::new(exe);
-    cmd.args(args);
-    cmd
-}
-
-fn invoke(
-    exe: &Path,
-    args: &[&str],
-    _cwd: Option<&Path>,
-    env_override: Option<(&str, &Path)>,
-    passthrough: bool,
-) -> Result<(), PackError> {
-    let tool_name = exe
-        .file_stem()
-        .and_then(|n| n.to_str())
-        .unwrap_or("tool")
-        .to_string();
-
-    let mut cmd = build_command(exe, args);
-    if let Some((key, val)) = env_override {
-        cmd.env(key, val);
-    }
-
-    if passthrough {
-        let status = cmd.status().map_err(PackError::Io)?;
-        if !status.success() {
-            return Err(PackError::ToolFailed {
-                tool: tool_name,
-                code: status.code(),
-                stderr: String::new(),
-            });
-        }
-    } else {
-        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-        let output = cmd.output().map_err(PackError::Io)?;
-        if !output.status.success() {
-            return Err(PackError::ToolFailed {
-                tool: tool_name,
-                code: output.status.code(),
-                stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-            });
-        }
-    }
-
-    Ok(())
-}
-
-fn copy_dir_into(src: &Path, dst: &Path) -> Result<(), PackError> {
-    for entry in WalkDir::new(src).min_depth(1) {
-        let entry = entry?;
-        let rel = entry.path().strip_prefix(src).expect("strip prefix failed");
-        let target = dst.join(rel);
-        if entry.file_type().is_dir() {
-            std::fs::create_dir_all(&target)?;
-        } else {
-            if let Some(parent) = target.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::copy(entry.path(), &target)?;
-        }
-    }
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1447,27 +1396,116 @@ mod tests {
     use super::*;
 
     #[test]
-    fn error_when_tool_not_found() {
-        let err = find_tool("SemBundle-nonexistent-tool-xyz-abc").unwrap_err();
+    fn native_codegraph_version_is_sempkg_native() {
+        let v = native_codegraph_version();
         assert!(
-            matches!(err, PackError::ToolNotFound(_)),
-            "expected ToolNotFound, got {err:?}"
+            v.starts_with("sempkg-native/"),
+            "expected sempkg-native/<ver>, got {v}"
+        );
+        // The suffix is the semgraph crate version (non-empty).
+        assert!(
+            v.len() > "sempkg-native/".len(),
+            "missing version suffix: {v}"
         );
     }
 
     #[test]
-    fn copy_dir_into_copies_tree() {
-        let src = tempfile::TempDir::new().unwrap();
-        let dst = tempfile::TempDir::new().unwrap();
+    fn included_roots_drops_absolute_excluded_dirs() {
+        // Use a real temp dir so the exclude entry is absolute on every OS
+        // (a leading-slash path is not absolute on Windows).
+        let base = tempfile::TempDir::new().unwrap();
+        let a = base.path().join("src");
+        let b = base.path().join("vendor");
+        assert!(
+            b.is_absolute(),
+            "exclude prefix must be absolute for this test"
+        );
+        let roots = included_roots(&[a.clone(), b.clone()], std::slice::from_ref(&b));
+        assert_eq!(roots, vec![a]);
+    }
 
-        std::fs::create_dir(src.path().join("sub")).unwrap();
-        std::fs::write(src.path().join("a.txt"), b"hello").unwrap();
-        std::fs::write(src.path().join("sub").join("b.txt"), b"world").unwrap();
+    /// A nonexistent explicitly-passed `--source-dir` must error, not silently
+    /// produce an empty graph (the #79 bug's cousin). The old CodeGraph path
+    /// errored here; the native path must too.
+    #[test]
+    fn run_semgraph_errors_on_missing_root() {
+        let out = tempfile::TempDir::new().unwrap();
+        let missing = out.path().join("does-not-exist");
+        let err = run_semgraph(std::slice::from_ref(&missing), out.path(), &[]).unwrap_err();
+        match err {
+            PackError::InvalidField { field, reason } => {
+                assert_eq!(field, "source_dirs");
+                assert!(reason.contains("does not exist"), "{reason}");
+            }
+            other => panic!("expected InvalidField, got {other:?}"),
+        }
+    }
 
-        copy_dir_into(src.path(), dst.path()).unwrap();
+    /// Issue #79: two `-s` roots that share the same basename must both land in
+    /// one graph, and the code-index extractor must resolve each namespaced
+    /// stored path back to the *correct* root on disk (the join key that
+    /// `read_symbol` / `read_code` rely on).
+    #[test]
+    fn multi_root_same_basename_lands_both_roots_and_resolves() {
+        let base = tempfile::TempDir::new().unwrap();
+        // Two roots with the SAME basename ("shared") under different parents —
+        // the exact collision #79 is about. Each holds a same-named file.
+        let alpha = base.path().join("alpha").join("shared");
+        let beta = base.path().join("beta").join("shared");
+        std::fs::create_dir_all(&alpha).unwrap();
+        std::fs::create_dir_all(&beta).unwrap();
+        std::fs::write(alpha.join("mod.py"), "def alpha_only():\n    return 1\n").unwrap();
+        std::fs::write(beta.join("mod.py"), "def beta_only():\n    return 2\n").unwrap();
 
-        assert!(dst.path().join("a.txt").is_file());
-        assert!(dst.path().join("sub").join("b.txt").is_file());
+        let out = tempfile::TempDir::new().unwrap();
+        let source_dirs = vec![alpha.clone(), beta.clone()];
+        run_semgraph(&source_dirs, out.path(), &[]).unwrap();
+
+        // --- Graph: both roots' symbols present in ONE db, namespaced apart ---
+        let db_path = out.path().join("graph").join("codegraph.db");
+        assert!(db_path.is_file(), "graph db not produced");
+        let db = semgraph::GraphDb::open(&db_path).unwrap();
+
+        let a = db.query("alpha_only", None, 10).unwrap();
+        let b = db.query("beta_only", None, 10).unwrap();
+        let a_node = a
+            .iter()
+            .find(|n| n.name == "alpha_only")
+            .expect("alpha_only missing — a root was dropped (issue #79 regression)");
+        let b_node = b
+            .iter()
+            .find(|n| n.name == "beta_only")
+            .expect("beta_only missing — a root was dropped (issue #79 regression)");
+        // Same-basename roots are namespaced so their stored paths stay distinct.
+        assert_eq!(a_node.file_path, "alpha/shared/mod.py", "{a_node:?}");
+        assert_eq!(b_node.file_path, "beta/shared/mod.py", "{b_node:?}");
+
+        // --- Code index: each namespaced path resolves to the correct file ---
+        let chunks =
+            extract_chunks_from_codegraph_db(&db_path, &source_dirs, &[], 8 * 1024).unwrap();
+        let a_chunk = chunks
+            .iter()
+            .find(|c| c.symbol == "alpha_only")
+            .expect("alpha_only chunk missing");
+        let b_chunk = chunks
+            .iter()
+            .find(|c| c.symbol == "beta_only")
+            .expect("beta_only chunk missing");
+        // Content proves resolve_stored_path mapped each namespaced path to the
+        // right root: a swap would surface the other root's body (or none).
+        assert!(
+            a_chunk.content.contains("return 1"),
+            "{:?}",
+            a_chunk.content
+        );
+        assert!(
+            b_chunk.content.contains("return 2"),
+            "{:?}",
+            b_chunk.content
+        );
+        // The chunk path equals the graph node file_path — the join key.
+        assert_eq!(a_chunk.path, a_node.file_path);
+        assert_eq!(b_chunk.path, b_node.file_path);
     }
 
     #[test]

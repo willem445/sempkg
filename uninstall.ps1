@@ -106,8 +106,7 @@ if ($Purge) {
 Write-Host ""
 Write-Host "Not removed (delete these yourself if you want them gone):"
 Write-Host "  * <project>\.sempkg\, sempkg.toml, sempkg.lock - per-project workspace state"
-Write-Host "  * <project>\.codegraph\ - CodeGraph indexes of your own repositories"
-Write-Host "  * The CodeGraph CLI:  npm uninstall -g @colbymchenry/codegraph"
+Write-Host "  * <project>\.codegraph\ - native codegraph indexes of your own repositories"
 Write-Host "  * MCP server entries pointing at sempkg (e.g. .vscode\mcp.json)"
 
 # ── User PATH ─────────────────────────────────────────────────────────────────

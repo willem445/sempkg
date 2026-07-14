@@ -1,0 +1,33 @@
+sempkg
+Copyright (c) sempkg contributors
+
+This product includes software developed as part of the sempkg project.
+
+--------------------------------------------------------------------------------
+Third-party attributions
+--------------------------------------------------------------------------------
+
+CodeGraph (@colbymchenry/codegraph)
+    https://github.com/colbymchenry/codegraph
+    Licensed under the MIT License.
+
+    The `semgraph` crate's native indexer (src/semgraph, issue #78 Phase 2) is
+    interoperable with the schema-v4 `codegraph.db` SQLite format produced by
+    CodeGraph, and its per-language tree-sitter definition-extraction queries
+    (src/semgraph/src/queries/*.scm) are adapted from CodeGraph's MIT-licensed
+    tree-sitter tag queries. The node/edge kind vocabulary, `"<kind>:<hash>"`
+    node-id convention, and `::`-joined qualified-name convention follow
+    CodeGraph's observed output so that sempkg-built graphs and CodeGraph-built
+    graphs are read by the same reader.
+
+    The tier-3 language packs (src/semgraph/src/tier3/, issue #78 Phase 2c) use a
+    config-driven recursive-descent extractor whose per-language configuration and
+    walker design are adapted from CodeGraph's MIT-licensed `TreeSitterExtractor`
+    engine and `LanguageExtractor` config objects.
+
+tree-sitter and grammar crates
+    tree-sitter (MIT), tree-sitter-rust (MIT), tree-sitter-python (MIT),
+    tree-sitter-typescript (MIT), tree-sitter-c (MIT), tree-sitter-cpp (MIT),
+    tree-sitter-go (MIT), tree-sitter-java (MIT), tree-sitter-ruby (MIT),
+    tree-sitter-php (MIT), tree-sitter-kotlin-ng (MIT), tree-sitter-swift (MIT),
+    tree-sitter-scala (MIT), tree-sitter-c-sharp (MIT).
