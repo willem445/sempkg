@@ -326,7 +326,7 @@ jobs:
       # the pull would then ignore and re-download anyway.
       - name: Restore cached HuggingFace models
         id: model-cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: ~/.sempkg/models
           key: ${{ steps.model-key.outputs.key }}
@@ -359,7 +359,7 @@ jobs:
       # Only after the model is verified present — never cache a bad download.
       - name: Save HuggingFace models to cache
         if: steps.model-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: ~/.sempkg/models
           key: ${{ steps.model-key.outputs.key }}
