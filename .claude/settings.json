@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo fmt*)",
+      "Bash(cargo clippy*)",
+      "Bash(cargo test*)",
+      "Bash(cargo build*)",
+      "Bash(cargo check*)",
+      "Bash(cargo run*)",
+      "Bash(.venv\\Scripts\\python.exe*)",
+      "Bash(uv sync*)",
+      "Bash(uv pip*)",
+      "Bash(uv run*)",
+      "Bash(sempkg*)",
+      "Bash(sembundle*)",
+      "Bash(git diff*)",
+      "Bash(git log*)",
+      "Bash(git status*)",
+      "Bash(git show*)"
+    ]
+  }
+}
