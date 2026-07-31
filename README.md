@@ -245,6 +245,25 @@ sempkg add https://github.company.com/org/repo/releases/tag/v3.0.3 --full
 
 ---
 
+## Claude Code skills
+
+This repo ships two [Claude Code](https://claude.com/claude-code) skills under
+[`.claude/skills/`](.claude/skills/) that give your coding agent both ends of
+the sempkg workflow. Copy the ones you want into your own project's
+`.claude/skills/` directory — they're plain checked-in files, no installer
+involved.
+
+- [`sempkg-add`](.claude/skills/sempkg-add/SKILL.md) — the **ingest** path.
+  Point your agent at a registry package, a `.sembundle` URL, a GitHub
+  repo/release, or a local path, and it triages source vs. docs vs. noise,
+  composes the right `sempkg add` command, runs it, and reports what it
+  classified.
+- [`sempkg`](.claude/skills/sempkg/SKILL.md) — the **read** path. Query
+  already-installed bundles for symbols, call graphs, and docs via the MCP
+  tools.
+
+---
+
 ## Documentation
 
 - [sempkg User Guide](docs/sempkg.md) — CLI reference, MCP tools, workspace setup
