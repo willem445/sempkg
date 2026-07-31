@@ -350,7 +350,7 @@ sempkg status
 ```
 
 ```
-sempkg 0.6.1
+sempkg 1.0.0-beta.1
   commit      : 1f3c9a0…            # the release commit; "unknown" for local builds
   os / arch   : windows / x86_64
   features    : reranker, embeddings
