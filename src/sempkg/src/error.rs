@@ -30,14 +30,6 @@ pub enum SempkgError {
     #[error("Registry error for {url}: {message}")]
     RegistryError { url: String, message: String },
 
-    #[error(
-        "codegraph not found on PATH. Install it with: npm install -g @colbymchenry/codegraph"
-    )]
-    CodegraphNotFound,
-
-    #[error("codegraph error: {0}")]
-    CodegraphError(String),
-
     #[error("No LanceDB documentation index found in bundle '{0}'")]
     NoLanceIndex(String),
 

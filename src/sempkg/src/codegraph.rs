@@ -1,265 +1,73 @@
-/// Codegraph CLI wrapper — scoped to a specific package/bundle directory.
+/// Native graph indexing + direct SQLite reads for a package/bundle's
+/// schema-v4 `codegraph.db`.
 ///
-/// All queries are strictly scoped: passing a package directory means the
-/// operation runs only against that package's index, never cross-package.
+/// Indexing is done in-process by the native [`semgraph`] indexer — there is no
+/// external CodeGraph/Node dependency. All operations are strictly scoped to a
+/// package directory: indexing writes only `<project>/.codegraph/codegraph.db`,
+/// and every query runs against that one database, never cross-package.
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use anyhow::{Context, Result};
 use rusqlite::OptionalExtension;
 
-use crate::error::SempkgError;
-
-/// Resolved codegraph executable path.
-fn codegraph_exe() -> Result<String> {
-    which::which("codegraph")
-        .or_else(|_| which::which("codegraph.cmd"))
-        .map(|p| p.to_string_lossy().to_string())
-        .map_err(|_| SempkgError::CodegraphNotFound.into())
-}
-
-fn run(args: &[&str], cwd: Option<&Path>) -> Result<String> {
-    let exe = codegraph_exe()?;
-    let mut cmd = Command::new(&exe);
-    cmd.args(args);
-    if let Some(dir) = cwd {
-        cmd.current_dir(dir);
-    }
-
-    let out = cmd
-        .output()
-        .with_context(|| format!("Failed to run codegraph with args: {args:?}"))?;
-
-    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-
-    if !out.status.success() {
-        return Err(
-            SempkgError::CodegraphError(if !stderr.is_empty() { stderr } else { stdout }).into(),
-        );
-    }
-
-    Ok(if !stdout.is_empty() { stdout } else { stderr })
-}
-
 // ---------------------------------------------------------------------------
-// Index management
+// Index management (native semgraph indexer)
 // ---------------------------------------------------------------------------
 
-/// Run `codegraph init --index <path>` to initialise and index a project.
+/// Format an [`semgraph::IndexStats`] as the one-line summary printed after
+/// indexing / reindexing a package.
+fn format_stats(stats: &semgraph::IndexStats) -> String {
+    format!(
+        "Indexed {} files, {} nodes, {} edges.",
+        stats.file_count, stats.node_count, stats.edge_count
+    )
+}
+
+/// Ensure the `.codegraph/` parent directory of `db` exists.
+fn ensure_db_dir(db: &Path) -> Result<()> {
+    if let Some(parent) = db.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating index directory {}", parent.display()))?;
+    }
+    Ok(())
+}
+
+/// Index a project from scratch into `<path>/.codegraph/codegraph.db` using the
+/// native semgraph indexer. Overwrites any existing index for the project.
 pub fn init_and_index(path: &Path) -> Result<String> {
-    run(&["init", "--index", &path.to_string_lossy()], None).context("codegraph init failed")
+    let db = db_path(path);
+    ensure_db_dir(&db)?;
+    let stats = semgraph::index_roots(
+        &[path.to_path_buf()],
+        &db,
+        &semgraph::IndexOptions::default(),
+    )
+    .with_context(|| format!("indexing {}", path.display()))?;
+    Ok(format_stats(&stats))
 }
 
-/// Run `codegraph sync <path>` to incrementally update an existing index.
+/// Incrementally update an existing index, re-parsing only changed/added/deleted
+/// files. Falls back to a full index when no database exists yet.
 pub fn sync(path: &Path) -> Result<String> {
-    run(&["sync", &path.to_string_lossy()], None).context("codegraph sync failed")
-}
-
-/// Run `codegraph status <path>`.
-pub fn status(path: &Path) -> Result<String> {
-    run(&["status", &path.to_string_lossy()], None).context("codegraph status failed")
-}
-
-// ---------------------------------------------------------------------------
-// Query operations (all scoped to `project_path`)
-// ---------------------------------------------------------------------------
-
-/// Search for symbols by name/pattern.
-pub fn query(
-    project_path: &Path,
-    search: &str,
-    kind: Option<&str>,
-    limit: usize,
-) -> Result<String> {
-    let limit_s = limit.to_string();
-    let mut args = vec!["query", search, "--json", "--limit", &limit_s];
-    let kind_arg;
-    if let Some(k) = kind {
-        kind_arg = format!("--kind={k}");
-        args.push(&kind_arg);
-    }
-    run(&args, Some(project_path)).context("codegraph query failed")
-}
-
-/// Find all callers of a symbol.
-pub fn callers(project_path: &Path, symbol: &str, limit: usize) -> Result<String> {
-    let limit_s = limit.to_string();
-    run(
-        &["callers", symbol, "--json", "--limit", &limit_s],
-        Some(project_path),
+    let db = db_path(path);
+    ensure_db_dir(&db)?;
+    let stats = semgraph::sync(
+        &[path.to_path_buf()],
+        &db,
+        &semgraph::IndexOptions::default(),
     )
-    .context("codegraph callers failed")
+    .with_context(|| format!("syncing {}", path.display()))?;
+    Ok(format_stats(&stats))
 }
 
-/// Find all callees of a symbol.
-pub fn callees(project_path: &Path, symbol: &str, limit: usize) -> Result<String> {
-    let limit_s = limit.to_string();
-    run(
-        &["callees", symbol, "--json", "--limit", &limit_s],
-        Some(project_path),
-    )
-    .context("codegraph callees failed")
-}
-
-/// Get AI-optimised context for a natural-language task description.
-pub fn context(project_path: &Path, task: &str) -> Result<String> {
-    run(&["context", task], Some(project_path)).context("codegraph context failed")
-}
-
-/// Like `context` but requests JSON output with bounded node count and no inline
-/// code blocks — suited for subsequent reranking.  Returns the raw JSON string.
-pub fn context_json(project_path: &Path, task: &str, max_nodes: usize) -> Result<String> {
-    let max_nodes_s = max_nodes.to_string();
-    run(
-        &[
-            "context",
-            task,
-            "--format",
-            "json",
-            "--max-nodes",
-            &max_nodes_s,
-            "--no-code",
-        ],
-        Some(project_path),
-    )
-    .context("codegraph context (json) failed")
-}
-
-/// Analyse the impact (downstream dependents) of changing a symbol.
-pub fn impact(project_path: &Path, symbol: &str, depth: usize) -> Result<String> {
-    let depth_s = depth.to_string();
-    run(
-        &["impact", symbol, "--json", "--depth", &depth_s],
-        Some(project_path),
-    )
-    .context("codegraph impact failed")
-}
-
-/// List files tracked by the index, with optional substring or glob filter and a result cap.
+/// The `codegraph_version` string recorded in bundles built by the native
+/// indexer: `"sempkg-native/<semgraph crate version>"`.
 ///
-/// Matching rules (applied in order, first rule that matches wins):
-/// 1. If `filter` contains `*` or `?`, it is treated as a glob pattern matched
-///    against the full stored path (case-insensitive on Windows).
-/// 2. Otherwise the filter is treated as a case-insensitive substring match.
-///
-/// Returns a human-readable list or one of two distinct sentinel messages:
-/// - "No files matched …"   → filter syntax was valid, zero results.
-/// - "Filter error: …"      → glob pattern was syntactically invalid.
-pub fn files(project_path: &Path, filter: Option<&str>, limit: usize) -> Result<String> {
-    let db = db_path(project_path);
-    if !db.exists() {
-        anyhow::bail!(
-            "No codegraph index found at '{}'. Run `sempkg index` first.",
-            project_path.display()
-        );
-    }
-    let conn = open_db(&db)?;
-
-    // Collect distinct file paths from the nodes table.
-    let mut stmt = conn.prepare(
-        "SELECT DISTINCT file_path FROM nodes WHERE file_path IS NOT NULL AND file_path != '' ORDER BY file_path"
-    ).context("Failed to prepare files query")?;
-    let all_files: Vec<String> = stmt
-        .query_map([], |row| row.get::<_, String>(0))
-        .context("Failed to query file paths")?
-        .filter_map(|r| r.ok())
-        .collect();
-
-    // Apply filter.
-    let filtered: Vec<&str> = match filter {
-        None => all_files.iter().map(String::as_str).collect(),
-        Some(pat) => {
-            // Glob path if the pattern contains wildcards.
-            if pat.contains('*') || pat.contains('?') {
-                // Build a glob::Pattern. Wrap the error distinctly so callers can
-                // surface "filter syntax unsupported" rather than "no matches".
-                let glob_pat = match glob::Pattern::new(pat) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        return Ok(format!(
-                            "Filter error: invalid glob pattern '{pat}': {e}. \
-                             Use * for any segment, ** for path wildcards, or a plain substring."
-                        ));
-                    }
-                };
-                let opts = glob::MatchOptions {
-                    case_sensitive: cfg!(not(target_os = "windows")),
-                    require_literal_separator: false,
-                    require_literal_leading_dot: false,
-                };
-                all_files
-                    .iter()
-                    .filter(|p| glob_pat.matches_with(p, opts))
-                    .map(String::as_str)
-                    .collect()
-            } else {
-                // Plain substring match (case-insensitive).
-                let lower = pat.to_lowercase();
-                all_files
-                    .iter()
-                    .filter(|p| p.to_lowercase().contains(&lower))
-                    .map(String::as_str)
-                    .collect()
-            }
-        }
-    };
-
-    if filtered.is_empty() {
-        return Ok(match filter {
-            Some(pat) => format!(
-                "No files matched filter '{pat}' in package at '{}'. \
-                 The index has {} file(s) total. \
-                 Try a shorter substring or use * wildcards (e.g. *.rs).",
-                project_path.display(),
-                all_files.len()
-            ),
-            None => format!(
-                "No files are tracked in the codegraph index at '{}'.",
-                project_path.display()
-            ),
-        });
-    }
-
-    let capped = &filtered[..filtered.len().min(limit)];
-    let truncated = filtered.len() > capped.len();
-    let mut out = capped.join("\n");
-    if truncated {
-        out.push_str(&format!(
-            "\n… {} more file(s) not shown (limit {}). Use a filter to narrow results.",
-            filtered.len() - capped.len(),
-            limit
-        ));
-    }
-    Ok(out)
-}
-
-/// Path to the codegraph CLI, or `None` when it is not on `PATH`.
-///
-/// `sempkg status` reports this: a missing codegraph is the single most common
-/// cause of "queries return nothing" bug reports.
-pub fn exe_on_path() -> Option<String> {
-    codegraph_exe().ok()
-}
-
-/// Query the installed codegraph version string.
-///
-/// Returns `"unknown"` on failure so callers never need to abort.
+/// The manifest field is free-form (`docs/sembundle-spec.md` §4.2); nothing
+/// validates its format, and the Phase-1 reader serves native-built and
+/// CodeGraph-0.9.7-built graphs interchangeably.
 pub fn version() -> String {
-    let exe = match codegraph_exe() {
-        Ok(e) => e,
-        Err(_) => return "unknown".to_owned(),
-    };
-    std::process::Command::new(&exe)
-        .arg("--version")
-        .output()
-        .ok()
-        .and_then(|o| {
-            let s = String::from_utf8_lossy(&o.stdout);
-            // typical output: "codegraph 0.9.7" — grab the last whitespace-separated token
-            s.split_whitespace().last().map(str::to_owned)
-        })
-        .unwrap_or_else(|| "unknown".to_owned())
+    format!("sempkg-native/{}", semgraph::VERSION)
 }
 
 // ---------------------------------------------------------------------------

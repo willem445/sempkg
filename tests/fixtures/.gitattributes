@@ -1,0 +1,4 @@
+# The golden CodeGraph fixture is a SQLite database — never apply text/CRLF
+# normalization to it, or the committed compatibility contract will corrupt.
+codegraph-v4.db binary
+*.db binary

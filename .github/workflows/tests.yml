@@ -25,14 +25,6 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@v5
 
-      - name: Install Node.js
-        uses: actions/setup-node@v6
-        with:
-          node-version: "lts/*"
-
-      - name: Install codegraph
-        run: npm install -g @colbymchenry/codegraph
-
       - name: Install dependencies
         run: uv pip install --system -e ".[dev]"
 
@@ -142,6 +134,9 @@ jobs:
       - name: Test sembundle
         run: cargo test --manifest-path src/sembundle/Cargo.toml
 
+      - name: Test semgraph
+        run: cargo test --manifest-path src/semgraph/Cargo.toml
+
       # Mirror the feature set the release CPU artifacts ship with, so what CI
       # compiles and tests is what users actually run. (`--all-features` is not
       # usable here: the GPU backends pull in mutually exclusive vendor SDKs.)
@@ -210,14 +205,6 @@ jobs:
 
       - name: Install Python test dependencies
         run: uv pip install --system pytest
-
-      - name: Install Node.js
-        uses: actions/setup-node@v6
-        with:
-          node-version: "lts/*"
-
-      - name: Install codegraph CLI (required by sembundle indexer)
-        run: npm install -g @colbymchenry/codegraph
 
       # ---- Rust build dependencies ----
 

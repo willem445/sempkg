@@ -66,7 +66,9 @@ automatically by `cargo`. No manual installation is needed.
 | `arrow-schema` | 52 | Arrow schema definition for the `docs` table (`path`, `content` columns) |
 | `tokio` | 1 | Async runtime — LanceDB's Rust API is fully async; `block_on` is used from sync entry points |
 | `glob` | 0.3 | Glob pattern matching for `--docs-glob` file discovery |
-| `which` | 6 | Locate `codegraph` on PATH |
+| `rusqlite` | 0.40 | Read the schema-v4 `codegraph.db` for the source-code index extractor |
+| `semgraph` | path | Native in-process graph indexer — `build.rs` calls `index_roots`/`resolve_stored_path` (replaces the CodeGraph CLI) |
+
 **Dev dependencies** (tests only):
 
 | Crate | Version | Purpose |

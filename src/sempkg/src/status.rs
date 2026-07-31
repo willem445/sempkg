@@ -3,7 +3,8 @@
 //! Bare `sempkg status` answers the questions every bug report needs: which
 //! version and build features this binary has, whether it can offload to a GPU,
 //! where the GGUF models are and whether they are on disk, what the workspace
-//! and global stores contain, and whether the CodeGraph CLI is reachable.
+//! and global stores contain, and which version of the native codegraph
+//! indexer this binary was built with.
 //!
 //! `sempkg status <name>` is a different question (the state of one bundle /
 //! package) and stays in `main.rs` unchanged.
@@ -107,9 +108,6 @@ pub struct GlobalStatus {
 
 #[derive(Debug, Serialize)]
 pub struct CodegraphStatus {
-    pub on_path: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub path: Option<String>,
     pub version: String,
 }
 
@@ -247,20 +245,13 @@ fn global_status() -> GlobalStatus {
 }
 
 fn codegraph_status() -> CodegraphStatus {
-    let path = codegraph::exe_on_path();
     CodegraphStatus {
-        on_path: path.is_some(),
-        version: if path.is_some() {
-            codegraph::version()
-        } else {
-            "unknown".to_string()
-        },
-        path,
+        version: codegraph::version(),
     }
 }
 
-/// Collect the full diagnostic report. Never fails: an unreadable workspace,
-/// a missing model, or an absent CodeGraph CLI are all *findings*, not errors.
+/// Collect the full diagnostic report. Never fails: an unreadable workspace
+/// or a missing model are *findings*, not errors.
 pub fn gather(workspace: Option<&Path>) -> DiagnosticReport {
     // Each section falls back to its defaults when the workspace has no
     // manifest — exactly what the runtime does, so the report describes the
@@ -403,13 +394,7 @@ fn print_report(r: &DiagnosticReport) {
 
     println!();
     println!("[codegraph]");
-    match &r.codegraph.path {
-        Some(p) => println!("  on PATH     : yes ({p})"),
-        None => {
-            println!("  on PATH     : no — install with `npm install -g @colbymchenry/codegraph`")
-        }
-    }
-    println!("  version     : {}", r.codegraph.version);
+    println!("  version     : {} (native, built-in)", r.codegraph.version);
 }
 
 /// Run bare `sempkg status`: print the diagnostic report as text or JSON.

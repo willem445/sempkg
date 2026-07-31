@@ -1,0 +1,45 @@
+[package]
+name = "semgraph"
+version = "0.6.0"
+edition = "2021"
+description = "Native reader/writer for CodeGraph `codegraph.db` graph databases (schema v4), shared by sempkg (read path) and sembundle (Phase 2 write path)"
+
+[lib]
+name = "semgraph"
+path = "src/lib.rs"
+
+# Parity harness (issue #78 Phase 2 item 6): quantify semgraph-vs-CodeGraph-0.9.7
+# graph parity so language packs can be accepted against objective thresholds.
+[[bin]]
+name = "parity"
+path = "src/bin/parity.rs"
+
+[dependencies]
+rusqlite   = { workspace = true }
+thiserror  = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+sha2       = { workspace = true }
+hex        = { workspace = true }
+rayon      = { workspace = true }
+walkdir    = { workspace = true }
+clap       = { workspace = true }
+which      = { workspace = true }
+streaming-iterator     = { workspace = true }
+tree-sitter            = { workspace = true }
+tree-sitter-rust       = { workspace = true }
+tree-sitter-python     = { workspace = true }
+tree-sitter-typescript = { workspace = true }
+tree-sitter-c          = { workspace = true }
+tree-sitter-cpp        = { workspace = true }
+tree-sitter-go         = { workspace = true }
+tree-sitter-java       = { workspace = true }
+tree-sitter-ruby       = { workspace = true }
+tree-sitter-php        = { workspace = true }
+tree-sitter-kotlin-ng  = { workspace = true }
+tree-sitter-swift      = { workspace = true }
+tree-sitter-scala      = { workspace = true }
+tree-sitter-c-sharp    = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

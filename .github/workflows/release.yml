@@ -570,15 +570,7 @@ jobs:
           chmod +x "$SEMBUNDLE_BIN"
           echo "SEMBUNDLE_BIN=$SEMBUNDLE_BIN" >> "$GITHUB_ENV"
 
-      - name: Install Node.js
-        uses: actions/setup-node@v6
-        with:
-          node-version: '20'
-
-      - name: Install CodeGraph
-        run: npm install -g @colbymchenry/codegraph
-
-      - name: Resolve version and CodeGraph version
+      - name: Resolve version
         run: |
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
             echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
@@ -587,17 +579,16 @@ jobs:
             # version so the bundle still builds for smoke-testing.
             echo "VERSION=0.0.0-dev.${GITHUB_SHA::7}" >> "$GITHUB_ENV"
           fi
-          CG_VER=$(codegraph --version 2>&1 | grep -oP '\d+\.\d+\.\d+' | head -1)
-          echo "CODEGRAPH_VERSION=${CG_VER:-unknown}" >> "$GITHUB_ENV"
 
       - name: Build sempkg SemBundle
         run: |
+          # No --codegraph-version: the native indexer stamps
+          # "sempkg-native/<version>" into the manifest automatically.
           "$SEMBUNDLE_BIN" build \
             --name sempkg \
             --version "$VERSION" \
             --source-repo https://github.com/willem445/sempkg \
             --commit-hash "${{ github.sha }}" \
-            --codegraph-version "$CODEGRAPH_VERSION" \
             --source-dir src/sempkg/src \
             --docs-dir docs \
             --language rust \

@@ -192,5 +192,6 @@ Generate a key pair with `sembundle keygen`.
 
 ## Dependencies
 
-- [CodeGraph](https://github.com/colbymchenry/codegraph) — must be on PATH (`npm install -g @colbymchenry/codegraph`)
-- No external tools required for documentation indexing. LanceDB runs entirely in-process.
+- **No external tools required.** Graph indexing is native (built-in `semgraph`
+  crate) and documentation/code indexing runs entirely in-process (LanceDB).
+  There is no CodeGraph/Node dependency for building or querying bundles.

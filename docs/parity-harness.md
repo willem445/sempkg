@@ -1,0 +1,251 @@
+# Parity harness (`semgraph`-vs-CodeGraph-0.9.7)
+
+The parity harness quantifies how closely the native **semgraph** indexer
+(issue #78, Phase 2) reproduces the graph a pinned **CodeGraph 0.9.7** build
+produces for the same source tree. It exists so language packs can be accepted
+against **objective thresholds** instead of eyeballing diffs, and it justified
+the cutover from the CodeGraph CLI to semgraph
+([ADR-006](arch/adr/adr-006-codegraph-cutover.md)).
+
+Note: since the cutover, CodeGraph is **not** a runtime or CI dependency of the
+product — it survives only as this developer-only parity baseline (the live mode
+shells out to a locally-installed `codegraph@0.9.7`; the offline gate needs
+nothing).
+
+- **Tool:** `cargo run -p semgraph --bin parity -- <tree> [flags]`
+- **Core library:** `semgraph::parity` (`src/semgraph/src/parity.rs`) — the pure,
+  unit-tested diff engine.
+- **Offline CI gate:** `src/semgraph/tests/parity_offline.rs` (runs under
+  `cargo test --manifest-path src/semgraph/Cargo.toml`, no Node/CodeGraph
+  needed).
+- **Whitelist:** `tests/fixtures/parity-whitelist.json` (known-better deltas
+  from ADR-003/ADR-004).
+
+## What it measures
+
+Both graphs are read out of a schema-v4 `codegraph.db` and diffed:
+
+| Entity | Match key | Notes |
+|--------|-----------|-------|
+| **Nodes** | `(kind, qualified_name, file_path)` | `--strict-line-range` additionally pins `(start_line, end_line)`. Otherwise line range is a whitelistable *attribute*, not a hard key. |
+| **Reconvention** (nodes) | second pass on `(kind, file_path, start_line, end_line)` | Residual nodes (unmatched after the exact pass) are re-matched on **physical identity**, ignoring the qualified name. A match here is the *same physical definition under a different qn convention* (e.g. CodeGraph drops Rust's `tests::` prefix, or names a nested Python function differently). Reconventions **count toward recall** but are reported separately, showing both qn forms — so convention drift is never conflated with a genuine gap. |
+| **Edges** | `(source_qn, target_qn, kind)`, as a **multiset** | Golden endpoints are **translated through the reconvention map** first, so the same qn-convention drift doesn't inflate the edge miss. Preserves duplicate call sites / return-type references. Attributed to the **caller's** language. A **raw** (untranslated) `calls` percentage is also reported, so the size of the convention effect is visible. |
+| **Node attributes** | per identity-matched node | `is_async`, `docstring`, `signature`, and (relaxed mode) line-range differences are reported and can be whitelisted — but only in the documented-better *direction* (see below). |
+
+The report gives **per-kind** and **per-language** match percentages for nodes
+and edges, plus missing/extra/reconvention listings, plus a machine-readable JSON
+summary. Match percentage is *recall* (golden items reproduced), crediting
+reconventions and whitelisted omissions.
+
+**`calls` = N/A.** When the golden side has no `calls` edges, the calls metric is
+reported as `N/A` (JSON `null`), not a misleading 100%, and the calls threshold is
+treated as vacuously satisfied.
+
+### Acceptance thresholds
+
+Two thresholds gate acceptance (the issue's Phase 2 criteria), both after the
+whitelist is applied:
+
+- `--min-nodes` (default **95**) — overall node match %.
+- `--min-calls` (default **90**) — `calls`-edge match %.
+
+The tool exits **0** when both pass, **1** when a threshold fails (CI gate), and
+**2** on a harness error (bad DB, codegraph version mismatch, …).
+
+## Running it
+
+### Offline / CI mode (committed golden DB)
+
+No Node or CodeGraph install required — compares against a prebuilt
+`codegraph.db`:
+
+```bash
+cargo run -p semgraph --bin parity -- tests/fixtures/graph-src \
+    --golden tests/fixtures/codegraph-v4.db \
+    --whitelist tests/fixtures/parity-whitelist.json
+```
+
+The same comparison runs automatically in CI as
+`src/semgraph/tests/parity_offline.rs` (via `cargo test -p semgraph`), which
+asserts the fixture clears the thresholds (in fact 100% post-P2b) and that every
+non-matching diff is accounted for by the whitelist.
+
+`parity_offline.rs` also runs the harness over **every committed language
+fixture** — the tier-1 tree plus each tier-2 (`graph-src-tier2/<lang>`) and
+tier-3 (`graph-src-tier3/<lang>`) fixture against its own golden — asserting each
+clears ≥95% nodes / ≥90% calls. A parity regression in *any* language fails CI
+offline, not just tier-1 (issue #78 edge alignment; this generalizes the gate
+that was previously hardcoded to the tier-1 fixture). Exhaustive per-edge-kind
+grading — `calls`/`imports`/`instantiates` **and** the inheritance/type-reference
+families `extends`/`implements`/`references` — is enforced bidirectionally in
+`tier2_parity.rs` / `tier3_parity.rs`. CodeGraph's synthesized interface→impl
+edges (`metadata.synthesizedBy = "interface-impl"`, NULL call-site column) are
+excluded from the harness on both sides — they are a name-based bridge, not a
+real call site (ADR-005).
+
+### Live / dev mode (shell out to codegraph@0.9.7)
+
+With `@colbymchenry/codegraph@0.9.7` installed
+(`npm install -g @colbymchenry/codegraph@0.9.7`), omit `--golden` and the
+harness builds the CodeGraph side itself:
+
+```bash
+cargo run -p semgraph --bin parity -- ./some/tree \
+    --whitelist tests/fixtures/parity-whitelist.json
+```
+
+Live mode:
+
+- verifies `codegraph --version` is exactly **0.9.7** and fails with an
+  actionable message otherwise;
+- runs `codegraph init --index <tree>` (or `index --force` if the tree already
+  has a `.codegraph/` index), reading `<tree>/.codegraph/codegraph.db`;
+- indexes a **single** root (CodeGraph has no single-DB multi-root mode); for
+  multi-root comparisons build a DB yourself and pass `--golden`;
+- removes the `.codegraph/` directory it created afterwards — unless the index
+  pre-existed or you pass `--keep-codegraph`. A generated `codegraph.db` is
+  large and machine-specific; **do not commit it** (report numbers only).
+
+### Useful flags
+
+| Flag | Effect |
+|------|--------|
+| `--min-nodes <pct>` / `--min-calls <pct>` | Acceptance thresholds (defaults 95 / 90). |
+| `--whitelist <json>` | Apply a known-better-delta whitelist. Without it, every delta counts. |
+| `--strict-line-range` | Pin `(start_line, end_line)` into the node match key. |
+| `--json` | Print the JSON summary to stdout (the human report goes to stderr). |
+| `--json-out <path>` | Write the JSON summary to a file. |
+| `--keep-codegraph` | Live mode: keep the `.codegraph/` index this run creates. |
+
+## The whitelist
+
+`tests/fixtures/parity-whitelist.json` records **intentional, documented**
+deviations where semgraph is *better than* CodeGraph 0.9.7 (ADR-003/ADR-004).
+A whitelisted diff is still reported (tagged `[whitelisted]` with its
+justification) but is **not** counted as a failure. Never whitelist a genuine
+regression — only a documented improvement.
+
+```jsonc
+{
+  "node_attrs": [
+    { "attr": "is_async",  "qualified_name": "*", "file": "*", "justification": "…" },
+    { "attr": "docstring", "qualified_name": "*", "file": "*", "justification": "…" }
+  ],
+  "edges": [
+    { "side": "missing", "kind": "references", "source": "*", "target": "*",
+      "only_duplicates": true, "justification": "…" }
+  ],
+  "nodes": []
+}
+```
+
+- **`node_attrs[]`** — `attr` ∈ `{is_async, docstring, signature, line_range}`;
+  optional `qualified_name`/`file` globs and an exact `language`. A **required
+  `direction`** constrains which side's value the improvement must be on, so a
+  rule only forgives the documented-better direction and never masks its
+  regression:
+  - `semgraph_true` / `semgraph_false` — for boolean attrs (`is_async`): forgive
+    only when semgraph's value is true/false. `is_async` uses `semgraph_true`
+    (we correctly flag async CodeGraph missed); a *dropped* `is_async`
+    (semgraph=false, CodeGraph=true) is **not** forgiven.
+  - `semgraph_nonempty` / `codegraph_empty` — for text attrs (`docstring`):
+    `docstring` uses `semgraph_nonempty` (we kept/added a docstring); a *dropped*
+    docstring (semgraph empty, CodeGraph non-empty) is **not** forgiven.
+- **`edges[]`** — `side` ∈ `{missing, extra}`; optional `kind`, `source`/`target`
+  globs. `only_duplicates: true` whitelists a *missing* edge instance **only**
+  when semgraph still emits that key at least once (a duplicate-multiplicity
+  omission, not a true recall gap). `cross_language: true` whitelists a *missing*
+  edge **only** when its source and target nodes are in **different languages** —
+  a CodeGraph fabrication that a language-scoped resolver (ADR-004) never emits
+  (e.g. a Rust `stmt.execute()` resolved by bare name to a Python
+  `KnowledgeAgentExecutor::execute`). One such rule forgives every cross-language
+  fabrication without naming each foreign target — which would also wrongly
+  forgive a *genuine same-language* call to a symbol of that name. `language:
+  "rust"` scopes a rule to edges whose *caller* is in that language, so a bare-name
+  target entry (`context`, `build`) only fires where that external library is used.
+- **`nodes[]`** — `side` ∈ `{missing, extra}`; optional `kind`, `qualified_name`/
+  `file` globs.
+- Globs support `*` matching any run (`Array<*>`, `python/*`).
+
+The whitelist has two tiers of entry. The **ADR-003/004 known-better** ones —
+`is_async` correctness across all languages, docstring cleanups, and the omission
+of CodeGraph's duplicate nested-generic return-type `references` — are the ones
+the committed *fixture* exercises. The **CodeGraph-fabrication** ones (tier-1
+hardening) forgive `calls` edges that CodeGraph 0.9.7 emits but that are provably
+wrong, so semgraph correctly declines them rather than imitating (per issue #78):
+
+- **cross-language `calls`** (`cross_language: true`) — a language-scoped
+  resolver never crosses a language boundary (ADR-004);
+- **external-library over-resolution** — CodeGraph resolves a call by *bare
+  method name* even when the receiver's type is external to the graph
+  (`.as_str()` → `str`, `.contains()` → str/`HashSet`, `.ok()` → `Result`,
+  `.context()` → anyhow, `.build()`/`.json()` → reqwest, `.write()` → `write!`,
+  `X::new()` → std constructors), so it points the edge at a same-named local
+  symbol the code never calls. Each entry names the fabricated *target*, documents
+  the std/library method, and states a **verified count** — and is only added when
+  the target's genuine calls use a form semgraph matches (a qualified call or an
+  associated constructor like `EdgeRecord::contains(a, b)`), so the `.method()`
+  misses are *unambiguously* the external over-resolution. Targets whose bare
+  `.method()` could also be a genuine same-language instance call (`.get()`,
+  `.query()`, `.status()`, `.open()`) are **not** whitelisted — they count as
+  honest recall gaps rather than risk masking a real miss.
+
+semgraph itself emits **zero** fabricated calls: it resolves a method call only
+from an inferred receiver type and drops an un-inferrable receiver (precision over
+recall). Never whitelist a *genuine* recall gap or an extraction miss — only a
+documented improvement or a demonstrable, verified CodeGraph fabrication.
+
+## Adding a language to the acceptance flow
+
+When a teammate adds a tier-2/tier-3 language pack to `semgraph`, wire it into
+parity acceptance as follows:
+
+1. **Add a fixture source tree.** Extend `tests/fixtures/graph-src` with a
+   subdirectory for the language (or add a new fixture tree), exercising the
+   node kinds (functions, methods, classes, imports, …) and at least one
+   cross-file call so `calls`/`references` edges are produced.
+2. **Regenerate the golden DB.** With codegraph@0.9.7 installed, rebuild
+   `tests/fixtures/codegraph-v4.db` from the fixture tree per
+   `tests/fixtures/README.md` ("How `codegraph-v4.db` was generated") and commit
+   the updated DB. This is the compatibility contract.
+3. **Run the harness** in live mode against a real-world tree in that language
+   and record the per-language node and `calls` percentages:
+   ```bash
+   cargo run -p semgraph --bin parity -- <real-tree-in-that-language> \
+       --whitelist tests/fixtures/parity-whitelist.json --json-out parity.json
+   ```
+4. **Whitelist only documented, known-better deltas.** If the language has an
+   intentional deviation (as Rust/Python/TS do for `is_async`/docstrings), add a
+   whitelist entry **with a justification and an ADR reference**. Do not
+   whitelist genuine gaps.
+5. **Gate on the thresholds.** A language pack is accepted for cutover when it
+   clears `--min-nodes 95 --min-calls 90` on its fixture (the offline test
+   enforces this) and reports healthy numbers on real-world trees. Report the
+   real-world numbers in the pack's PR.
+6. The offline test (`parity_offline.rs`) enumerates every committed fixture —
+   the tier-1 tree and each `graph-src-tier2/<lang>` / `graph-src-tier3/<lang>`
+   dir — and gates each on the thresholds through the harness. A tier-1/2/3
+   language is covered automatically as soon as its fixture + golden are present
+   in `all_fixtures()`; keep that list and the goldens in sync. Per-edge-kind
+   exactness (including `extends`/`implements`/`references`) is asserted in
+   `tier2_parity.rs` / `tier3_parity.rs`.
+
+## Interpreting real-world numbers
+
+The committed fixture is deliberately exact (100% nodes / 100% calls post-P2b) —
+it is the *contract*, not a representative repo. Running the harness against a
+large real tree will surface genuine gaps (unsupported node/edge kinds,
+name-resolution recall at scale). Those are the actionable signal the harness
+exists to produce: a language stays behind the CodeGraph default until it clears
+the thresholds on real code, not just on the fixture.
+
+**Read the reconvention split first.** On a real tree, a large fraction of the
+apparent node/edge "miss" is usually qualified-name *convention* drift, not
+genuine absence — semgraph found the definition but named it differently
+(`tests::` prefixes, nested-scope prefixes). The reconvention pass separates
+those out and translates edge endpoints through them, so the reported node recall
+and the *convention-normalized* calls percentage reflect **genuine** parity. The
+`raw` calls percentage shows how much the convention was hiding. Scope hardening
+work from the genuine, post-normalization gaps (e.g. unsupported kinds like
+`trait`/`extends`/`implements`, or surviving call-resolution recall), not from
+the raw numbers.

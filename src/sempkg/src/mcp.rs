@@ -18,7 +18,7 @@ use crate::reranker;
 use crate::store::{
     list_all_bundles, resolve_bundle, resolve_bundle_spec, resolve_bundle_spec_in, BundleInfo,
 };
-use crate::{codegraph, embedding, lance, query_expansion};
+use crate::{embedding, graph, lance, query_expansion};
 
 use crate::query_expansion::ExpansionKind;
 
@@ -1432,7 +1432,7 @@ impl McpContext {
                 // When a reranker is present, fetch more candidates than
                 // requested so the model has a richer pool to score.
                 let fetch_limit = self.reranker_fetch_limit(limit);
-                let raw = codegraph::query(&path, query, kind, fetch_limit)
+                let raw = graph::query(&path, query, kind, fetch_limit)
                     .unwrap_or_else(|e| format!("Error: {e}"));
 
                 self.apply_rerank_to_codegraph_json(query, &raw, limit)
@@ -1449,14 +1449,11 @@ impl McpContext {
         // Fetch more candidates than `limit` so the reranker has a richer pool.
         let fetch_limit = self.reranker_fetch_limit(limit).max(limit * 2);
 
-        // Request JSON output with code blocks suppressed so we can rerank the
-        // symbol list before returning it.
-        let raw = match codegraph::context_json(&path, task, fetch_limit) {
+        // Native context: FTS seed + graph expansion, returned as
+        // `{ "nodes": [...] }` for the reranker to score.
+        let raw = match graph::context(&path, task, fetch_limit) {
             Ok(s) => s,
-            Err(_) => {
-                // Graceful fallback: return plain markdown output.
-                return codegraph::context(&path, task).unwrap_or_else(|e| format!("Error: {e}"));
-            }
+            Err(e) => return format!("Error: {e}"),
         };
 
         // Parse the JSON response: extract the `nodes` array and re-serialise
@@ -1479,8 +1476,8 @@ impl McpContext {
         match self.resolve_codegraph_path(package) {
             Err(e) => e,
             Ok(path) => {
-                let raw = codegraph::callers(&path, symbol, limit)
-                    .unwrap_or_else(|e| format!("Error: {e}"));
+                let raw =
+                    graph::callers(&path, symbol, limit).unwrap_or_else(|e| format!("Error: {e}"));
                 self.fmt_codegraph_with_source(package, &raw)
             }
         }
@@ -1490,8 +1487,8 @@ impl McpContext {
         match self.resolve_codegraph_path(package) {
             Err(e) => e,
             Ok(path) => {
-                let raw = codegraph::callees(&path, symbol, limit)
-                    .unwrap_or_else(|e| format!("Error: {e}"));
+                let raw =
+                    graph::callees(&path, symbol, limit).unwrap_or_else(|e| format!("Error: {e}"));
                 self.fmt_codegraph_with_source(package, &raw)
             }
         }
@@ -1501,8 +1498,8 @@ impl McpContext {
         match self.resolve_codegraph_path(package) {
             Err(e) => e,
             Ok(path) => {
-                let raw = codegraph::impact(&path, symbol, depth)
-                    .unwrap_or_else(|e| format!("Error: {e}"));
+                let raw =
+                    graph::impact(&path, symbol, depth).unwrap_or_else(|e| format!("Error: {e}"));
                 fmt_codegraph_json(&raw)
             }
         }
@@ -1512,7 +1509,7 @@ impl McpContext {
         match self.resolve_codegraph_path(package) {
             Err(e) => e,
             Ok(path) => {
-                codegraph::files(&path, filter, limit).unwrap_or_else(|e| format!("Error: {e}"))
+                graph::files(&path, filter, limit).unwrap_or_else(|e| format!("Error: {e}"))
             }
         }
     }
@@ -1928,7 +1925,7 @@ impl McpContext {
 
             // CodeGraph symbol search (lexical only).
             if do_lex && bundle.is_indexed() {
-                if let Ok(raw) = codegraph::query(&bundle.bundle_dir, query, None, fetch_limit) {
+                if let Ok(raw) = graph::query(&bundle.bundle_dir, query, None, fetch_limit) {
                     stats.lex_codegraph_hits += push_codegraph_hits(hits, &pkg_name, &raw);
                 }
             }
@@ -1964,7 +1961,7 @@ impl McpContext {
 
             // CodeGraph (lexical only).
             if do_lex && pkg.is_indexed() {
-                if let Ok(raw) = codegraph::query(&pkg.abs_path(), query, None, fetch_limit) {
+                if let Ok(raw) = graph::query(&pkg.abs_path(), query, None, fetch_limit) {
                     stats.lex_codegraph_hits += push_codegraph_hits(hits, &pkg_name, &raw);
                 }
             }
@@ -2361,8 +2358,7 @@ impl McpContext {
                 // top_k / output_n truncation here — rerank() applies those
                 // internally and would cap p1_scored to output_n (= 5)
                 // regardless of how large pass2_budget or limit are.
-                let p1_texts: Vec<&str> =
-                    p1_candidates.iter().map(|c| c.text.as_str()).collect();
+                let p1_texts: Vec<&str> = p1_candidates.iter().map(|c| c.text.as_str()).collect();
                 let p1_scores = ranker
                     .score_pairs(query, &p1_texts)
                     .unwrap_or_else(|_| vec![0.0; p1_texts.len()]);
@@ -2426,8 +2422,7 @@ impl McpContext {
                     }
                 }
 
-                let window_refs: Vec<&str> =
-                    window_texts.iter().map(String::as_str).collect();
+                let window_refs: Vec<&str> = window_texts.iter().map(String::as_str).collect();
                 let window_scores = ranker
                     .score_pairs(query, &window_refs)
                     .unwrap_or_else(|_| vec![0.0; window_refs.len()]);

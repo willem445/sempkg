@@ -31,8 +31,9 @@ optional local LLM reranker for high-quality hybrid queries.
 
 | Requirement | Notes |
 |-------------|-------|
-| [CodeGraph](https://github.com/colbymchenry/codegraph) | Must be on `PATH`. Install with `npm install -g @colbymchenry/codegraph`. |
 | Rust toolchain | Required only when building from source. |
+
+Indexing and querying are fully native — no CodeGraph/Node install is required.
 
 ---
 
@@ -367,7 +368,7 @@ sempkg 0.6.1
 
 [workspace]                          # sempkg.toml / sempkg.lock / installed bundles
 [global]                             # ~/.sempkg: bundles, downloaded models, packages
-[codegraph]                          # on PATH? which version?
+[codegraph]                          # native indexer version (always built-in)
 ```
 
 The `features` and `gpu build` lines are the ones most bug reports turn on:

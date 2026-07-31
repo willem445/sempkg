@@ -396,9 +396,9 @@ bundles built locally.
 ### Phase 4 — Orchestration + install
 - [ ] `add_from_github` wires fast path + build path + `BundleStore.install_bytes`.
 - [ ] `codegraph::version()` and `detect_language()` implemented with safe defaults.
-- [ ] `sempkg add pandas-dev/pandas@v2.2.2` (with `codegraph` on PATH) installs a
-      queryable bundle; `sempkg list` shows it; `sempkg status pandas` reports
-      `Queryable: true`.
+- [ ] `sempkg add pandas-dev/pandas@v2.2.2` installs a queryable bundle (indexed
+      natively, no external tools); `sempkg list` shows it; `sempkg status pandas`
+      reports `Queryable: true`.
 
 ### Phase 5 — Manifest/lock + sync reproducibility
 - [ ] `DependencyEntry` gains optional `git`/`git_ref`/`subdir`; old manifests still

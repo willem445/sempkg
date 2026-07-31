@@ -44,6 +44,7 @@ metal  = ["dep:llama-cpp-2", "llama-cpp-2/metal"]
 
 [dependencies]
 sembundle    = { path = "../sembundle" }
+semgraph     = { path = "../semgraph" }
 clap         = { workspace = true }
 tokio        = { workspace = true, features = ["full"] }
 serde        = { workspace = true }
