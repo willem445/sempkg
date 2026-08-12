@@ -238,7 +238,7 @@ jobs:
       # GitHub caching is disabled so the ~3 GB installer doesn't evict the Rust
       # build cache from the repo's 10 GB Actions cache budget.
       - name: Install CUDA Toolkit
-        uses: Jimver/cuda-toolkit@v0.2.35
+        uses: Jimver/cuda-toolkit@v0.2.36
         id: cuda-toolkit
         with:
           cuda: '13.2.0'
