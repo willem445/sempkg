@@ -129,15 +129,70 @@ if ($Only -eq "" -or $Only -eq "sembundle") { Install-Binary "sembundle" }
 if ($Only -eq "" -or $Only -eq "sempkg")    { Install-Sempkg }
 
 # ── PATH check ────────────────────────────────────────────────────────────────
-$userPath = [Environment]::GetEnvironmentVariable("PATH", "User")
-if ($userPath -notlike "*$InstallDir*") {
-    Write-Host ""
-    Write-Host "NOTE: $InstallDir is not on your PATH."
-    Write-Host "Adding it to your user PATH permanently..."
-    $newPath = ($userPath.TrimEnd(";") + ";" + $InstallDir).TrimStart(";")
-    [Environment]::SetEnvironmentVariable("PATH", $newPath, "User")
-    $env:PATH = $env:PATH.TrimEnd(";") + ";" + $InstallDir
-    Write-Host "Done. Restart your terminal for the change to take effect."
-} else {
-    Write-Host "Done."
+# Read and write the user PATH through the registry *unexpanded*, preserving its
+# value kind. [Environment]::GetEnvironmentVariable("PATH", "User") expands a
+# REG_EXPAND_SZ value on read, so reading with it and writing the result back
+# would bake every other tool's `%JAVA_HOME%\bin` / `%USERPROFILE%\go\bin`
+# segment down to today's literal path and flip the value kind to REG_SZ —
+# breaking those entries the moment the variable changes. Every existing
+# segment must come back out exactly as it went in (see uninstall.ps1, which
+# fixed the same bug on removal — issue #107).
+$target = $InstallDir.TrimEnd('\')
+
+# Compare on the *expanded* form (so an entry already stored as
+# `%USERPROFILE%\.local\bin` is recognised as present) but keep the raw form
+# for writing back. A plain substring/`-like` match on the raw value would miss
+# that case and append a duplicate entry on every run.
+function Test-IsInstallDirSegment {
+    param([string] $Segment)
+
+    if (-not $Segment) { return $false }
+    if ($Segment.TrimEnd('\') -eq $target) { return $true }
+    return ([Environment]::ExpandEnvironmentVariables($Segment)).TrimEnd('\') -eq $target
+}
+
+$envKey = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment', $true)
+try {
+    $rawPath = $null
+    $kind = [Microsoft.Win32.RegistryValueKind]::String
+    if ($envKey) {
+        $rawPath = $envKey.GetValue(
+            'Path', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+        if ($null -ne $rawPath) { $kind = $envKey.GetValueKind('Path') }
+    }
+
+    $segments = @()
+    if ($rawPath) { $segments = @([string]$rawPath -split ';') }
+    $alreadyPresent = @($segments | Where-Object { Test-IsInstallDirSegment $_ }).Count -gt 0
+
+    if ($alreadyPresent) {
+        Write-Host "Done."
+    } elseif (-not $envKey) {
+        # HKCU\Environment should always be openable; this is a last-resort
+        # fallback so install still completes rather than crashing. It can
+        # still expand %VAR% segments already in the user PATH — said so
+        # explicitly rather than silently.
+        Write-Host ""
+        Write-Host "WARNING: could not open HKCU\Environment for writing; falling back to"
+        Write-Host "         [Environment]::SetEnvironmentVariable, which may expand any"
+        Write-Host "         %VAR% segments already in your user PATH."
+        $legacyPath = [Environment]::GetEnvironmentVariable("PATH", "User")
+        $newPath = if ($legacyPath) { $legacyPath.TrimEnd(";") + ";" + $InstallDir } else { $InstallDir }
+        [Environment]::SetEnvironmentVariable("PATH", $newPath, "User")
+        $env:PATH = $env:PATH.TrimEnd(";") + ";" + $InstallDir
+        Write-Host "Done. Restart your terminal for the change to take effect."
+    } else {
+        Write-Host ""
+        Write-Host "NOTE: $InstallDir is not on your PATH."
+        Write-Host "Adding it to your user PATH permanently..."
+        # Preserve every existing segment byte-for-byte — including stray empty
+        # ones from a `;;` — and append the install dir.
+        $newPath = (@($segments) + $InstallDir) -join ';'
+        $envKey.SetValue('Path', $newPath, $kind)
+        $env:PATH = $env:PATH.TrimEnd(";") + ";" + $InstallDir
+        Write-Host "Done. Restart your terminal for the change to take effect."
+    }
+}
+finally {
+    if ($envKey) { $envKey.Dispose() }
 }

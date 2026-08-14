@@ -143,19 +143,22 @@ jobs:
       - name: Test sempkg
         run: cargo test --manifest-path src/sempkg/Cargo.toml --features reranker,embeddings
 
-  # The uninstall scripts delete files and (on Windows) edit the user PATH, so
-  # they are exercised end-to-end rather than reviewed by eye. Both harnesses run
-  # entirely inside a throwaway sandbox — a fake HOME/USERPROFILE, a fake install
-  # dir, a victim dir, a canary dir and a fake user workspace — and assert what
-  # must be removed *and* what must survive. The Windows harness additionally
-  # snapshots the real user PATH (raw value + REG_EXPAND_SZ kind), runs against a
-  # hostile probe value, and restores it in a `finally`, asserting the restore.
+  # The install/uninstall scripts delete or download files and (on Windows) edit
+  # the user PATH, so they are exercised end-to-end rather than reviewed by eye.
+  # The harnesses run entirely inside a throwaway sandbox — a fake
+  # HOME/USERPROFILE, a fake install dir, a victim dir, a canary dir and a fake
+  # user workspace — and assert what must be removed/added *and* what must
+  # survive. The Windows harnesses additionally snapshot the real user PATH (raw
+  # value + REG_EXPAND_SZ kind), run against a hostile probe value, and restore
+  # it in a `finally`, asserting the restore. install.ps1's harness never touches
+  # the network: it shadows Invoke-WebRequest with a local mock and passes an
+  # explicit -Version and -Gpu off to skip the release-lookup and CUDA download
+  # paths (see tests/install/smoke.ps1).
   #
-  # Note: the harnesses seed the pre-uninstall state directly instead of running
-  # the installer. install.ps1 has a known pre-existing PATH-append bug (#107), so
-  # an install -> uninstall round trip would currently fail on the *installer's*
-  # corruption rather than on uninstall's behaviour. A full round trip is worth
-  # adding once #107 lands.
+  # Note: the uninstall harness seeds the pre-uninstall state directly instead of
+  # running the installer, so an install -> uninstall round trip is still worth
+  # adding as a follow-up; the two harnesses today cover install and uninstall
+  # independently.
   uninstall-scripts:
     name: Uninstall scripts — ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
@@ -177,6 +180,11 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: pwsh -File tests/uninstall/smoke.ps1
+
+      - name: Smoke-test install.ps1
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: pwsh -File tests/install/smoke.ps1
 
   functional-tests:
     name: Functional MCP tests (ubuntu)

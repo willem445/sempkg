@@ -14,12 +14,10 @@
 # machine is read or written.
 #
 # The pre-uninstall state is SEEDED DIRECTLY instead of by running install.ps1.
-# That is deliberate: install.ps1 has a known pre-existing PATH-append bug
-# (issue #107 — it expands REG_EXPAND_SZ entries on write-back), so a naive
-# install -> uninstall round trip would fail on the installer's corruption
-# rather than on anything uninstall does. Seeding the state an install *would*
-# have produced isolates what uninstall actually owns. A full round trip is
-# worth adding once #107 lands.
+# That is deliberate: it isolates what uninstall actually owns from what
+# install.ps1 does (covered separately by tests/install/smoke.ps1, added
+# alongside the #107 fix). A full install -> uninstall round trip is still
+# worth adding as a follow-up.
 #
 # Usage:
 #   pwsh -File tests/uninstall/smoke.ps1 [-Script path\to\uninstall.ps1]
