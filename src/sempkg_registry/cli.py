@@ -61,9 +61,9 @@ def _cmd_token_revoke(args: argparse.Namespace) -> None:
     config_dir = Path(args.config_dir) if args.config_dir else None
     store = TokenStore(config_dir=config_dir)
     if store.revoke_token(args.token):
-        print(f"Token revoked.")
+        print("Token revoked.")
     else:
-        sys.exit(f"Error: token not found.")
+        sys.exit("Error: token not found.")
 
 
 def main() -> None:

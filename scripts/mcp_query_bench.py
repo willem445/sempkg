@@ -13,7 +13,6 @@ import argparse
 import json
 import statistics
 import subprocess
-import sys
 import time
 
 DEFAULT_BIN = r"C:/Projects/sempkg/src/sempkg/target/release/sempkg.exe"

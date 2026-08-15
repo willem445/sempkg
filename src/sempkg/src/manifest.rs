@@ -222,10 +222,6 @@ pub struct LockEntry {
 }
 
 impl LockFile {
-    pub fn find(&self, name: &str) -> Option<&LockEntry> {
-        self.packages.iter().find(|e| e.name == name)
-    }
-
     pub fn upsert(&mut self, entry: LockEntry) {
         if let Some(existing) = self.packages.iter_mut().find(|e| e.name == entry.name) {
             *existing = entry;

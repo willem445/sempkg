@@ -637,7 +637,7 @@ pub fn download_and_extract_tarball(
 
         // Strip the first path component (the GitHub-generated `repo-ref/` prefix)
         let stripped: PathBuf = raw_path.components().skip(1).collect();
-        if stripped == PathBuf::from("") {
+        if stripped.as_os_str().is_empty() {
             continue; // top-level dir entry itself
         }
 
@@ -811,11 +811,6 @@ pub fn detect_language(root: &Path) -> String {
 // ---------------------------------------------------------------------------
 // Token helper
 // ---------------------------------------------------------------------------
-
-/// Read GitHub token from environment (`GITHUB_TOKEN` preferred, then `GH_TOKEN`).
-pub fn github_token() -> Option<String> {
-    github_token_for_host("github.com")
-}
 
 /// Resolve which host should be used for GitHub PAT lookup for a URL.
 ///

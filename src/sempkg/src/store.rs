@@ -129,13 +129,6 @@ impl BundleStore {
         self.bundle_dir(name, version).exists()
     }
 
-    /// Install a .sembundle file from disk into the store.
-    pub fn install(&self, bundle_path: &Path) -> Result<BundleInfo> {
-        let bytes = std::fs::read(bundle_path)
-            .with_context(|| format!("Cannot read bundle: {}", bundle_path.display()))?;
-        self.install_bytes(&bytes)
-    }
-
     /// Install from raw bytes (already downloaded).
     pub fn install_bytes(&self, bytes: &[u8]) -> Result<BundleInfo> {
         use std::io::Cursor;
@@ -280,7 +273,7 @@ impl BundleStore {
 
     /// Get a specific installed bundle by name (latest version if multiple).
     pub fn get(&self, name: &str) -> Option<BundleInfo> {
-        self.list().into_iter().filter(|b| b.name == name).last()
+        self.list().into_iter().rfind(|b| b.name == name)
     }
 
     /// Get a specific version of a bundle.
@@ -578,7 +571,9 @@ mod tests {
         let bundles = vec![bundle("qmd", "2.5.2", BundleScope::Global)];
         // Unknown exact version falls back to the installed one.
         assert_eq!(
-            resolve_bundle_spec_in(&bundles, "qmd@9.9.9").unwrap().version,
+            resolve_bundle_spec_in(&bundles, "qmd@9.9.9")
+                .unwrap()
+                .version,
             "2.5.2"
         );
         // Bare name resolves too.
