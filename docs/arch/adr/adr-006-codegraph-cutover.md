@@ -98,11 +98,13 @@ target, PR #90):
 | Metric | Native vs CodeGraph 0.9.7 |
 |---|---|
 | **Nodes** | **≈99.9%** (`99.86%`; the residual is a Python nested-function convention) |
-| **`calls` — honest recall** | **83.90%** (golden 2640; 1847 matched, 368 verified CodeGraph fabrications whitelisted, **793 declined-and-counted**) |
-| **`calls` — true genuine-recall** | **≈82.6%** (point estimate; ~81–84% over the ambiguous split) |
+| **`calls` — honest recall** | **86.4%** (post-PR-#93 receiver-type inference; measurement of record: [ADR-004](adr-004-semgraph-resolution-and-sync.md)) |
+| **`calls` — true genuine-recall** | **≈86.8%** (point estimate; fabrications excluded from the denominator) |
 
-The `calls` number is deliberately **not** inflated to the ≥90 harness bar. PR
-#90 hand-classified a random sample of the 793 declined edges (n=63, ~8%):
+The `calls` number is deliberately **not** inflated to the ≥90 harness bar. At
+cutover time (PR #90), against an 83.90%-honest-recall / ~82.6%-genuine-recall
+baseline, a hand-classification of a random sample of the then-793 declined
+edges (n=63, ~8%) found:
 
 - **~46%** are CodeGraph *fabrications* — it bare-name-resolves an external/std
   call (`str::find`, `HashMap::get`, `Digest::finalize`, clap `parse`) to an
@@ -114,10 +116,26 @@ The `calls` number is deliberately **not** inflated to the ≥90 harness bar. PR
 
 Extrapolated: of the 793, roughly **365 CodeGraph fabrications**, **352 genuine
 losses**, **76 ambiguous**. So about half the apparent gap to 90 is CodeGraph
-noise semgraph is right to drop; the other half is a real ~15%-of-golden recall
-loss whose closure is a **precision-preserving receiver-inference follow-up**
+noise semgraph is right to drop; the other half was a real recall loss whose
+closure was scoped as a **precision-preserving receiver-inference follow-up**
 (return-type-of-local, chained-call, typed-Python) — explicitly **not** a return
 to name-based guessing. Full write-up and per-edge examples: **PR #90**.
+
+That follow-up has since **landed, in PR #93** (issue #78). Method-call
+receivers are now typed, evidence-only, from the callee's resolved return type
+(covering return-type-of-local and chained calls), from typed-Python
+parameter/variable annotations and constructor assignments, and from for-loop
+element types over a typed collection — with semgraph still emitting **zero**
+fabricated calls (an ambiguous or un-resolvable callee yields no type, same as
+before). Measured on this repo's `src/`: `calls` honest recall **83.2% →
+86.4%**, true genuine-recall **~82.6% → ~86.8%** — the current numbers in the
+table above. **[ADR-004](adr-004-semgraph-resolution-and-sync.md)** is the
+measurement of record for these figures and the inference mechanism; this ADR
+should be kept in sync with it rather than drift, as happened between PR #93's
+own merge and this correction. What genuinely remains, per ADR-004: receivers
+with **no static evidence** — untyped Python fixture parameters, and iteration
+over a bare local collection — which stay deliberately dropped rather than
+guessed.
 
 We accept this tradeoff for cutover: `get_callers`/`get_impact` favor precision
 (no fabricated edges) over recapturing CodeGraph's fabricated tail, and the
@@ -137,8 +155,10 @@ number stays honest rather than gamed to the threshold.
 
 **Negative / accepted**
 
-- `calls` recall trails CodeGraph 0.9.7's *reported* number by design; ~15% of
-  golden calls are genuinely not emitted pending receiver inference (above).
+- `calls` recall trails CodeGraph 0.9.7's *reported* number by design; even
+  after PR #93's receiver-type inference (above), some genuine calls remain
+  unemitted — receivers with no static evidence — and stay deliberately
+  dropped rather than guessed.
 - **Output-stability deviation:** `sempkg pkg add`/`reindex` previously printed
   CodeGraph's CLI stdout; they now print a one-line native summary (`Indexed N
   files, M nodes, K edges.`). The build log label changed from `codegraph:
@@ -159,5 +179,6 @@ their licenses.
   the product).
 - **Chase ≥90 `calls` parity before cutover** by re-adding name-based receiver
   resolution. Rejected: that is exactly the fabrication semgraph declines; it
-  would trade precision for a number. Deferred to a precision-preserving
-  receiver-inference follow-up.
+  would trade precision for a number. Deferred to — and since delivered by — a
+  precision-preserving receiver-inference follow-up (PR #93; see ADR-004),
+  which still does not reach ≥90 by design.
