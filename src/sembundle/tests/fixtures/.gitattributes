@@ -1,0 +1,5 @@
+# These fixtures pin an Ed25519 signature over exact bytes (see README.md).
+# Never let git normalize line endings on any of them — a CRLF/LF conversion
+# on one platform but not another would silently change the signed bytes and
+# break the very cross-version invariant this directory exists to prove.
+* -text
