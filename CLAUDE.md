@@ -15,6 +15,8 @@
 cargo fmt --all
 # sembundle has no optional GPU features, so --all-features is safe there:
 cargo clippy --all-targets --all-features --manifest-path src/sembundle/Cargo.toml -- -D warnings
+# semgraph (native tree-sitter indexer, issue #78) has no optional features either:
+cargo clippy --all-targets --all-features --manifest-path src/semgraph/Cargo.toml -- -D warnings
 # sempkg's --all-features enables every GPU backend at once (cuda/vulkan/rocm/metal),
 # which is mutually incompatible and needs each vendor's SDK — lint the buildable set:
 cargo clippy --all-targets --features reranker,embeddings --manifest-path src/sempkg/Cargo.toml -- -D warnings
