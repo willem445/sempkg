@@ -637,15 +637,79 @@ jobs:
           path: dist/
           merge-multiple: true
 
+      # Single source of truth for what ships in a release (#124). This is the
+      # ONLY place the allow-list patterns live: the checksum step below and
+      # the publish step both simply operate on whatever survives this prune,
+      # so there is exactly one list to keep in sync with the build matrix —
+      # not one in the checksum step and a second, driftable copy in the
+      # publish step's `files:`.
+      #
+      # Pruning here (before checksums, before publish) also fixes a
+      # correctness bug a naive "just filter the publish step" fix would have
+      # left in place: if debris like `cuda-installer.log` (uploaded as its
+      # own artifact by the Jimver/cuda-toolkit action, then swept into dist/
+      # by the merge-multiple download above) were hashed into
+      # SHA256SUMS.txt but never published, `sha256sum -c SHA256SUMS.txt`
+      # would error for every user with "No such file" on the unpublished
+      # entry. Pruning first means the checksums file describes exactly what
+      # ships — this is also issue #124's option 2 (stop the debris reaching
+      # the collected directory) for free, applied at the one place all
+      # build-job outputs are already collected together.
+      #
+      # Patterns are derived from what each job actually stages/uploads:
+      #   - `sempkg-*` / `sembundle-*` — every per-target binary from the
+      #     `build`, `build-cuda`, and `build-vulkan` jobs (including the
+      #     `.exe`, `-cuda.zip`, and `-vulkan.exe` variants), plus the
+      #     `sempkg-<version>.sembundle` and its `.sig` from bundle-sempkg
+      #     (both filenames start with `sempkg-`).
+      #   - `public.pem` — the signing public key staged by bundle-sempkg.
+      # `SHA256SUMS.txt` itself doesn't need an entry: it doesn't exist yet at
+      # prune time (the next step creates it), so it can't be pruned or
+      # hashed into itself. If a future job's artifact doesn't start with
+      # `sempkg-`/`sembundle-` or match `public.pem`, add its pattern here
+      # rather than widening either downstream step back to a wildcard.
+      - name: Prune dist/ to the release asset allow-list
+        shell: bash
+        run: |
+          set -eu
+          cd dist
+          shopt -s nullglob
+          keep=(sempkg-* sembundle-* public.pem)
+          declare -A keeper=()
+          for pattern in "${keep[@]}"; do
+            for f in $pattern; do
+              keeper["$f"]=1
+            done
+          done
+          for f in *; do
+            [ -f "$f" ] || continue
+            if [ -z "${keeper[$f]:-}" ]; then
+              echo "pruning unpublished build artifact: $f"
+              rm -f "$f"
+            fi
+          done
+          ls -la
+
       - name: Generate SHA-256 checksums
         run: |
           cd dist
-          find . -type f | sort | xargs sha256sum > SHA256SUMS.txt
+          # `> SHA256SUMS.txt` truncates/creates the file as part of setting up
+          # the redirection, before `find` ever runs — so without the
+          # `! -name` exclusion, `find` sees the now-existing empty file and
+          # hashes it, and the file ends up containing a self-referential line
+          # for its own empty state (the SHA-256 of the empty string,
+          # e3b0c442...b855). That shipped in v1.0.0-beta.1 and made
+          # `sha256sum -c SHA256SUMS.txt` fail for every user.
+          find . -type f ! -name SHA256SUMS.txt | sort | xargs sha256sum > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          # dist/ was already pruned to the allow-list above, and
+          # SHA256SUMS.txt was generated from that same pruned set — so the
+          # published assets and the checksums file describe exactly the same
+          # files. No second copy of the allow-list needed here.
           files: dist/**
           generate_release_notes: true
           prerelease: ${{ contains(github.ref_name, '-') }}
