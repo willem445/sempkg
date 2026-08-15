@@ -93,7 +93,8 @@ producer-neutral).
 
 The native indexer is accepted against a pinned CodeGraph 0.9.7 baseline via the
 parity harness (`docs/parity-harness.md`). On this repo's `src/` (the hardening
-target, PR #90):
+target, PR #90; `calls` figures below are post-PR-#93 receiver-type inference,
+per row):
 
 | Metric | Native vs CodeGraph 0.9.7 |
 |---|---|
