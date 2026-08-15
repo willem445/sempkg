@@ -7,11 +7,9 @@
 # sandbox is read or written.
 #
 # The pre-uninstall state is SEEDED DIRECTLY instead of by running install.sh.
-# That is deliberate: install.ps1 has a known pre-existing PATH-append bug
-# (issue #107), so a naive install -> uninstall round trip would fail on the
-# installer's corruption rather than on anything uninstall does. Seeding the
-# state an install *would* have produced isolates what uninstall actually owns.
-# A full round trip is worth adding once #107 lands.
+# That is deliberate: it isolates what uninstall actually owns from what
+# install.sh/install.ps1 do. A full install -> uninstall round trip is still
+# worth adding as a follow-up.
 #
 # Usage:
 #   sh tests/uninstall/smoke.sh [--script path/to/uninstall.sh]
