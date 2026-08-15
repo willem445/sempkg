@@ -96,6 +96,10 @@ function Get-RawUserPath {
     return [string]$envKey.GetValue('Path', '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
 }
 
+function Get-RawUserPathKind {
+    return $envKey.GetValueKind('Path')
+}
+
 function Set-RawUserPath {
     param([string] $Value, $Kind)
     if ($null -eq $Value) { $envKey.DeleteValue('Path', $false) }
@@ -112,6 +116,7 @@ try {
     Assert-True (Invoke-Install) "Case 1: install completed without throwing"
     $after = Get-RawUserPath
     Assert-True ($after -eq $script:BinDir) "Case 1: PATH created containing exactly the install dir"
+    Assert-True ((Get-RawUserPathKind) -eq [Microsoft.Win32.RegistryValueKind]::String) "Case 1: new value created as REG_SZ"
 
     # ── Case 2: REG_EXPAND_SZ PATH with unexpanded %VAR% segments, dir absent ──
     Write-Host ""

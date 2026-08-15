@@ -169,18 +169,25 @@ try {
         Write-Host "Done."
     } elseif (-not $envKey) {
         # HKCU\Environment should always be openable; this is a last-resort
-        # fallback so install still completes rather than crashing. It can
-        # still expand %VAR% segments already in the user PATH — said so
-        # explicitly rather than silently.
+        # path so install still completes rather than crashing. It deliberately
+        # does NOT fall back to [Environment]::SetEnvironmentVariable — that
+        # writes the very same HKCU\Environment key OpenSubKey just failed to
+        # open (so it would almost certainly throw too), and if it somehow
+        # succeeded it would silently expand any %VAR% segment already on the
+        # user's PATH: exactly the corruption this fix exists to stop. Nothing
+        # is written to the registry here; the user is told how to add it
+        # themselves instead.
         Write-Host ""
-        Write-Host "WARNING: could not open HKCU\Environment for writing; falling back to"
-        Write-Host "         [Environment]::SetEnvironmentVariable, which may expand any"
-        Write-Host "         %VAR% segments already in your user PATH."
-        $legacyPath = [Environment]::GetEnvironmentVariable("PATH", "User")
-        $newPath = if ($legacyPath) { $legacyPath.TrimEnd(";") + ";" + $InstallDir } else { $InstallDir }
-        [Environment]::SetEnvironmentVariable("PATH", $newPath, "User")
+        Write-Host "WARNING: could not open HKCU\Environment for writing, so $InstallDir was"
+        Write-Host "         NOT added to your permanent user PATH (nothing was written to the"
+        Write-Host "         registry — this avoids risking corruption of any existing %VAR%"
+        Write-Host "         entries on your PATH)."
+        Write-Host "Add it yourself: Windows Settings > System > About > Advanced system"
+        Write-Host "settings > Environment Variables, then edit the user 'Path' variable and"
+        Write-Host "add:"
+        Write-Host "  $InstallDir"
         $env:PATH = $env:PATH.TrimEnd(";") + ";" + $InstallDir
-        Write-Host "Done. Restart your terminal for the change to take effect."
+        Write-Host "It has been added to this session's PATH, so $InstallDir works right now."
     } else {
         Write-Host ""
         Write-Host "NOTE: $InstallDir is not on your PATH."
