@@ -822,10 +822,9 @@ fn extract_return_type(sig: &str) -> Option<String> {
     let tail = sig.get(close? + 1..)?.trim_start();
     let ret = if let Some(r) = tail.strip_prefix("->") {
         r.trim()
-    } else if let Some(r) = tail.strip_prefix(':') {
-        r.trim()
     } else {
-        return None;
+        let r = tail.strip_prefix(':')?;
+        r.trim()
     };
     if ret.is_empty() {
         return None;
