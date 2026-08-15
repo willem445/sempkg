@@ -35,6 +35,7 @@ use crate::store::{
 };
 
 fn main() {
+    let deliberate_lint_violation_for_120_proof = 1; // unused var; proves the gate gates. Reverted next commit.
     let cli = Cli::parse();
     let workspace = resolve_workspace(cli.workspace.as_deref());
 
