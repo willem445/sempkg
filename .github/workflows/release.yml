@@ -693,7 +693,14 @@ jobs:
       - name: Generate SHA-256 checksums
         run: |
           cd dist
-          find . -type f | sort | xargs sha256sum > SHA256SUMS.txt
+          # `> SHA256SUMS.txt` truncates/creates the file as part of setting up
+          # the redirection, before `find` ever runs — so without the
+          # `! -name` exclusion, `find` sees the now-existing empty file and
+          # hashes it, and the file ends up containing a self-referential line
+          # for its own empty state (the SHA-256 of the empty string,
+          # e3b0c442...b855). That shipped in v1.0.0-beta.1 and made
+          # `sha256sum -c SHA256SUMS.txt` fail for every user.
+          find . -type f ! -name SHA256SUMS.txt | sort | xargs sha256sum > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
       - name: Create GitHub Release
