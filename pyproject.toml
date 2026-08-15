@@ -42,3 +42,11 @@ markers = [
 [tool.uv]
 # Prefer uv for dependency management and environment sync in this project.
 managed = true
+
+[tool.ruff]
+# tests/fixtures holds deliberately-broken/unusual source fixtures for the
+# indexer test suites (e.g. tests/fixtures/graph-src/python/unresolved.py
+# imports a nonexistent module on purpose) — not real application code, and
+# not meant to be lint-clean. Extend (not replace) ruff's own default
+# excludes (.venv, __pycache__, etc.).
+extend-exclude = ["tests/fixtures"]

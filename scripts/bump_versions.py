@@ -20,7 +20,7 @@ import argparse
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Iterator
+from typing import Iterator
 
 SECTION_RE = re.compile(r"^\s*\[(?P<section>[^\]]+)\]\s*(?:#.*)?$")
 VERSION_RE = re.compile(r'^(?P<prefix>\s*version\s*=\s*")[^"]*(?P<suffix>"\s*(?:#.*)?)$')

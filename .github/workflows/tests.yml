@@ -498,7 +498,12 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@v5
 
-      # sempkg_agent carries its own ruff config; sempkg_registry uses ruff
-      # defaults. Pin the ruff version so CI matches local runs.
-      - name: ruff check (agent + registry)
-        run: uvx ruff@0.15.20 check src/sempkg_agent src/sempkg_registry
+      # Whole-repo, not just src/sempkg_agent + src/sempkg_registry: the
+      # narrower scope missed tests/*.py and scripts/*.py entirely, so a
+      # violation there stayed invisible to this gate (#120 review). sempkg_agent
+      # carries its own nested ruff config (picked up automatically); everything
+      # else uses ruff defaults via the root pyproject.toml, which excludes
+      # tests/fixtures (deliberately-broken indexer test fixtures, not meant to
+      # be lint-clean). Pin the ruff version so CI matches local runs.
+      - name: ruff check (repo-wide)
+        run: uvx ruff@0.15.20 check .

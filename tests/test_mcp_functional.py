@@ -38,7 +38,6 @@ import json
 import os
 import shutil
 import subprocess
-import sys
 from pathlib import Path
 from typing import Generator
 
@@ -317,7 +316,7 @@ class TestCliSmoke:
             timeout=15,
         )
         cg_line = next(
-            (l for l in result.stdout.splitlines() if CODEGRAPH_PKG in l), ""
+            (line for line in result.stdout.splitlines() if CODEGRAPH_PKG in line), ""
         )
         assert "+code" in cg_line, (
             f"codegraph bundle missing +code index — rebuild with --include-source.\n"
@@ -332,7 +331,7 @@ class TestCliSmoke:
             timeout=15,
         )
         cg_line = next(
-            (l for l in result.stdout.splitlines() if CODEGRAPH_PKG in l), ""
+            (line for line in result.stdout.splitlines() if CODEGRAPH_PKG in line), ""
         )
         assert "[indexed]" in cg_line, (
             f"codegraph bundle not codegraph-indexed.\nLine: {cg_line!r}"
@@ -618,7 +617,7 @@ class TestListFiles:
         text = mcp_client.tool_text(
             "list_files", {"package": CODEGRAPH_PKG}
         )
-        lines = [l for l in text.splitlines() if l.strip()]
+        lines = [line for line in text.splitlines() if line.strip()]
         assert len(lines) >= LIST_FILES_TOTAL, (
             f"Expected ≥{LIST_FILES_TOTAL} files unfiltered, got {len(lines)}:\n{text[:300]}"
         )
@@ -649,7 +648,7 @@ class TestListFiles:
         text = mcp_client.tool_text(
             "list_files", {"package": CODEGRAPH_PKG, "filter": "mcp"}
         )
-        lines = [l for l in text.splitlines() if l.strip()]
+        lines = [line for line in text.splitlines() if line.strip()]
         assert len(lines) == LIST_FILES_MCP_COUNT, (
             f"Expected {LIST_FILES_MCP_COUNT} 'mcp' files, got {len(lines)}:\n{text}"
         )
@@ -694,7 +693,7 @@ class TestListFiles:
         text = mcp_client.tool_text(
             "list_files", {"package": CODEGRAPH_PKG, "filter": "mcp/*.ts"}
         )
-        lines = [l for l in text.splitlines() if l.strip()]
+        lines = [line for line in text.splitlines() if line.strip()]
         assert len(lines) == LIST_FILES_MCP_COUNT, (
             f"Expected {LIST_FILES_MCP_COUNT} files for glob 'mcp/*.ts', got {len(lines)}:\n{text}"
         )
@@ -704,7 +703,7 @@ class TestListFiles:
         text = mcp_client.tool_text(
             "list_files", {"package": CODEGRAPH_PKG, "filter": "**/*.ts"}
         )
-        lines = [l for l in text.splitlines() if l.strip()]
+        lines = [line for line in text.splitlines() if line.strip()]
         assert len(lines) >= LIST_FILES_TOTAL, (
             f"**/*.ts expected ≥{LIST_FILES_TOTAL} files, got {len(lines)}:\n{text[:300]}"
         )
@@ -723,7 +722,7 @@ class TestListFiles:
         text = mcp_client.tool_text(
             "list_files", {"package": CODEGRAPH_PKG, "filter": "mcp/tools.ts"}
         )
-        lines = [l.strip() for l in text.splitlines() if l.strip()]
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
         assert lines == [LIST_FILES_KNOWN_FILE], (
             f"Expected exactly ['{LIST_FILES_KNOWN_FILE}'], got: {lines}"
         )
@@ -739,8 +738,8 @@ class TestListFiles:
         )
         # Split off the truncation notice (contains "more file(s) not shown")
         content_lines = [
-            l for l in text.splitlines()
-            if l.strip() and "more file(s) not shown" not in l
+            line for line in text.splitlines()
+            if line.strip() and "more file(s) not shown" not in line
         ]
         assert len(content_lines) == 5, (
             f"Expected 5 file lines with limit=5, got {len(content_lines)}:\n{text}"
@@ -760,7 +759,7 @@ class TestListFiles:
             "list_files", {"package": CODEGRAPH_PKG, "limit": limit}
         )
         notice_line = next(
-            (l for l in text.splitlines() if "more file(s) not shown" in l), ""
+            (line for line in text.splitlines() if "more file(s) not shown" in line), ""
         )
         # Extract the leading number from "… N more file(s) not shown"
         import re
@@ -1184,7 +1183,7 @@ class TestReadSymbolAmbiguity:
 # on keyword overlap would surface many wrong candidates, so correct top-1
 # placement is strong evidence that the cross-encoder ran.
 
-import re as _re
+import re as _re  # noqa: E402 -- grouped with the section that uses it, not hoisted
 
 
 def _parse_query_scores(text: str) -> list[float]:
@@ -1714,7 +1713,7 @@ class TestReadDocs:
 # and an "installed" bundle is faked on disk (just its ``manifest.json``) so it
 # appears in the listings.
 
-import contextlib
+import contextlib  # noqa: E402 -- grouped with the section that uses it, not hoisted
 
 ADD_DESC_NAME = "demo-lib"
 ADD_DESC_VERSION = "1.2.3"
@@ -1820,7 +1819,7 @@ def _mcp_server(sempkg_bin: str, workspace: Path, log_dir: Path):
 
 def _bundle_line(text: str, name: str) -> str:
     """Return the first output line that names *name*, or '' if none."""
-    return next((l for l in text.splitlines() if name in l), "")
+    return next((line for line in text.splitlines() if name in line), "")
 
 
 @pytest.mark.functional
