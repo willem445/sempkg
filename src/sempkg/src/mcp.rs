@@ -563,7 +563,7 @@ fn debug_hit_preview(h: &UnifiedHit) -> String {
     };
     let symbol = h.symbol.as_deref().unwrap_or("-");
     let kind = h.kind.as_deref().unwrap_or("-");
-    let mut snip = h.snippet.replace('\n', " ").replace('\r', " ");
+    let mut snip = h.snippet.replace(['\n', '\r'], " ");
     if snip.len() > 110 {
         snip.truncate(110);
         snip.push_str("...");
@@ -1584,7 +1584,7 @@ impl McpContext {
                     Ok(mut results) => {
                         // Client-side kind filter
                         if let Some(k) = kind_filter {
-                            results.retain(|r| r.kind.as_deref().map_or(false, |rk| rk == k));
+                            results.retain(|r| r.kind.as_deref() == Some(k));
                         }
                         self.apply_rerank_to_lance(query, results, limit)
                     }
@@ -1610,7 +1610,7 @@ impl McpContext {
     /// always replaced by something richer.
     fn expand_pool_hits(
         &self,
-        hits: &mut Vec<UnifiedHit>,
+        hits: &mut [UnifiedHit],
         pool_indices: &[usize],
         bundles: &[BundleInfo],
     ) {

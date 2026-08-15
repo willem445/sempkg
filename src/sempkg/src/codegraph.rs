@@ -98,6 +98,9 @@ pub struct NodeRecord {
     pub end_line: u32,
     pub kind: String,
     pub signature: Option<String>,
+    /// Mirrors semgraph's `nodes.docstring` column for schema parity; no
+    /// current caller reads it back off a `NodeRecord`.
+    #[allow(dead_code)]
     pub docstring: Option<String>,
 }
 
@@ -147,15 +150,6 @@ pub fn db_query_symbol_all(db_path: &Path, symbol: &str) -> Result<Vec<NodeRecor
         .filter_map(|r| r.ok())
         .collect();
     Ok(rows)
-}
-
-/// Query `codegraph.db` for an exact symbol match by name or qualified name.
-/// Prefers exact `qualified_name` match, then exact `name` match.
-/// Returns `None` when there is no match.  When there are multiple matches the
-/// first (highest-priority) row is returned; callers that need to surface
-/// ambiguity should use [`db_query_symbol_all`] instead.
-pub fn db_query_symbol(db_path: &Path, symbol: &str) -> Result<Option<NodeRecord>> {
-    Ok(db_query_symbol_all(db_path, symbol)?.into_iter().next())
 }
 
 /// Query `codegraph.db` for the tightest symbol whose range encloses `line`

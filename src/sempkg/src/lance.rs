@@ -88,22 +88,6 @@ fn invalidate_table_cache(dir: &Path, table_name: &str) {
 }
 
 // ---------------------------------------------------------------------------
-// Paths
-// ---------------------------------------------------------------------------
-
-pub fn lance_dir_path(bundle_dir: &Path) -> PathBuf {
-    bundle_dir.join("lance")
-}
-
-pub fn lance_metadata_path(bundle_dir: &Path) -> PathBuf {
-    bundle_dir.join("lance").join("metadata.json")
-}
-
-pub fn has_lance(bundle_dir: &Path) -> bool {
-    lance_dir_path(bundle_dir).is_dir()
-}
-
-// ---------------------------------------------------------------------------
 // LanceDB metadata
 // ---------------------------------------------------------------------------
 
@@ -113,6 +97,9 @@ pub struct LanceMetadata {
     pub document_count: Option<u64>,
     pub chunk_count: Option<u64>,
     pub fts_enabled: Option<bool>,
+    /// Deserialized for schema parity with the written `metadata.json`; no
+    /// current caller reads it back.
+    #[allow(dead_code)]
     pub indexed_paths: Option<Vec<String>>,
     pub created_at: Option<String>,
     /// Identifier of the embedding model used to populate the `vector` column,
@@ -155,8 +142,12 @@ pub struct SearchResult {
     /// 1-based line number where this chunk ends in the source file (0 = unknown).
     pub end_line: u32,
     /// Byte offset of the chunk start within the source file (0 = unknown).
+    /// Populated from the stored column; no current caller reads it back.
+    #[allow(dead_code)]
     pub start_byte: u32,
     /// Byte offset of the chunk end within the source file (0 = unknown).
+    /// Populated from the stored column; no current caller reads it back.
+    #[allow(dead_code)]
     pub end_byte: u32,
     // Code-index fields (absent for docs results).
     pub symbol: Option<String>,
@@ -209,21 +200,13 @@ pub struct SymbolCandidate {
 ///
 /// - `Unique`      — exactly one match; contains the full source.
 /// - `Ambiguous`   — multiple nodes share the same name; the caller must ask
-///                   the user to disambiguate.
+///   the user to disambiguate.
 /// - `NotFound`    — no node matched the requested symbol name.
 #[derive(Debug)]
 pub enum SymbolLookup {
     Unique(SymbolSource),
     Ambiguous(Vec<SymbolCandidate>),
     NotFound,
-}
-
-pub fn code_dir_path(bundle_dir: &Path) -> PathBuf {
-    bundle_dir.join("code")
-}
-
-pub fn has_code(bundle_dir: &Path) -> bool {
-    code_dir_path(bundle_dir).is_dir()
 }
 
 /// Full-text (BM25) search against the docs LanceDB table.

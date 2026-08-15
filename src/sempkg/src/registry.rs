@@ -163,23 +163,6 @@ impl RegistryClient {
                 .into()
             })
     }
-
-    /// List all packages and versions available in the registry.
-    pub fn list_available(&self) -> Result<Vec<(String, String)>> {
-        let index = self.fetch_index()?;
-        let mut entries = Vec::new();
-        for (pkg_name, pkg) in &index.packages {
-            for version in pkg.bundles.keys() {
-                entries.push((pkg_name.clone(), version.clone()));
-            }
-        }
-        entries.sort();
-        Ok(entries)
-    }
-
-    pub fn base_url(&self) -> &str {
-        &self.base_url
-    }
 }
 
 // ---------------------------------------------------------------------------
