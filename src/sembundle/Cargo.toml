@@ -32,7 +32,9 @@ thiserror = { workspace = true }
 tempfile  = { workspace = true }
 reqwest   = { workspace = true, features = ["blocking", "multipart"] }
 ed25519-dalek = { workspace = true, features = ["rand_core"] }
-rand      = { version = "0.8", features = ["getrandom"] }
+# ed25519-dalek 3.0 moved to rand_core 0.10, whose CryptoRng is implemented
+# by rand 0.10's SysRng (the OsRng replacement) — see keygen.rs.
+rand      = { version = "0.10", features = ["sys_rng"] }
 zeroize   = "1"
 lancedb   = { workspace = true }
 arrow-array  = { workspace = true }

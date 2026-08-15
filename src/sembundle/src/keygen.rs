@@ -22,18 +22,32 @@ pub struct KeygenOptions {
 pub fn keygen(opts: KeygenOptions) -> Result<(PathBuf, PathBuf), KeygenError> {
     use ed25519_dalek::pkcs8::spki::EncodePublicKey;
     use ed25519_dalek::pkcs8::EncodePrivateKey;
-    use rand::rngs::OsRng;
+    // ed25519-dalek 3.0 moved to rand_core 0.10, and rand 0.10 replaced
+    // `rand::rngs::OsRng` with `SysRng` — which only implements `TryCryptoRng`
+    // (its error type isn't `Infallible`: the OS RNG can fail). `SigningKey::
+    // generate` needs `CryptoRng`, so wrap it in `UnwrapErr`, which turns any
+    // `TryCryptoRng` into an infallible `CryptoRng` (panicking on the error
+    // path, same as the old `OsRng` effectively did).
+    use ed25519_dalek::rand_core::UnwrapErr;
+    use rand::rngs::SysRng;
 
-    let signing_key = ed25519_dalek::SigningKey::generate(&mut OsRng);
+    let mut csprng = UnwrapErr(SysRng);
+    let signing_key = ed25519_dalek::SigningKey::generate(&mut csprng);
 
     std::fs::create_dir_all(&opts.output_dir)?;
 
     let private_path = opts.output_dir.join("private.pem");
     let public_path = opts.output_dir.join("public.pem");
 
-    signing_key
-        .write_pkcs8_pem_file(&private_path, Default::default())
+    // `write_pkcs8_pem_file` still exists on `EncodePrivateKey`, but it's
+    // gated behind pkcs8's own `std` feature — which ed25519-dalek's `pem`
+    // feature no longer forwards (ed25519-dalek dropped its own `std`
+    // feature in 3.0). Encode to a PEM string and write it ourselves instead,
+    // matching how `verify.rs` already reads public keys manually.
+    let private_pem = signing_key
+        .to_pkcs8_pem(Default::default())
         .map_err(|e| KeygenError::Pkcs8(e.to_string()))?;
+    std::fs::write(&private_path, private_pem.as_bytes())?;
 
     #[cfg(unix)]
     {
