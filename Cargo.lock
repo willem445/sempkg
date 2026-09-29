@@ -5433,7 +5433,7 @@ dependencies = [
 
 [[package]]
 name = "sembundle"
-version = "1.0.0-beta.2"
+version = "1.0.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -5461,7 +5461,7 @@ dependencies = [
 
 [[package]]
 name = "semgraph"
-version = "1.0.0-beta.2"
+version = "1.0.0"
 dependencies = [
  "clap",
  "hex",
@@ -5493,7 +5493,7 @@ dependencies = [
 
 [[package]]
 name = "sempkg"
-version = "1.0.0-beta.2"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "arrow-array",
